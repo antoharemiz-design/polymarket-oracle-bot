@@ -9,7 +9,7 @@ from .engine import MarketSession, PaperExecutor
 from .fairvalue import SpotSeries
 from .feeds import market_feed, now_ms, spot_feed
 from .journal import Journal
-from .markets import DUR, closed_winner, lookup
+from .markets import DUR, lookup, resolve
 from .risk import Risk
 
 GRID_S = 0.05
@@ -125,10 +125,10 @@ class Bot:
             ftask.cancel()
         # resolution
         outcome = None
-        for _ in range(60):
+        for _ in range(180):
             await asyncio.sleep(10)
             try:
-                outcome = await asyncio.to_thread(closed_winner, cfg.asset, cfg.tf, start)
+                outcome = await asyncio.to_thread(resolve, cfg.asset, cfg.tf, start, market["condition_id"])
             except Exception:
                 outcome = None
             if outcome is not None:

@@ -43,7 +43,7 @@ def fetch_market(slug):
         d = json.load(r)
     if not d:
         return None
-    return json.loads(d[0]["clobTokenIds"])
+    return json.loads(d[0]["clobTokenIds"]), d[0]["conditionId"]
 
 
 async def record_market(out, asset, tf, start):
@@ -52,8 +52,11 @@ async def record_market(out, asset, tf, start):
     toks = None
     for _ in range(10):
         try:
-            toks = await asyncio.to_thread(fetch_market, slug)
-            if toks:
+            found = await asyncio.to_thread(fetch_market, slug)
+            if found:
+                toks, cond = found
+                with open(f"{out}/pm/{slug}.json", "w") as mf:      # needed later to look up the resolution
+                    json.dump({"condition_id": cond, "token_up": toks[0], "token_down": toks[1]}, mf)
                 break
         except Exception as e:
             log(slug, "gamma error", repr(e)[:80])

@@ -58,6 +58,19 @@ def closed_winner(asset: str, tf: str, start: int):
     return None
 
 
+def resolve(asset: str, tf: str, start: int, condition_id: str | None = None):
+    """Winner of a finished market, or None while unresolved. The resolutions endpoint knows the
+    result first; Gamma lists a market as closed only several minutes later."""
+    if condition_id:
+        try:
+            w = winners([condition_id]).get(condition_id)
+            if w is not None:
+                return w
+        except Exception:
+            pass
+    return closed_winner(asset, tf, start)
+
+
 def update_outcomes(rec_dir: str, asset="btc", tf="5m") -> dict:
     """Maintain REC_DIR/outcomes.json = {start: winner} for every recorded market that has resolved."""
     from .replay import list_markets
@@ -67,8 +80,10 @@ def update_outcomes(rec_dir: str, asset="btc", tf="5m") -> dict:
     for start, _ in list_markets(rec_dir):
         if str(start) in out or now < start + DUR[tf] + 90:
             continue
+        meta = os.path.join(rec_dir, "pm", f"{slug_for(asset, tf, start)}.json")
+        cond = json.load(open(meta)).get("condition_id") if os.path.exists(meta) else None
         try:
-            w = closed_winner(asset, tf, start)
+            w = resolve(asset, tf, start, cond)
         except Exception:
             continue
         if w is not None:
