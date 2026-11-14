@@ -156,13 +156,14 @@ class Bot:
         r = ses.settle(outcome) if outcome is not None else ses.settle()
         t = now_ms()
         if r.pnl is not None:
-            self.risk.on_settled(t, start, r.pnl)
+            self.risk.on_settled(t, start, r.pnl_ex_rebate)     # stop-loss counts cash, not rebates paid later
             tt = self.totals
             tt["markets"] += 1; tt["pnl"] += r.pnl; tt["rebate"] += r.rebate
             tt["shares"] += r.q_up + r.q_dn; tt["fills"] += r.fills
         self.journal.write(t, start, "settle", outcome=r.outcome, outcome_src=r.outcome_src, up=round(r.q_up, 4),
                            dn=round(r.q_dn, 4), cost=round(r.cost, 4), pnl=None if r.pnl is None else round(r.pnl, 4),
-                           rebate_est=round(r.rebate, 4), fills=r.fills, placed=r.placed, canceled=r.canceled,
+                           pnl_ex_rebate=None if r.pnl_ex_rebate is None else round(r.pnl_ex_rebate, 4),
+                           rebate=round(r.rebate, 4), fills=r.fills, placed=r.placed, canceled=r.canceled,
                            rejected=r.rejected, markout60=round(r.markout, 4), day_pnl=round(self.risk.day_pnl, 4))
         log(f"{market['slug']} outcome={r.outcome} fills={r.fills} up={r.q_up:.1f} dn={r.q_dn:.1f} cost=${r.cost:.2f} "
             f"pnl={'n/a' if r.pnl is None else f'${r.pnl:.2f}'} | total ${self.totals['pnl']:.2f} over {self.totals['markets']} markets")

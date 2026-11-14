@@ -17,7 +17,10 @@ What is simulated
     exchange taker delay) at the then-best price if it is still within the limit; taker fee
     0.07 * p * (1 - p) per share.
   * Positions are held to resolution. Outcome: actual resolution when known, otherwise the
-    TWAP rule on recorded spot (agrees with actual resolution in 98.4% of markets).
+    TWAP rule on recorded spot. The proxy disagrees with the real resolution in a few percent
+    of markets, so the summary counts proxy-settled markets in the `proxy` column; a PnL with
+    proxy > 0 is a proxy PnL and must not be quoted as a result.
+  * PnL is reported twice: without maker rebates (`noReb$`) and with them (`pnl$`).
 
 What is not simulated: our own market impact, and reactions of other participants to our quotes.
 
@@ -62,6 +65,8 @@ def summarize(results, label=""):
     if not rs:
         return {"label": label, "markets": 0}
     pnl = [r.pnl for r in rs]
+    pnl_x = [r.pnl_ex_rebate for r in rs]
+    sd_x = statistics.pstdev(pnl_x) if len(pnl_x) > 1 else 0.0
     shares = sum(r.q_up + r.q_dn for r in rs)
     cum = peak = dd = 0.0
     for x in pnl:
@@ -80,7 +85,9 @@ def summarize(results, label=""):
     return {
         "label": label, "markets": len(rs), "traded": len(traded), "fills": sum(r.fills for r in rs),
         "shares": shares, "cost": sum(r.cost for r in rs), "fees": sum(r.fees for r in rs),
-        "pnl": sum(pnl), "rebate": sum(r.rebate for r in rs),
+        "pnl": sum(pnl), "rebate": sum(r.rebate for r in rs), "pnl_ex_rebate": sum(pnl_x),
+        "tstat_ex_rebate": statistics.mean(pnl_x) / sd_x * math.sqrt(len(pnl_x)) if sd_x else 0.0,
+        "proxy_outcomes": sum(1 for r in rs if r.outcome_src != "actual"),
         "pnl_per_share_c": 100 * sum(pnl) / shares if shares else 0.0,
         "markout60_per_share_c": 100 * sum(r.markout for r in rs) / mo_sh if mo_sh else 0.0,
         "markout5_per_share_c": mo5, "markout5_se_c": mo5_se, "fee_per_share_c": fee_sh,
@@ -93,16 +100,17 @@ def summarize(results, label=""):
     }
 
 
-HEADER = (f"{'run':<28}{'mkts':>5}{'fills':>6}{'shares':>7}{'pnl$':>9}{'c/sh':>7}{'mo5 c':>7}{'+-se':>6}{'mo60 c':>7}"
-          f"{'fee c':>6}{'reb$':>7}{'win%':>6}{'t':>6}{'maxDD$':>8}{'cancels':>8}")
+HEADER = (f"{'run':<28}{'mkts':>5}{'fills':>6}{'shares':>7}{'noReb$':>9}{'t':>6}{'reb$':>7}{'pnl$':>9}{'t':>6}{'c/sh':>7}"
+          f"{'mo5 c':>7}{'+-se':>6}{'mo60 c':>7}{'fee c':>6}{'win%':>6}{'maxDD$':>8}{'proxy':>6}")
 
 
 def fmt(s):
     if not s.get("markets"):
         return f"{s['label']:<28} no resolved markets"
-    return (f"{s['label']:<28}{s['markets']:5d}{s['fills']:6d}{s['shares']:7.0f}{s['pnl']:9.2f}{s['pnl_per_share_c']:7.2f}"
+    return (f"{s['label']:<28}{s['markets']:5d}{s['fills']:6d}{s['shares']:7.0f}{s['pnl_ex_rebate']:9.2f}{s['tstat_ex_rebate']:6.2f}"
+            f"{s['rebate']:7.2f}{s['pnl']:9.2f}{s['tstat']:6.2f}{s['pnl_per_share_c']:7.2f}"
             f"{s['markout5_per_share_c']:7.2f}{s['markout5_se_c']:6.2f}{s['markout60_per_share_c']:7.2f}{s['fee_per_share_c']:6.2f}"
-            f"{s['rebate']:7.2f}{s['win_rate']:6.1f}{s['tstat']:6.2f}{s['max_dd']:8.2f}{s['canceled']:8d}")
+            f"{s['win_rate']:6.1f}{s['max_dd']:8.2f}{s['proxy_outcomes']:6d}")
 
 
 def run_all(rec_dir, p, mode="maker", lat_ms=150, queue_mult=1.0, outcomes=None, markets=None, taker_theta=1.0):

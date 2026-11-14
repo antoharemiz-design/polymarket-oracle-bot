@@ -51,21 +51,25 @@ def main():
             res[label]["out" if s >= split else "in"].append(r)
     n_in = sum(1 for s, _ in markets if s < split); n_out = len(markets) - n_in
     print(f"markets: {n_in} before the split (used to choose), {n_out} after (not used)")
-    hdr = f"{'fills':>6}{'sh':>6}{'mo5':>7}{'se':>6}{'fee':>6}{'net5':>7}{'t':>6}{'pnl$':>8}{'DD$':>7}"
-    print(f"{'configuration':<30}| {'chosen on':^58}| {'independent check':^58}")
+    hdr = f"{'fills':>6}{'sh':>6}{'net5':>7}{'t':>6}{'noReb$':>8}{'t':>6}{'reb$':>7}{'pnl$':>8}{'t':>6}{'DD$':>7}"
+    print(f"{'configuration':<30}| {'chosen on':^66}| {'independent check':^66}")
     print(f"{'':<30}| {hdr} | {hdr}")
+    proxies = 0
     for c in CONFIGS:
         row = f"{c[0]:<30}"
         for part in ("in", "out"):
             s = summarize(sorted(res[c[0]][part], key=lambda r: r.start))
             if not s.get("markets") or not s["shares"]:
-                row += "| " + " " * 58; continue
+                row += "| " + " " * 66; continue
             net = s["markout5_per_share_c"] - s["fee_per_share_c"]
             t = net / s["markout5_se_c"] if s["markout5_se_c"] else 0.0
-            row += (f"| {s['fills']:6d}{s['shares']:6.0f}{s['markout5_per_share_c']:7.2f}{s['markout5_se_c']:6.2f}{s['fee_per_share_c']:6.2f}"
-                    f"{net:7.2f}{t:6.1f}{s['pnl']:8.2f}{s['max_dd']:7.1f} ")
+            row += (f"| {s['fills']:6d}{s['shares']:6.0f}{net:7.2f}{t:6.1f}{s['pnl_ex_rebate']:8.2f}{s['tstat_ex_rebate']:6.1f}"
+                    f"{s['rebate']:7.2f}{s['pnl']:8.2f}{s['tstat']:6.1f}{s['max_dd']:7.1f} ")
+            proxies += s["proxy_outcomes"]
         print(row)
-    print("mo5 = markout vs book mid 5 s after the fill, cents/share; net5 = mo5 - fee; pnl = held to resolution, after fees")
+    print("net5 = markout vs book mid 5 s after the fill minus taker fee, cents/share; noReb$ = held to resolution, after fees,")
+    print("without maker rebates; pnl$ = with rebates (20% of own maker fee-equivalent); t = per-market t-statistic")
+    print(f"markets settled on the spot proxy instead of the real resolution: {proxies}")
 
 
 if __name__ == "__main__":

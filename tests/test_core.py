@@ -221,8 +221,19 @@ class PaperExecutorTest(unittest.TestCase):
         ex, ses = self.make()
         ses.on_fill("B", 40, 10, 1000); ses.on_fill("S", 45, 10, 2000)   # Up at 40c, Down at 55c
         r = ses.settle(0)
-        self.assertAlmostEqual(r.pnl, 10 - (4.0 + 5.5))
-        self.assertAlmostEqual(ses.settle(1).pnl, 10 - 9.5)
+        rebate = 10 * 0.2 * (fee_c(40) + fee_c(55)) / 100          # 20% of our own maker fee-equivalent
+        self.assertAlmostEqual(r.pnl_ex_rebate, 10 - (4.0 + 5.5))
+        self.assertAlmostEqual(r.pnl, 10 - 9.5 + rebate)
+        self.assertEqual(r.outcome_src, "actual")
+        self.assertAlmostEqual(ses.settle(1).pnl_ex_rebate, 10 - 9.5)
+
+    def test_taker_fills_pay_fee_and_earn_no_rebate(self):
+        ex, ses = self.make()
+        ses.on_fill("B", 50, 10, 1000, True)
+        r = ses.settle(0)
+        self.assertAlmostEqual(r.fees, 10 * fee_c(50) / 100)
+        self.assertEqual(r.rebate, 0.0)
+        self.assertAlmostEqual(r.pnl, 10 - 5.0 - 0.175)
 
 
 class BookRiskJournalTest(unittest.TestCase):

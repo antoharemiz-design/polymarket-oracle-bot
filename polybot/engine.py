@@ -16,7 +16,10 @@ from .strategy import Fair, Params, decide, keep
 
 TAKER_DELAY_MS = 250      # exchange hold on marketable orders in crypto up/down markets
 FEE_RATE = 0.07           # taker fee = FEE_RATE * p * (1 - p) per share
-REBATE_SHARE = 0.20       # share of taker fees returned to the makers of those fills
+# Maker rebate: 20% of the fee-equivalent of your own filled maker orders, paid daily.
+# Verified against the public rebates endpoint for a real maker: actual / (0.20 * own fee-equivalent)
+# = 1.000 on 795 market-days (research/06_maker_inventory.md). It does not depend on competitors.
+REBATE_SHARE = 0.20
 
 
 def fee_c(price_c: float) -> float:
@@ -54,7 +57,8 @@ class Result:
     markout_shares: float = 0.0
     markout5: float = 0.0           # dollars, vs book mid 5 s after each fill (low-noise edge estimate)
     markout5_shares: float = 0.0
-    pnl: float | None = None
+    pnl: float | None = None        # payoff - cost - taker fees + maker rebate
+    pnl_ex_rebate: float | None = None
 
 
 class PaperExecutor:
@@ -306,7 +310,8 @@ class MarketSession:
             outcome, src = self.spot_proxy_outcome(), "spot-proxy"
         r.outcome, r.outcome_src = outcome, src if outcome is not None else ""
         if outcome is not None:
-            r.pnl = (r.q_up if outcome == 0 else r.q_dn) - r.cost - r.fees
+            r.pnl_ex_rebate = (r.q_up if outcome == 0 else r.q_dn) - r.cost - r.fees
+            r.pnl = r.pnl_ex_rebate + r.rebate
         r.markout = r.markout_shares = r.markout5 = r.markout5_shares = 0.0
         for t, sign, price_c, sh in self.fill_log:
             j = bisect.bisect_right(self.grid_t, t + 60000) - 1
