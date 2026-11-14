@@ -88,7 +88,9 @@ class FairValue:
         self.spot, self.start, self.end, self.vol_mult = spot, start, start + dur, vol_mult
         self.strike = None
 
-    def p_up(self, now_ms: int):
+    def components(self, now_ms: int):
+        """(d, sd): expected final TWAP minus strike, and its standard deviation, in dollars.
+        P(Up) = phi(d / sd). Returns None while data is missing; sd == 0 after the window ends."""
         sp = self.spot
         sp.advance(now_ms)
         if self.strike is None:
@@ -96,13 +98,15 @@ class FairValue:
             if self.strike is None:
                 return None
         s = sp.last_mid
+        if s is None:
+            return None
         sig = sp.sigma() * s * self.vol_mult
-        if s is None or sig <= 0:
+        if sig <= 0:
             return None
         now = now_ms / 1000.0
         if now >= self.end:
             fin = sp.mean(self.end - TW, self.end)
-            return None if fin is None else (1.0 if fin >= self.strike else 0.0)
+            return None if fin is None else (fin - self.strike, 0.0)
         first = self.end - TW + 1                      # first boundary of the final TWAP
         nsec = int(now)                                # last boundary already sampled
         if nsec < first:
@@ -120,4 +124,13 @@ class FairValue:
                 d = (nsec + k) - now
                 acc += d * (2 * (n - k) + 1)
             var = sig * sig * acc / (TW * TW)
-        return phi((mean - self.strike) / math.sqrt(var + 1e-12))
+        return mean - self.strike, math.sqrt(var + 1e-12)
+
+    def p_up(self, now_ms: int):
+        c = self.components(now_ms)
+        if c is None:
+            return None
+        d, sd = c
+        if sd == 0.0:
+            return 1.0 if d >= 0 else 0.0
+        return phi(d / sd)

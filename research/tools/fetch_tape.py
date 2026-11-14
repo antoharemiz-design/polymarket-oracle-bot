@@ -4,6 +4,9 @@ Condition ids come from a wallet activity dump that traded those markets (any ac
 Output CSV rows: start,ts,outcome_index,side,price,size,taker_wallet,tx
   start = window start (epoch s), ts = on-chain block time (epoch s), side = taker side.
 
+Re-running with the same OUT.csv resumes: markets already present are skipped
+(the newest 20 present are re-fetched, since the last batch may be incomplete).
+
 usage: fetch_tape.py ACTIVITY.jsonl OUT.csv FROM_EPOCH TO_EPOCH
 """
 import json
@@ -39,9 +42,21 @@ def main():
         if m and lo <= int(m.group(1)) < hi and r.get("condition_id"):
             conds[r["condition_id"]] = int(m.group(1))
     ids = sorted(conds, key=conds.get)
-    print(f"{len(ids)} markets", flush=True)
+    import os
+    if os.path.exists(out):
+        have = sorted({int(line.split(",", 1)[0]) for line in open(out) if line[:1].isdigit()})
+        keep = set(have[:-20])
+        tmp = out + ".tmp"
+        with open(out) as src, open(tmp, "w") as dst:
+            for line in src:
+                if line[:1].isdigit() and int(line.split(",", 1)[0]) in keep:
+                    dst.write(line)
+        os.replace(tmp, out)
+        ids = [c for c in ids if conds[c] not in keep]
+        print(f"resuming: {len(keep)} markets kept", flush=True)
+    print(f"{len(ids)} markets to fetch", flush=True)
     n = 0
-    with open(out, "w") as f:
+    with open(out, "a") as f:
         for i in range(0, len(ids), 20):
             params = {"condition": ",".join(ids[i:i + 20]), "limit": 1000}
             cursor = None

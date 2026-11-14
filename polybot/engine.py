@@ -202,13 +202,12 @@ class MarketSession:
         if not (0 < bb < ba < 100):
             self._pull(td, "book_empty"); return
         self.grid_t.append(td); self.grid_mid.append((bb + ba) / 2.0)
-        model = None
+        comp = None
         if p.use_model and self.mode != "mid":
-            pu = self.fv.p_up(td) if self.spot.ready(self.start) else None
-            if pu is None:
+            comp = self.fv.components(td) if self.spot.ready(self.start) else None
+            if comp is None:
                 self._pull(td, "model_not_ready"); return
-            model = 100.0 * pu
-        f, raw = self.fair.update(td, model, bb, ba)
+        f, raw = self.fair.update(td, comp, bb, ba)
         elapsed = (td - self.start_ms) / 1000.0
         self.last = {"bb": bb, "ba": ba, "fair": round(f, 2), "gap": round(raw, 2)}
         if self.halted:

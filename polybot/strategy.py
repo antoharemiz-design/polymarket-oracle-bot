@@ -21,8 +21,8 @@ class Params:
     t_off: float = 235.0          # stop quoting (and pull quotes) this many seconds in
     p_min: float = 12.0           # only quote while the book mid is inside [p_min, 100 - p_min]
     improve: int = 0              # 0 = at most join the best price, 1 = may step one tick ahead
-    gap_halflife: float = 20.0    # s; slow model-vs-book gap is treated as basis and removed
-    max_gap: float = 8.0          # cents; stop quoting when model and book disagree more than this
+    gap_halflife: float = 20.0    # s; half-life of the strike-offset (basis) estimate
+    max_gap: float = 25.0         # cents; stop quoting when raw model and book disagree more than this
     use_model: bool = True        # False = quote around the book mid only (baseline)
 
 
@@ -33,30 +33,50 @@ class Quote:
 
 
 class Fair:
-    """Fair value in cents = book mid + fast part of the model's disagreement with the book.
+    """Fair value in cents from the spot model, anchored to the book.
 
-    The level of (model - mid) drifts with the Binance/Chainlink basis and volatility
-    mis-estimation, so only its deviation from a slow average is used as signal.
+    The model works from Binance while the market resolves on Chainlink, and near the strike a
+    basis of a dollar or two moves the model probability by many cents. Measured on 1,268
+    markets, the model's *level* deserves only ~0.1 weight against the traded price
+    (research/03_backtest.md). What the model adds is speed: it moves with spot before the
+    book does. So the basis is estimated in dollars, as the strike offset that makes the model
+    agree with the book mid, averaged with half-life `halflife_s`:
+
+        offset_t = inv_phi(mid) * sd - d          (d, sd from FairValue.components)
+        fair     = phi((d + EWMA(offset)) / sd)
+
+    A spot move changes d immediately, so fair moves with the right delta while the slow
+    disagreement is absorbed by the offset.
     """
 
+    _nd = None
+
     def __init__(self, halflife_s: float):
+        from statistics import NormalDist
+        Fair._nd = Fair._nd or NormalDist()
         self.halflife = halflife_s
-        self.gap = None
+        self.offset = None
         self.last_ms = None
 
-    def update(self, now_ms: int, model_c: float | None, bb: int, ba: int):
+    def update(self, now_ms: int, comp, bb: int, ba: int):
+        """comp = FairValue.components() or None. Returns (fair_cents, raw_gap_cents)."""
         mid = (bb + ba) / 2.0
-        if model_c is None:
+        if comp is None:
             return mid, 0.0
-        raw = model_c - mid
-        if self.gap is None:
-            self.gap = raw
+        d, sd = comp
+        if sd <= 0:
+            return mid, 0.0
+        nd = Fair._nd
+        raw = 100.0 * nd.cdf(d / sd) - mid
+        o = nd.inv_cdf(min(max(mid / 100.0, 0.005), 0.995)) * sd - d
+        if self.offset is None:
+            self.offset = o
         else:
             dt = max(0.0, (now_ms - self.last_ms) / 1000.0)
             a = 1.0 - math.exp(-dt * math.log(2) / self.halflife)
-            self.gap += a * (raw - self.gap)
+            self.offset += a * (o - self.offset)
         self.last_ms = now_ms
-        return mid + (raw - self.gap), raw
+        return 100.0 * nd.cdf((d + self.offset) / sd), raw
 
 
 def decide(p: Params, elapsed: float, fair_c: float, raw_gap: float, bb: int, ba: int,
