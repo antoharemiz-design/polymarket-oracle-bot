@@ -21,7 +21,8 @@ class Params:
     t_off: float = 235.0          # stop quoting (and pull quotes) this many seconds in
     p_min: float = 12.0           # only quote while the book mid is inside [p_min, 100 - p_min]
     improve: int = 0              # 0 = at most join the best price, 1 = may step one tick ahead
-    gap_halflife: float = 20.0    # s; half-life of the strike-offset (basis) estimate
+    fast_ms: int = 250            # window of the spot move that the book is assumed not to have priced yet
+    fast_k: float = 1.0           # weight of that move in fair value
     max_gap: float = 25.0         # cents; stop quoting when raw model and book disagree more than this
     use_model: bool = True        # False = quote around the book mid only (baseline)
 
@@ -33,33 +34,29 @@ class Quote:
 
 
 class Fair:
-    """Fair value in cents from the spot model, anchored to the book.
+    """Fair value in cents = book mid + the part of the latest spot move the book has not priced yet.
 
-    The model works from Binance while the market resolves on Chainlink, and near the strike a
-    basis of a dollar or two moves the model probability by many cents. Measured on 1,268
-    markets, the model's *level* deserves only ~0.1 weight against the traded price
-    (research/03_backtest.md). What the model adds is speed: it moves with spot before the
-    book does. So the basis is estimated in dollars, as the strike offset that makes the model
-    agree with the book mid, averaged with half-life `halflife_s`:
+    Measured on recorded ticks (research/03_backtest.md): the Polymarket book follows Binance
+    with a lag of roughly one second. The spot move of the last ~500 ms, converted to cents
+    with the model delta, predicts the next move of the book mid (correlation 0.33-0.39, and
+    the mid covers about that full distance within 3 s).
 
-        offset_t = inv_phi(mid) * sd - d          (d, sd from FairValue.components)
-        fair     = phi((d + EWMA(offset)) / sd)
-
-    A spot move changes d immediately, so fair moves with the right delta while the slow
-    disagreement is absorbed by the offset.
+    Only the model's *sensitivity* is used, evaluated at the probability the book implies.
+    The model's level is not: it is built on Binance while the market settles on Chainlink,
+    and near the strike a one-dollar basis is worth several cents. On 1,268 markets the level
+    deserved a weight of only 0.12 +- 0.09 against the traded price.
     """
 
     _nd = None
 
-    def __init__(self, halflife_s: float):
+    def __init__(self, k: float = 1.0):
         from statistics import NormalDist
         Fair._nd = Fair._nd or NormalDist()
-        self.halflife = halflife_s
-        self.offset = None
-        self.last_ms = None
+        self.k = k
 
-    def update(self, now_ms: int, comp, bb: int, ba: int):
-        """comp = FairValue.components() or None. Returns (fair_cents, raw_gap_cents)."""
+    def update(self, now_ms: int, comp, bb: int, ba: int, spot_move: float = 0.0, sens: float = 1.0):
+        """comp = FairValue.components() or None; spot_move in dollars over the fast window.
+        Returns (fair_cents, raw_gap_cents) where raw gap = model level minus book mid."""
         mid = (bb + ba) / 2.0
         if comp is None:
             return mid, 0.0
@@ -68,15 +65,10 @@ class Fair:
             return mid, 0.0
         nd = Fair._nd
         raw = 100.0 * nd.cdf(d / sd) - mid
-        o = nd.inv_cdf(min(max(mid / 100.0, 0.005), 0.995)) * sd - d
-        if self.offset is None:
-            self.offset = o
-        else:
-            dt = max(0.0, (now_ms - self.last_ms) / 1000.0)
-            a = 1.0 - math.exp(-dt * math.log(2) / self.halflife)
-            self.offset += a * (o - self.offset)
-        self.last_ms = now_ms
-        return 100.0 * nd.cdf((d + self.offset) / sd), raw
+        z = nd.inv_cdf(min(max(mid / 100.0, 0.005), 0.995))
+        delta = 100.0 * nd.pdf(z) / sd * sens                # cents per dollar of spot
+        fair = mid + self.k * delta * spot_move
+        return min(max(fair, 0.5), 99.5), raw
 
 
 def decide(p: Params, elapsed: float, fair_c: float, raw_gap: float, bb: int, ba: int,

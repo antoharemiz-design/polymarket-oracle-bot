@@ -4,7 +4,7 @@ For every recorded trade, the resting side's edge is computed from what a maker 
 `lat` ms before the trade, under several fair-value definitions:
     mid          book mid only (no model)
     raw          spot model level
-    hl=N         spot model with the strike offset averaged over an N-second half-life
+    fast N ms    book mid + (spot move of the last N ms) x model delta
 Trades are bucketed by that edge. Reported per bucket: maker markout per share (cents) against
 the book mid 1 s / 5 s / 30 s later and against the final outcome.
 
@@ -26,8 +26,8 @@ rec = sys.argv[1]
 LAT = int(sys.argv[2]) if len(sys.argv) > 2 else 150
 GRID = 100
 H = (1000, 5000, 30000)
-HLS = (5, 20, 60)
-NAMES = ["mid", "raw"] + [f"hl={h}" for h in HLS]
+WINS = (250, 500, 1000)
+NAMES = ["mid", "raw"] + [f"fast {w}ms" for w in WINS]
 outcomes = json.load(open(os.path.join(rec, "outcomes.json"))) if os.path.exists(os.path.join(rec, "outcomes.json")) else {}
 EDGES = [-1e9, -3, -1, 1, 3, 1e9]
 LABELS = ["<-3c", "-3..-1", "-1..+1", "+1..+3", ">+3c"]
@@ -37,7 +37,7 @@ per_mkt = {nm: collections.defaultdict(lambda: collections.defaultdict(float)) f
 used = 0
 for start, path in list_markets(rec):
     spot = SpotSeries(); fv = FairValue(spot, start); book = UpBook()
-    fairs = [Fair(h) for h in HLS]
+    fair = Fair(1.0)
     gt, gmid, gf = [], [], []
     trades = []
     nxt, end_ms = start * 1000, (start + 300) * 1000
@@ -50,9 +50,9 @@ for start, path in list_markets(rec):
                 if comp is not None and comp[1] > 0 and 0 < bb < ba < 100:
                     mid = (bb + ba) / 2.0
                     vals = [mid, None]
-                    for f in fairs:
-                        fair, raw = f.update(nxt, comp, bb, ba)
-                        vals.append(fair); vals[1] = mid + raw
+                    for wm in WINS:
+                        fval, raw = fair.update(nxt, comp, bb, ba, spot.move(nxt, wm), fv.sens(nxt))
+                        vals.append(fval); vals[1] = mid + raw
                     gt.append(nxt); gmid.append(mid); gf.append(vals)
             nxt += GRID
         k = e[0]

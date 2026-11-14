@@ -1,9 +1,11 @@
 """Tick-level backtest on recorder output.
 
 What is simulated
-  * Our information is the stream as received locally (receive timestamps).
+  * Decisions use the stream as received locally (receive timestamps), including its burst lag.
+  * Order transitions and fills run on exchange time (server timestamps): a quote that still
+    looks available in a lagging local book is not available to the simulated order.
   * Every action (place, cancel) takes effect `lat_ms` after the decision: this is the full
-    round trip (our uplink plus the delay with which we saw the market).
+    round trip (our uplink plus the smallest delay with which we see the market).
   * Post-only: an order that would cross when it arrives is rejected.
   * Queue: on arrival we join behind the displayed size at our price (times `queue_mult` to
     mimic more competing makers). The queue only shrinks through trades at our level; size
@@ -37,27 +39,21 @@ GRID_MS = 50
 
 
 def run_market(rec_dir, start, path, p: Params, mode="maker", lat_ms=150, queue_mult=1.0,
-               outcome=None, dur=300, taker_theta=1.0, journal=None):
+               outcome=None, dur=300, taker_theta=1.0, journal=None, source="coinbase"):
     spot = SpotSeries()
     ex = PaperExecutor(None, lat_ms, queue_mult)
     ses = MarketSession(start, p, spot, ex, dur, mode, journal, taker_theta)
     ex.book = ses.book
     end_ms = ses.end_ms
     next_dec = ses.start_ms
-    for e in merged(rec_dir, start, path, dur):
+    for e in merged(rec_dir, start, path, dur, source=source):
         t = e[1]
-        while next_dec <= t and next_dec < end_ms:
-            ex.on_time(next_dec); ses.on_timer(next_dec); next_dec += GRID_MS
-        ex.on_time(t)
-        k = e[0]
-        if k == "S":
+        while next_dec <= t and next_dec < end_ms:      # decisions see only what had been received
+            ses.on_timer(next_dec); next_dec += GRID_MS
+        if e[0] == "S":
             spot.update(t, e[2])
-        elif k == "B":
-            ses.on_snapshot(e[2], e[3])
-        elif k == "P":
-            ses.on_level(e[2], e[3], e[4])
-        elif k == "T":
-            ses.on_trade(e[2], e[3], e[4], t)
+        else:
+            ses.feed(e)                                  # fills and order transitions run on exchange time
     return ses.settle(outcome) if outcome is not None else ses.settle()
 
 
@@ -73,12 +69,21 @@ def summarize(results, label=""):
     sd = statistics.pstdev(pnl) if len(pnl) > 1 else 0.0
     traded = [r for r in rs if r.fills]
     mo_sh = sum(r.markout_shares for r in rs)
+    mo5_sh = sum(r.markout5_shares for r in rs)
+    # standard error of the 5 s markout per share, treating markets as independent
+    per = [(r.markout5, r.markout5_shares) for r in rs if r.markout5_shares > 0]
+    mo5 = 100 * sum(a for a, _ in per) / mo5_sh if mo5_sh else 0.0
+    mo5_se = 0.0
+    if len(per) > 2:
+        mo5_se = 100 * math.sqrt(sum((a - mo5 / 100 * b) ** 2 for a, b in per)) / mo5_sh
+    fee_sh = 100 * sum(r.fees for r in rs) / shares if shares else 0.0
     return {
         "label": label, "markets": len(rs), "traded": len(traded), "fills": sum(r.fills for r in rs),
         "shares": shares, "cost": sum(r.cost for r in rs), "fees": sum(r.fees for r in rs),
         "pnl": sum(pnl), "rebate": sum(r.rebate for r in rs),
         "pnl_per_share_c": 100 * sum(pnl) / shares if shares else 0.0,
         "markout60_per_share_c": 100 * sum(r.markout for r in rs) / mo_sh if mo_sh else 0.0,
+        "markout5_per_share_c": mo5, "markout5_se_c": mo5_se, "fee_per_share_c": fee_sh,
         "win_rate": 100 * sum(1 for r in traded if r.pnl > 0) / len(traded) if traded else 0.0,
         "mean": statistics.mean(pnl), "stdev": sd,
         "sharpe_per_market": statistics.mean(pnl) / sd if sd else 0.0,
@@ -88,15 +93,16 @@ def summarize(results, label=""):
     }
 
 
-HEADER = (f"{'run':<26}{'mkts':>5}{'fills':>7}{'shares':>8}{'pnl$':>9}{'c/share':>8}{'mo60 c':>8}"
-          f"{'rebate$':>8}{'win%':>6}{'t-stat':>7}{'maxDD$':>8}{'cancels':>8}")
+HEADER = (f"{'run':<28}{'mkts':>5}{'fills':>6}{'shares':>7}{'pnl$':>9}{'c/sh':>7}{'mo5 c':>7}{'+-se':>6}{'mo60 c':>7}"
+          f"{'fee c':>6}{'reb$':>7}{'win%':>6}{'t':>6}{'maxDD$':>8}{'cancels':>8}")
 
 
 def fmt(s):
     if not s.get("markets"):
-        return f"{s['label']:<26} no resolved markets"
-    return (f"{s['label']:<26}{s['markets']:5d}{s['fills']:7d}{s['shares']:8.0f}{s['pnl']:9.2f}{s['pnl_per_share_c']:8.2f}"
-            f"{s['markout60_per_share_c']:8.2f}{s['rebate']:8.2f}{s['win_rate']:6.1f}{s['tstat']:7.2f}{s['max_dd']:8.2f}{s['canceled']:8d}")
+        return f"{s['label']:<28} no resolved markets"
+    return (f"{s['label']:<28}{s['markets']:5d}{s['fills']:6d}{s['shares']:7.0f}{s['pnl']:9.2f}{s['pnl_per_share_c']:7.2f}"
+            f"{s['markout5_per_share_c']:7.2f}{s['markout5_se_c']:6.2f}{s['markout60_per_share_c']:7.2f}{s['fee_per_share_c']:6.2f}"
+            f"{s['rebate']:7.2f}{s['win_rate']:6.1f}{s['tstat']:6.2f}{s['max_dd']:8.2f}{s['canceled']:8d}")
 
 
 def run_all(rec_dir, p, mode="maker", lat_ms=150, queue_mult=1.0, outcomes=None, markets=None, taker_theta=1.0):

@@ -20,14 +20,23 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
-def backfill_spot(spot: SpotSeries, symbol="BTCUSDT"):
-    """Seed ~16 minutes of 1s closes so the model is usable immediately after start."""
+def backfill_spot(spot: SpotSeries, first_live_ms: int, first_live_mid: float, symbol="BTCUSDT"):
+    """Seed ~16 minutes of 1s history so volatility is known right after start.
+
+    The history comes from Binance and is shifted to the level of the live source, so the splice
+    does not show up as a price jump. Only volatility is taken from it: fair value never uses the
+    model's level (see strategy.Fair).
+    """
     req = urllib.request.Request(KLINES.format(sym=symbol), headers={"User-Agent": "polybot/1.0"})
     with urllib.request.urlopen(req, timeout=15) as r:
-        rows = json.load(r)
+        rows = [k for k in json.load(r) if int(k[6]) < first_live_ms]
+    if not rows:
+        return None
+    shift = first_live_mid - float(rows[-1][4])
+    hist = SpotSeries(spot.vol_lookback, spot.keep)
     for k in rows:
-        spot.update(int(k[6]), float(k[4]))     # close time, close price
-    return len(rows)
+        hist.update(int(k[6]), float(k[4]) + shift)     # close time, shifted close
+    return hist, len(rows)
 
 
 class Bot:
@@ -50,18 +59,31 @@ class Bot:
     async def run(self, max_markets: int | None = None):
         cfg = self.cfg
         dur = DUR[cfg.tf]
+        first = asyncio.get_running_loop().create_future()
+
+        def first_tick(t, mid):
+            if not first.done():
+                first.set_result((t, mid))
+            else:
+                self.on_mid(t, mid)
+
+        tasks = [asyncio.create_task(spot_feed(first_tick, cfg.asset, log, self.on_spot_alive, cfg.spot_source))]
+        t0, mid0 = await first
         try:
-            n = await asyncio.to_thread(backfill_spot, self.spot, cfg.asset.upper() + "USDT")
-            log(f"spot backfilled with {n} seconds")
+            got = await asyncio.to_thread(backfill_spot, self.spot, t0, mid0, cfg.asset.upper() + "USDT")
+            if got:
+                self.spot, n = got
+                log(f"volatility history seeded with {n} seconds")
         except Exception as e:
-            log(f"spot backfill failed ({e!r}); the model needs ~16 minutes of live data first")
-        tasks = [asyncio.create_task(spot_feed(self.on_mid, cfg.asset + "usdt", log, self.on_spot_alive))]
+            log(f"history seed failed ({e!r}); quoting starts after ~6 minutes of live data")
+        self.on_mid(t0, mid0)
         if cfg.mode == "live":
             from .live import LiveClient
             self.live = await LiveClient(cfg.private_key, cfg.wallet, cfg.relayer_key, cfg.relayer_address,
                                          self.risk, log, cfg.heartbeat).start()
-        self.journal.write(now_ms(), 0, "start", params=vars(cfg.params), limits=vars(cfg.limits),
-                           lat_ms=cfg.lat_ms, queue_mult=cfg.queue_mult)
+        self.journal.write(now_ms(), 0, "start", strategy=cfg.strategy, taker_theta=cfg.taker_theta,
+                           params=vars(cfg.params), limits=vars(cfg.limits), lat_ms=cfg.lat_ms,
+                           queue_mult=cfg.queue_mult, spot_source=cfg.spot_source)
         sessions = []
         try:
             while max_markets is None or len(self.started) < max_markets or any(not s.done() for s in sessions):
@@ -98,7 +120,7 @@ class Bot:
             ex = self.live_exec(market)
         else:
             ex = PaperExecutor(None, cfg.lat_ms, cfg.queue_mult)
-        ses = MarketSession(start, cfg.params, self.spot, ex, dur, "maker", self.journal)
+        ses = MarketSession(start, cfg.params, self.spot, ex, dur, cfg.strategy, self.journal, cfg.taker_theta)
         if cfg.mode != "live":
             ex.book = ses.book
         feed = _Feed(ses, ex, cfg.mode)
@@ -108,8 +130,6 @@ class Bot:
             await asyncio.sleep(max(0.0, start - time.time()))
             while time.time() < start + dur:
                 t = now_ms()
-                if cfg.mode != "live":
-                    ex.on_time(t)
                 halt = "" if ok else why
                 halt = halt or self.risk.halt_reason(t, start, ses.res.cost, self.spot_ms, feed.last_ms)
                 if halt and not ses.halted:
@@ -160,22 +180,19 @@ class Bot:
 
 
 class _Feed:
-    """Adapts market_feed callbacks to a session; in paper mode it also drives the fill model."""
+    """Adapts market_feed to a session. Paper mode: the session's fill model consumes every event.
+    Live mode: only the book is maintained; fills come from the exchange."""
 
     def __init__(self, ses, ex, mode):
-        self.ses, self.ex, self.paper, self.last_ms = ses, ex, mode != "live", 0
+        self.ses, self.paper, self.last_ms = ses, mode != "live", 0
 
     def on_feed(self, t):
         self.last_ms = t
+
+    def feed(self, e):
         if self.paper:
-            self.ex.on_time(t)
-
-    def on_snapshot(self, bids, asks):
-        self.ses.on_snapshot(bids, asks)
-
-    def on_level(self, side, price_c, size):
-        self.ses.on_level(side, price_c, size)
-
-    def on_trade(self, taker_side, price_c, size, t):
-        if self.paper:
-            self.ses.on_trade(taker_side, price_c, size, t)
+            self.ses.feed(e)
+        elif e[0] == "P":
+            self.ses.on_level(e[2], e[3], e[4])
+        elif e[0] == "B":
+            self.ses.on_snapshot(e[2], e[3])

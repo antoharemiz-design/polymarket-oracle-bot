@@ -1,8 +1,9 @@
 """Live execution through the official `polymarket-client` SDK.
 
 Rules this module enforces (they answer the ghost-fill and orphan-order bugs of the old bot):
-  * Orders are post-only limit BUYs. Nothing is ever replaced in place: an order is cancelled,
-    the cancellation is confirmed, and only then may a new one be placed on that side.
+  * Maker quotes are post-only limit BUYs. Nothing is ever replaced in place: an order is
+    cancelled, the cancellation is confirmed, and only then may a new one be placed on that side.
+  * Taker orders are fill-and-kill BUYs capped at the price seen when the decision was made.
   * A fill is counted only from the cumulative `size_matched` of an order reported on the
     authenticated user stream. A cancelled or vanished order is never counted as filled.
   * If the result of a request is unknown (timeout, transport error), every order of ours in
@@ -198,6 +199,39 @@ class MarketExec:
         self.busy = {"B": False, "S": False}
         if self.session is not None:
             self.session._log(now_ms(), "cancel_market", reason="unknown_order_state")
+
+    def take(self, side, limit_c, size, now):
+        """Marketable FAK buy capped at the price seen at decision time (Up-token cents)."""
+        if self.taker is not None:
+            return
+        self.taker = (now, side, limit_c, size)
+        asyncio.create_task(self._take(side, limit_c, size))
+
+    async def _take(self, side, limit_c, size):
+        paid_cap = limit_c if side == "B" else 100 - limit_c
+        try:
+            resp = await self.live.client.place_market_order(
+                token_id=self._token(side), side="BUY", shares=str(size),
+                max_price=str(Decimal(paid_cap) / 100), order_type="FAK")
+        except Exception as e:
+            # outcome unknown: the user stream or the balance reconciliation will reveal any fill
+            self.live.log(f"take failed with unknown outcome: {e!r}")
+            self.live.risk.on_error()
+            self.taker = None
+            return
+        self.live.risk.on_ok()
+        try:
+            if getattr(resp, "ok", False):
+                got = Decimal(resp.taking_amount)
+                if got > 0:
+                    paid_c = float(Decimal(resp.making_amount) / got * 100)
+                    self.matched[resp.order_id] = got            # later stream events must not double count
+                    self.session.on_fill(side, paid_c if side == "B" else 100 - paid_c, float(got), now_ms(), True)
+                self.live.register(resp.order_id, self, side)
+            else:
+                self.session.on_reject(side, limit_c, now_ms(), getattr(resp, "code", "rejected"))
+        finally:
+            self.taker = None
 
     def on_order_event(self, side, payload):
         prev = self.matched.get(payload.id, Decimal(0))

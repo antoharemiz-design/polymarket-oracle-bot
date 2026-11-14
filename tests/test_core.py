@@ -116,13 +116,25 @@ class StrategyTest(unittest.TestCase):
         self.assertTrue(keep(p, "S", 52, 50.5, 0, 0))
         self.assertFalse(keep(p, "S", 52, 51.5, 0, 0))
 
-    def test_fair_follows_spot_but_absorbs_slow_gap(self):
-        f = Fair(halflife_s=20)
-        fair, raw = f.update(0, (10.0, 20.0), 49, 50)        # model says 69c, book says 49.5c
-        self.assertAlmostEqual(fair, 49.5, delta=0.01)       # the standing gap is treated as basis
+    def test_fair_is_mid_plus_unpriced_spot_move(self):
+        f = Fair(k=1.0)
+        fair, raw = f.update(0, (10.0, 20.0), 49, 50)                  # model level says 69c, book 49.5c
+        self.assertAlmostEqual(fair, 49.5, delta=0.01)                 # the level disagreement is ignored
         self.assertGreater(raw, 15)
-        fair2, _ = f.update(100, (14.0, 20.0), 49, 50)       # spot jumps $4, book has not moved yet
-        self.assertGreater(fair2, fair + 5)
+        up, _ = f.update(100, (10.0, 20.0), 49, 50, spot_move=4.0)     # spot just rose $4
+        self.assertAlmostEqual(up, 49.5 + 100 * 0.3989 / 20 * 4, delta=0.1)
+        late, _ = f.update(100, (10.0, 20.0), 49, 50, spot_move=4.0, sens=0.25)   # 15 s of the TWAP left
+        self.assertAlmostEqual(late - 49.5, (up - 49.5) / 4, delta=0.05)
+        down, _ = f.update(100, (10.0, 20.0), 49, 50, spot_move=-4.0)
+        self.assertAlmostEqual(down, 49.5 - (up - 49.5), delta=0.01)
+
+    def test_spot_move_window(self):
+        s = SpotSeries()
+        for t, px in ((1000, 100.0), (1300, 101.0), (1700, 103.0), (2000, 106.0)):
+            s.update(t, px)
+        self.assertAlmostEqual(s.move(2000, 500), 106.0 - 101.0)       # latest tick at or before 1500
+        self.assertAlmostEqual(s.move(2000, 250), 106.0 - 103.0)
+        self.assertAlmostEqual(s.move(2000, 5000), 0.0)                # no tick that old
 
 
 class PaperExecutorTest(unittest.TestCase):
@@ -195,6 +207,15 @@ class PaperExecutorTest(unittest.TestCase):
         ses.on_level("S", 50, 0.0)                       # the quote we wanted is pulled meanwhile
         ex.on_time(1350)
         self.assertEqual(ses.res.fills, 0)               # best ask is now 51 > limit: nothing bought
+
+    def test_fills_use_exchange_time_not_receive_time(self):
+        ex, ses = self.make(lat=100)
+        ses.feed(("P", 10_050, "S", 60, 5.0, 10_000))            # establishes a 50 ms minimum feed lag
+        ex.take("B", 50, 10, 10_100)                             # matched at exchange time 10_450
+        # the 50c offer was pulled on the exchange at 10_300 but the message reached us at 10_900
+        ses.feed(("P", 10_900, "S", 50, 0.0, 10_250))
+        ses.feed(("P", 10_950, "S", 52, 9.0, 10_900))            # first event after the match time
+        self.assertEqual(ses.res.fills, 0)                       # nothing left at or below the limit
 
     def test_settlement(self):
         ex, ses = self.make()

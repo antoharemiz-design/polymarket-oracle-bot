@@ -28,6 +28,7 @@ class SpotSeries:
         self.last_ms = 0
         self._r2 = deque()            # squared 1s log returns, aligned with samples[1:]
         self._r2_sum = 0.0
+        self.ticks = deque()          # (ts_ms, mid) of the last few seconds, for short-horizon moves
 
     def update(self, ts_ms: int, mid: float) -> None:
         sec = ts_ms // 1000
@@ -37,6 +38,20 @@ class SpotSeries:
             self._fill_to(sec)        # boundaries passed before this tick carry the previous mid
         self.last_mid = mid
         self.last_ms = ts_ms
+        tk = self.ticks
+        tk.append((ts_ms, mid))
+        while len(tk) > 2 and tk[1][0] <= ts_ms - 10000:
+            tk.popleft()
+
+    def move(self, now_ms: int, window_ms: int) -> float:
+        """Spot change in dollars over the last `window_ms` (0 if there is no tick that old)."""
+        cut = now_ms - window_ms
+        ref = None
+        for ts, mid in reversed(self.ticks):
+            if ts <= cut:
+                ref = mid
+                break
+        return 0.0 if ref is None or self.last_mid is None else self.last_mid - ref
 
     def _fill_to(self, sec: int) -> None:
         nxt = self.sec0 + len(self.samples)
@@ -125,6 +140,11 @@ class FairValue:
                 acc += d * (2 * (n - k) + 1)
             var = sig * sig * acc / (TW * TW)
         return mean - self.strike, math.sqrt(var + 1e-12)
+
+    def sens(self, now_ms: int) -> float:
+        """d(expected final TWAP)/d(spot): 1 before the final minute, then the share still open."""
+        left = self.end - now_ms / 1000.0
+        return 1.0 if left >= TW else max(0.0, left / TW)
 
     def p_up(self, now_ms: int):
         c = self.components(now_ms)

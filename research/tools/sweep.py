@@ -14,26 +14,35 @@ from polybot.sim import HEADER, fmt, run_market, summarize  # noqa: E402
 from polybot.strategy import Params              # noqa: E402
 
 BASE = dict(clip=10.0, max_net=50.0, max_gross=400.0)
+MM = dict(edge=2.0, edge_cancel=1.0)
 CONFIGS = [
     # --- hypothesis 3: passive market making ---------------------------------------------------
-    ("mm book-mid only",          "mid",   150, 1.0, dict(edge=1.0, edge_cancel=0.5), 0),
-    ("mm model e=1",              "maker", 150, 1.0, dict(edge=1.0, edge_cancel=0.5), 0),
-    ("mm model e=2",              "maker", 150, 1.0, dict(edge=2.0, edge_cancel=1.0), 0),
-    ("mm model e=3",              "maker", 150, 1.0, dict(edge=3.0, edge_cancel=1.5), 0),
-    ("mm model e=2 hl=5",         "maker", 150, 1.0, dict(edge=2.0, edge_cancel=1.0, gap_halflife=5.0), 0),
-    ("mm model e=2 hl=60",        "maker", 150, 1.0, dict(edge=2.0, edge_cancel=1.0, gap_halflife=60.0), 0),
-    ("mm model e=2 early<=120s",  "maker", 150, 1.0, dict(edge=2.0, edge_cancel=1.0, t_off=120.0), 0),
-    ("mm model e=2 net<=20",      "maker", 150, 1.0, dict(edge=2.0, edge_cancel=1.0, max_net=20.0), 0),
-    # --- sensitivity to latency and competition ------------------------------------------------
-    ("mm model e=2 lat=200",      "maker", 200, 1.0, dict(edge=2.0, edge_cancel=1.0), 0),
-    ("mm model e=2 lat=250",      "maker", 250, 1.0, dict(edge=2.0, edge_cancel=1.0), 0),
-    ("mm model e=2 lat=350",      "maker", 350, 1.0, dict(edge=2.0, edge_cancel=1.0), 0),
-    ("mm model e=2 queue x2",     "maker", 150, 2.0, dict(edge=2.0, edge_cancel=1.0), 0),
-    ("mm model e=2 queue x4",     "maker", 150, 4.0, dict(edge=2.0, edge_cancel=1.0), 0),
-    # --- hypothesis 2: taking on the spot model -------------------------------------------------
-    ("taker theta=1c",            "taker", 150, 1.0, dict(), 1.0),
-    ("taker theta=2c",            "taker", 150, 1.0, dict(), 2.0),
-    ("taker theta=2c lat=350",    "taker", 350, 1.0, dict(), 2.0),
+    ("mm book-mid only e=1",      "mid",   150, 1.0, dict(edge=1.0, edge_cancel=0.5), 0),
+    ("mm book-mid only e=2",      "mid",   150, 1.0, MM, 0),
+    ("mm fast e=1",               "maker", 150, 1.0, dict(edge=1.0, edge_cancel=0.5), 0),
+    ("mm fast e=2",               "maker", 150, 1.0, MM, 0),
+    ("mm fast e=3",               "maker", 150, 1.0, dict(edge=3.0, edge_cancel=1.5), 0),
+    ("mm fast e=2 win=250ms",     "maker", 150, 1.0, dict(MM, fast_ms=250), 0),
+    ("mm fast e=2 win=1000ms",    "maker", 150, 1.0, dict(MM, fast_ms=1000), 0),
+    ("mm fast e=2 k=1.5",         "maker", 150, 1.0, dict(MM, fast_k=1.5), 0),
+    ("mm fast e=2 first 120s",    "maker", 150, 1.0, dict(MM, t_off=120.0), 0),
+    ("mm fast e=2 net<=20",       "maker", 150, 1.0, dict(MM, max_net=20.0), 0),
+    # sensitivity: latency and competition
+    ("mm fast e=2 lat=200",       "maker", 200, 1.0, MM, 0),
+    ("mm fast e=2 lat=250",       "maker", 250, 1.0, MM, 0),
+    ("mm fast e=2 lat=350",       "maker", 350, 1.0, MM, 0),
+    ("mm fast e=2 queue x2",      "maker", 150, 2.0, MM, 0),
+    ("mm fast e=2 queue x4",      "maker", 150, 4.0, MM, 0),
+    # --- hypothesis 2: taking stale quotes on the fast spot signal ------------------------------
+    ("taker th=1c",               "taker", 150, 1.0, dict(), 1.0),
+    ("taker th=2c",               "taker", 150, 1.0, dict(), 2.0),
+    ("taker th=3c",               "taker", 150, 1.0, dict(), 3.0),
+    ("taker th=2c win=250ms",     "taker", 150, 1.0, dict(fast_ms=250), 2.0),
+    ("taker th=2c win=1000ms",    "taker", 150, 1.0, dict(fast_ms=1000), 2.0),
+    ("taker th=2c lat=200",       "taker", 200, 1.0, dict(), 2.0),
+    ("taker th=2c lat=250",       "taker", 250, 1.0, dict(), 2.0),
+    ("taker th=2c lat=350",       "taker", 350, 1.0, dict(), 2.0),
+    ("taker th=2c lat=600",       "taker", 600, 1.0, dict(), 2.0),
 ]
 
 

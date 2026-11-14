@@ -52,6 +52,8 @@ class Result:
     rejected: int = 0
     markout: float = 0.0            # dollars, vs book mid 60 s after each fill
     markout_shares: float = 0.0
+    markout5: float = 0.0           # dollars, vs book mid 5 s after each fill (low-noise edge estimate)
+    markout5_shares: float = 0.0
     pnl: float | None = None
 
 
@@ -138,15 +140,47 @@ class MarketSession:
         self.start_ms, self.end_ms = start * 1000, (start + dur) * 1000
         self.book = book if book is not None else UpBook()
         self.fv = FairValue(spot, start, dur)
-        self.fair = Fair(p.gap_halflife)
+        self.fair = Fair(p.fast_k)
         self.res = Result(start=start)
         self.fill_log = []            # (t, sign, price_c, shares)
         self.grid_t, self.grid_mid = [], []
+        self.min_lag = None           # smallest (receive - exchange) timestamp gap seen, ms
         self.halted = False           # set by risk control: pull quotes, place nothing
         self.last = {}                # last decision inputs, for the journal
         executor.session = self
 
     # ---- market data -------------------------------------------------------------------------
+    def exch_time(self, recv_ms: int, srv_ms: int) -> int:
+        """Exchange time of an event on the local clock: srv + (smallest feed delay seen so far).
+
+        Our view of the book is `recv`; what the exchange had already done is `srv`. In bursts the
+        feed lags by hundreds of ms, so a quote that still looks available locally may be long
+        gone. Order transitions and fills are therefore timed on this clock, decisions on `recv`.
+        """
+        if not srv_ms:
+            return recv_ms
+        lag = recv_ms - srv_ms
+        if self.min_lag is None or lag < self.min_lag:
+            self.min_lag = lag
+        return srv_ms + self.min_lag
+
+    def feed(self, e):
+        """Apply one normalized market event (see polybot.replay) with paper-execution timing."""
+        k = e[0]
+        if k == "P":
+            tau = self.exch_time(e[1], e[5])
+            self._tick(tau); self.on_level(e[2], e[3], e[4])
+        elif k == "T":
+            tau = self.exch_time(e[1], e[6])
+            self._tick(tau); self.on_trade(e[2], e[3], e[4], tau)
+        elif k == "B":
+            tau = self.exch_time(e[1], e[4])
+            self._tick(tau); self.on_snapshot(e[2], e[3])
+
+    def _tick(self, tau):
+        if hasattr(self.ex, "on_time"):
+            self.ex.on_time(tau)
+
     def on_snapshot(self, bids, asks):
         self.book.snapshot(bids, asks)
 
@@ -207,7 +241,7 @@ class MarketSession:
             comp = self.fv.components(td) if self.spot.ready(self.start) else None
             if comp is None:
                 self._pull(td, "model_not_ready"); return
-        f, raw = self.fair.update(td, comp, bb, ba)
+        f, raw = self.fair.update(td, comp, bb, ba, self.spot.move(td, p.fast_ms) if comp is not None else 0.0, self.fv.sens(td))
         elapsed = (td - self.start_ms) / 1000.0
         self.last = {"bb": bb, "ba": ba, "fair": round(f, 2), "gap": round(raw, 2)}
         if self.halted:
@@ -252,8 +286,10 @@ class MarketSession:
             return
         net = r.q_up - r.q_dn
         if f - ba - fee_c(ba) >= self.taker_theta and net + p.clip <= p.max_net:
+            self._log(td, "take", side="B", limit=ba, size=p.clip, edge=round(f - ba - fee_c(ba), 2))
             ex.take("B", ba, p.clip, td)
         elif bb - f - fee_c(bb) >= self.taker_theta and -net + p.clip <= p.max_net:
+            self._log(td, "take", side="S", limit=bb, size=p.clip, edge=round(bb - f - fee_c(bb), 2))
             ex.take("S", bb, p.clip, td)
 
     # ---- settlement --------------------------------------------------------------------------
@@ -271,10 +307,14 @@ class MarketSession:
         r.outcome, r.outcome_src = outcome, src if outcome is not None else ""
         if outcome is not None:
             r.pnl = (r.q_up if outcome == 0 else r.q_dn) - r.cost - r.fees
-        r.markout = r.markout_shares = 0.0
+        r.markout = r.markout_shares = r.markout5 = r.markout5_shares = 0.0
         for t, sign, price_c, sh in self.fill_log:
             j = bisect.bisect_right(self.grid_t, t + 60000) - 1
             if j >= 0 and self.grid_t[j] >= t + 60000 - 200:
                 r.markout += sh * sign * (self.grid_mid[j] - price_c) / 100.0
                 r.markout_shares += sh
+            j = bisect.bisect_right(self.grid_t, t + 5000) - 1
+            if j >= 0 and self.grid_t[j] >= t + 5000 - 200:
+                r.markout5 += sh * sign * (self.grid_mid[j] - price_c) / 100.0
+                r.markout5_shares += sh
         return r

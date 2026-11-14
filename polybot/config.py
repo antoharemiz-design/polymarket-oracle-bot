@@ -27,6 +27,9 @@ class Config:
     mode: str = "paper"                 # "paper" or "live"; live also needs --i-understand-live on the CLI
     asset: str = "btc"
     tf: str = "5m"
+    spot_source: str = "coinbase"       # "coinbase" or "binance"
+    strategy: str = "taker"             # "taker" (fast spot signal) or "maker" (post-only quotes)
+    taker_theta: float = 1.0            # taker: required edge after fee and spread, cents
     lat_ms: int = 150                   # paper: assumed round-trip latency of every action
     queue_mult: float = 1.0             # paper: multiplier on the queue ahead of us
     journal_dir: str = "journal"
@@ -43,7 +46,7 @@ def from_env() -> Config:
     load_dotenv()
     c = Config()
     env = os.environ
-    for f in ("mode", "asset", "tf", "lat_ms", "queue_mult", "journal_dir", "heartbeat"):
+    for f in ("mode", "asset", "tf", "spot_source", "strategy", "taker_theta", "lat_ms", "queue_mult", "journal_dir", "heartbeat"):
         raw = env.get("BOT_" + f.upper())
         if raw is not None:
             setattr(c, f, _cast(getattr(c, f), raw))
