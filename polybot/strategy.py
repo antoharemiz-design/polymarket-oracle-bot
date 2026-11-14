@@ -36,15 +36,15 @@ class Quote:
 class Fair:
     """Fair value in cents = book mid + the part of the latest spot move the book has not priced yet.
 
-    Measured on recorded ticks (research/03_backtest.md): the Polymarket book follows Binance
-    with a lag of roughly one second. The spot move of the last ~500 ms, converted to cents
-    with the model delta, predicts the next move of the book mid (correlation 0.33-0.39, and
-    the mid covers about that full distance within 3 s).
+    Measured on recorded ticks (research/03_backtest.md): the Polymarket book follows spot
+    with a lag of roughly one second. The spot move of the last 250-500 ms, converted to cents
+    with the model delta, predicts the next move of the book mid (correlation 0.33-0.40, and
+    the mid covers about that full distance within 1-3 s).
 
     Only the model's *sensitivity* is used, evaluated at the probability the book implies.
     The model's level is not: it is built on Binance while the market settles on Chainlink,
-    and near the strike a one-dollar basis is worth several cents. On 1,268 markets the level
-    deserved a weight of only 0.12 +- 0.09 against the traded price.
+    and near the strike a one-dollar basis is worth several cents. On 2,749 markets the level
+    deserved a weight of only 0.14 +- 0.07 against the traded price.
     """
 
     _nd = None
