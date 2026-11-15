@@ -50,7 +50,8 @@ def run_market(rec_dir, start, path, p: Params, mode="maker", lat_ms=150, queue_
     ses = MarketSession(start, p, spot, ex, dur, mode, journal, taker_theta)
     ex.book = ses.book
     end_ms = ses.end_ms
-    next_dec = ses.start_ms + int(1000 * min(0.0, p.lad_place)) if mode == "ladder" else ses.start_ms
+    early = min(0.0, p.lad_place) if mode == "ladder" else min(0.0, p.t_on)
+    next_dec = ses.start_ms + int(1000 * early)                  # quoting may start before the window opens
     for e in (events if events is not None else merged(rec_dir, start, path, dur, source=source)):
         t = e[1]
         while next_dec <= t and next_dec < end_ms:      # decisions see only what had been received

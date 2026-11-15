@@ -145,6 +145,21 @@ EARLY = [
     ("control first 30s queue x2",    150, 2.0, dict(CTL, t_off=30.0)),
     ("control first 30s lat350",      350, 1.0, dict(CTL, t_off=30.0)),
 ]
+MID = dict(clip=10.0, max_net=30.0, max_gross=400.0, edge=1.0, edge_cancel=0.5, skew=1.0, use_model=False)
+EARLY2 = [
+    ("mid-quote -20..30s edge1",      150, 1.0, dict(MID, t_on=-20.0, t_off=30.0), "mid"),
+    ("mid-quote -20..30s edge2",      150, 1.0, dict(MID, t_on=-20.0, t_off=30.0, edge=2.0, edge_cancel=1.0), "mid"),
+    ("mid-quote 0..30s edge1",        150, 1.0, dict(MID, t_on=0.0, t_off=30.0), "mid"),
+    ("mid-quote -20..30s share<25%",  150, 1.0, dict(MID, t_on=-20.0, t_off=30.0, max_share=0.25), "mid"),
+    ("mid-quote -20..30s net<=60",    150, 1.0, dict(MID, t_on=-20.0, t_off=30.0, max_net=60.0), "mid"),
+    ("model-quote 5..30s edge1",      150, 1.0, dict(CTL, t_off=30.0, edge=1.0, edge_cancel=0.5), "maker"),
+    ("ladder rearm pre-20 stop 30s",  150, 1.0, dict(RA, lad_place=-20.0, lad_stop=30.0), "ladder"),
+    ("ladder rearm pre-20 stop 30 net30", 150, 1.0, dict(RA, lad_place=-20.0, lad_stop=30.0, max_net=30.0), "ladder"),
+    ("ladder rearm pre-20 stop 45 d0=1", 150, 1.0, dict(RA, lad_place=-20.0, lad_stop=45.0, lad_d0=1, lad_step=2), "ladder"),
+    ("mid-quote -20..30s edge1 q x2", 150, 2.0, dict(MID, t_on=-20.0, t_off=30.0), "mid"),
+    ("mid-quote -20..30s edge1 lat350", 350, 1.0, dict(MID, t_on=-20.0, t_off=30.0), "mid"),
+]
+
 # research/PREREGISTRATION_2.md, frozen 2026-11-15 08:30 UTC
 P1 = dict(RA, lad_place=-20.0, lad_stop=45.0)
 P2 = dict(RA, lad_stop=45.0)
@@ -156,10 +171,12 @@ PREREG = []
 for name, cfg, mode in (("P1 ladder rearm pre-20 stop 45s", P1, "ladder"), ("P2 ladder rearm stop 45s", P2, "ladder"),
                         ("P3 control first 30s", P3, "maker"), ("P4 ladder rearm d0=3 step4", P4, "ladder"),
                         ("P5 candidate join>=20", P5, "maker"), ("P6 candidate share<10%", P6, "maker"),
+                        ("P7 ladder pre-20 stop30 net30", dict(RA, lad_place=-20.0, lad_stop=30.0, max_net=30.0), "ladder"),
+                        ("P8 ladder pre-20 stop 30s", dict(RA, lad_place=-20.0, lad_stop=30.0), "ladder"),
                         ("R  control", CTL, "maker")):
     PREREG += [(name, 150, 1.0, cfg, mode), (name + " q x2", 150, 2.0, cfg, mode), (name + " lat350", 350, 1.0, cfg, mode)]
 SETS = {"step2": CONFIGS, "momentum": MOMENTUM, "share": SHARE, "rewards": REWARDS, "ladder": LADDER, "ladder2": LADDER2,
-        "early": EARLY, "prereg": PREREG}
+        "early": EARLY, "prereg": PREREG, "early2": EARLY2}
 
 
 REAL = False

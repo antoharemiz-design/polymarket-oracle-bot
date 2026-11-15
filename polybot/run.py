@@ -5,7 +5,7 @@ import time
 import urllib.request
 
 from .config import Config
-from .engine import MarketSession, PaperExecutor
+from .engine import MarketSession, MultiPaperExecutor, PaperExecutor
 from .fairvalue import SpotSeries
 from .feeds import market_feed, now_ms, spot_feed
 from .journal import Journal
@@ -119,7 +119,7 @@ class Bot:
         if cfg.mode == "live":
             ex = self.live_exec(market)
         else:
-            ex = PaperExecutor(None, cfg.lat_ms, cfg.queue_mult)
+            ex = (MultiPaperExecutor if cfg.strategy == "ladder" else PaperExecutor)(None, cfg.lat_ms, cfg.queue_mult)
         ses = MarketSession(start, cfg.params, self.spot, ex, dur, cfg.strategy, self.journal, cfg.taker_theta)
         if cfg.mode != "live":
             ex.book = ses.book
@@ -127,7 +127,8 @@ class Bot:
         ftask = asyncio.create_task(market_feed(market["token_up"], market["token_down"], feed, start + dur + 10, log))
         self.journal.write(now_ms(), start, "session_open", slug=market["slug"], allowed=ok, reason=why)
         try:
-            await asyncio.sleep(max(0.0, start - time.time()))
+            first = start + min(0.0, cfg.params.lad_place if cfg.strategy == "ladder" else cfg.params.t_on)
+            await asyncio.sleep(max(0.0, first - time.time()))
             while time.time() < start + dur:
                 t = now_ms()
                 halt = "" if ok else why

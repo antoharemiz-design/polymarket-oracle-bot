@@ -30,6 +30,8 @@ def main():
                 sys.exit("live mode sends real orders. Re-run with --i-understand-live after paper validation.")
             if not cfg.private_key:
                 sys.exit("POLYMARKET_PRIVATE_KEY is not set")
+            if cfg.strategy == "ladder":
+                sys.exit("ladder mode is paper-only: the live executor supports one order per side")
         n = int(args[args.index("--markets") + 1]) if "--markets" in args else None
         try:
             totals = asyncio.run(Bot(cfg).run(n))

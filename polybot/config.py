@@ -28,7 +28,7 @@ class Config:
     asset: str = "btc"
     tf: str = "5m"
     spot_source: str = "coinbase"       # "coinbase" or "binance"
-    strategy: str = "taker"             # "taker" (fast spot signal) or "maker" (post-only quotes)
+    strategy: str = "maker"             # "maker" (post-only quotes), "ladder" (place and hold) or "taker" (closed, research/05)
     taker_theta: float = 1.0            # taker: required edge after fee and spread, cents
     lat_ms: int = 150                   # paper: assumed round-trip latency of every action
     queue_mult: float = 1.0             # paper: multiplier on the queue ahead of us
