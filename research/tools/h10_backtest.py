@@ -18,10 +18,11 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from h2_negrisk_scan import get  # noqa: E402
 
-T_START = calendar.timegm((2026, 11, 1, 0, 0, 0))
-T_SPLIT = calendar.timegm((2026, 11, 8, 0, 0, 0))
-T_END = calendar.timegm((2026, 11, 15, 21, 0, 0))
+T_START = int(os.environ.get("H10_T_START", calendar.timegm((2026, 11, 1, 0, 0, 0))))
+T_SPLIT = int(os.environ.get("H10_T_SPLIT", calendar.timegm((2026, 11, 8, 0, 0, 0))))
+T_END = int(os.environ.get("H10_T_END", calendar.timegm((2026, 11, 15, 21, 0, 0))))   # env overrides: H10L (October)
 CAPITAL = 10000.0
+CAP_MULT = float(os.environ.get("H10_CAP_MULT", "0"))   # H10C: position limit in units of N; 0 = no limit (H10)
 CONFIGS = ("best", "behind")
 
 
@@ -75,6 +76,8 @@ def fetch(snap_path, out):
     os.makedirs(out, exist_ok=True)
     snap = json.load(open(snap_path))
     port = {cfg: portfolio(snap, cfg) for cfg in CONFIGS}
+    if os.path.exists(f"{out}/portfolio.json"):
+        port = json.load(open(f"{out}/portfolio.json"))      # the portfolio fixed by snapshot 1 is reused
     json.dump(port, open(f"{out}/portfolio.json", "w"))
     allm = {p["cond"]: p for cfg in CONFIGS for p in port[cfg]}
     print({cfg: (len(port[cfg]), round(sum(p["cap"] for p in port[cfg]))) for cfg in CONFIGS}, "union", len(allm), flush=True)
@@ -93,9 +96,14 @@ def fetch(snap_path, out):
             cur = (d.get("pagination") or {}).get("next_cursor")
             if not cur or not data or min(r["timestamp"] for r in data) < T_START:
                 break
-        h = get("https://clob.polymarket.com/prices-history?" + urllib.parse.urlencode(
-            {"market": p["token"], "startTs": T_START, "endTs": T_END, "fidelity": 1}))
-        mids = [(x["t"], x["p"]) for x in (h.get("history") or [])]
+        mids = []
+        for a in range(T_START, T_END, 7 * 86400):          # the endpoint refuses long intervals at fidelity 1
+            try:
+                h = get("https://clob.polymarket.com/prices-history?" + urllib.parse.urlencode(
+                    {"market": p["token"], "startTs": a, "endTs": min(a + 7 * 86400, T_END), "fidelity": 1}))
+            except RuntimeError:
+                continue
+            mids += [(x["t"], x["p"]) for x in (h.get("history") or []) if T_START <= x["t"] < T_END]
         g = get("https://gamma-api.polymarket.com/markets?" + urllib.parse.urlencode({"condition_ids": cond}))
         status = None
         if g:
@@ -118,7 +126,8 @@ def fetch(snap_path, out):
 
 
 def simulate(p, h, recenter):
-    """worst-case fills of a two-sided quote at mid(prev) -/+ s; returns per-period [pnl, buys, sells, active_days]."""
+    """worst-case fills of a two-sided quote at mid(prev) -/+ s.
+    returns per period [pnl, fills buy, fills sell, reward-weighted active days, peak inventory $]."""
     mids = sorted(h["mids"])
     if not mids:
         return None
@@ -140,7 +149,14 @@ def simulate(p, h, recenter):
         used = collections.Counter()
         pos = cash = 0.0
         nb = ns = 0
+        peak = 0.0
+        cap = CAP_MULT * N if CAP_MULT else float("inf")
+        one_sided = 0.0                     # seconds with one side withdrawn at the position limit
+        last_t = ms[0][0]
         for ts, oi, side, px, sz in sorted(x for x in h["trades"] if a <= x[0] < b):
+            if abs(pos) >= cap - 1e-9 and ts > last_t:
+                one_sided += min(ts, ms[-1][0]) - last_t
+            last_t = max(last_t, ts)
             if res_t is not None and ts >= res_t:
                 continue
             k = ts // (60 * recenter)
@@ -154,21 +170,47 @@ def simulate(p, h, recenter):
                 buy_yes, y = side == "B", px
             else:
                 buy_yes, y = side != "B", 1 - px
-            if buy_yes and y >= ask - 1e-9 and used[(k, "a")] < N:
-                q = min(N - used[(k, "a")], sz); used[(k, "a")] += q
+            if buy_yes and y >= ask - 1e-9 and used[(k, "a")] < N and pos > -cap + 1e-9:
+                q = min(N - used[(k, "a")], sz, pos + cap); used[(k, "a")] += q
                 pos -= q; cash += q * ask; ns += 1
-            elif not buy_yes and y <= bid + 1e-9 and used[(k, "b")] < N:
-                q = min(N - used[(k, "b")], sz); used[(k, "b")] += q
+            elif not buy_yes and y <= bid + 1e-9 and used[(k, "b")] < N and pos < cap - 1e-9:
+                q = min(N - used[(k, "b")], sz, cap - pos); used[(k, "b")] += q
                 pos += q; cash -= q * bid; nb += 1
-        active = (ms[-1][0] - ms[0][0]) / 86400
-        out[part] = [cash + pos * mark, nb, ns, active]
+            peak = max(peak, abs(pos) * (m0 if pos > 0 else 1 - m0))
+        if abs(pos) >= cap - 1e-9 and ms[-1][0] > last_t:
+            one_sided += ms[-1][0] - last_t
+        span = ms[-1][0] - ms[0][0]
+        active = (span - one_sided * (2 / 3)) / 86400   # one-sided time earns 1/3 of the two-sided reward
+        out[part] = [cash + pos * mark, nb, ns, active, peak]
     return out
+
+
+def event_map(out, conds):
+    path = f"{out}/events.json"
+    if os.path.exists(path):
+        return json.load(open(path))
+    em = {}
+    conds = list(conds)
+    for i in range(0, len(conds), 40):
+        q = urllib.parse.urlencode([("condition_ids", c) for c in conds[i:i + 40]] + [("limit", 40)])
+        for m in get("https://gamma-api.polymarket.com/markets?" + q):
+            ev = (m.get("events") or [{}])[0]
+            em[m["conditionId"]] = str(ev.get("id") or m["conditionId"])
+    json.dump(em, open(path, "w"))
+    return em
+
+
+def tstat(groups):
+    v = list(groups.values())
+    mean = sum(v) / len(v); sd = math.sqrt(sum((x - mean) ** 2 for x in v) / len(v))
+    return mean / sd * math.sqrt(len(v)) if sd else 0.0
 
 
 def evaluate(out, snaps):
     port = json.load(open(f"{out}/portfolio.json"))
     hist = json.load(open(f"{out}/history.json"))
     snaps = [{m["cond"]: m for m in json.load(open(s))["markets"]} for s in snaps]
+    em = event_map(out, {p["cond"] for cfg in CONFIGS for p in port[cfg]})
     for cfg in CONFIGS:
         P = port[cfg]
         for comp_mult in (1.0, 2.0):
@@ -183,8 +225,8 @@ def evaluate(out, snaps):
                         continue
                     rw = [reward(sn[p["cond"]], cfg, comp_mult) if p["cond"] in sn else 0.0 for sn in snaps]
                     rday = sum(rw) / len(rw)
-                    for part, (pnl, nb, ns, act) in r.items():
-                        rows[part].append((p, rday * act, pnl - 0.01 * act, nb + ns, act))
+                    for part, (pnl, nb, ns, act, peak) in r.items():
+                        rows[part].append((p, rday * act, pnl - 0.01 * act, nb + ns, act, peak))
                 for part in ("sel", "hold"):
                     R = rows[part]
                     if not R:
@@ -194,10 +236,18 @@ def evaluate(out, snaps):
                     t = mean / sd * math.sqrt(len(net)) if sd else 0.0
                     days = (T_SPLIT - T_START if part == "sel" else T_END - T_SPLIT) / 86400
                     rew = sum(x[1] for x in R); fills = sum(x[2] for x in R); nf = sum(x[3] for x in R)
-                    cap = sum(x[0]["cap"] for x in R)
+                    cap = sum(x[0]["cap"] for x in R); inv = sum(x[5] for x in R)
+                    byev = collections.defaultdict(float)
+                    for x in R:
+                        byev[em.get(x[0]["cond"], x[0]["cond"])] += x[1] + x[2]
+                    top5 = sorted(byev.items(), key=lambda x: -x[1])[:5]
+                    rest = {k: v for k, v in byev.items() if k not in dict(top5)}
+                    conc = (f" | top-5 events ${sum(v for _, v in top5):6.0f}, without them ${sum(rest.values()):6.0f} "
+                            f"t {tstat(rest):5.2f}") if comp_mult == 1.0 and recenter == 1 else ""
                     print(f"{cfg:>6} comp x{comp_mult:.0f} recenter {recenter} min {('selection' if part == 'sel' else 'hold-out'):>9}: "
-                          f"markets {len(R):3d} cap ${cap:6.0f} | reward ${rew:8.0f} fills PnL ${fills:8.0f} ({nf} fills) "
-                          f"net ${rew + fills:8.0f} = ${(rew + fills) / days:6.0f}/day, t {t:5.2f}")
+                          f"markets {len(R):3d} events {len(byev):3d} cap ${cap:6.0f} + peak inventory ${inv:6.0f} | reward ${rew:8.0f} "
+                          f"fills PnL ${fills:8.0f} ({nf} fills) net ${rew + fills:8.0f} = ${(rew + fills) / days:6.0f}/day, "
+                          f"t(market) {t:5.2f} t(event) {tstat(byev):5.2f}" + conc)
         # concentration of fill losses
         worst = []
         for p in P:
