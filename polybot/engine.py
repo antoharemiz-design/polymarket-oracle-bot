@@ -36,6 +36,8 @@ class Order:
     state: str            # PENDING -> LIVE -> CANCELING
     t_eff: int = 1 << 62  # when the pending transition takes effect (paper)
     queue: float = 0.0    # shares ahead of us at our price (paper)
+    live_at: int = 0      # exchange time at which the order started resting (paper)
+    queue0: float = 0.0   # shares ahead of us when the order started resting (paper)
     order_id: str = ""    # exchange id (live)
 
 
@@ -62,13 +64,27 @@ class Result:
 
 
 class PaperExecutor:
-    """Execution model shared by backtest and paper trading (see polybot.sim docstring)."""
+    """Execution model shared by backtest and paper trading (see polybot.sim docstring).
 
-    def __init__(self, book: UpBook, lat_ms: int = 150, queue_mult: float = 1.0):
+    Calibration options (research/06_maker_inventory.md, step 3):
+      queue_mult   multiplier on the displayed size ahead of us when the order starts resting
+      fill_share   fraction of each at-price fill we keep: other makers at the same price with
+                   equal priority (1.0 = we are alone behind the displayed queue)
+      share_good   like fill_share, but applied only to fills that look favourable against the
+                   fair value at that moment; models competitors who quote the same good prices
+                   while nobody competes for toxic fills
+    Taker orders walk the book from the best price up to their limit.
+    """
+
+    def __init__(self, book: UpBook, lat_ms: int = 150, queue_mult: float = 1.0,
+                 fill_share: float = 1.0, share_good: float = 1.0):
         self.book, self.lat_ms, self.queue_mult = book, lat_ms, queue_mult
+        self.fill_share, self.share_good = fill_share, share_good
         self.orders = {"B": None, "S": None}
         self.taker = None             # (t_exec, side, limit, size)
         self.session = None
+        self.fill_meta = []           # (t, side, price, got, queue0, queue_before, trade_size, through, edge_vs_fair)
+        self.stale_trades = 0         # trades ignored because they happened before our order rested
 
     def order(self, side):
         return self.orders[side]
@@ -96,25 +112,36 @@ class PaperExecutor:
                 if crosses or not book.ready:
                     self.orders[side] = None; s.on_reject(side, o.price, t)
                 else:
-                    o.state = "LIVE"; o.queue = book.size(side, o.price) * self.queue_mult; o.t_eff = 1 << 62
+                    o.state = "LIVE"; o.queue = o.queue0 = book.size(side, o.price) * self.queue_mult
+                    o.live_at = o.t_eff; o.t_eff = 1 << 62
             elif o.state == "CANCELING":
                 self.orders[side] = None; s.on_canceled(side, o.price, t)
         if self.taker is not None and self.taker[0] <= t:
             _, side, limit, size = self.taker
             self.taker = None
             if book.ready:
-                if side == "B":
-                    px = book.best_ask()
-                    if px <= limit and px < 100:
-                        s.on_fill("B", px, min(size, book.size("S", px)), t, True)
-                else:
-                    px = book.best_bid()
-                    if px >= limit and px > 0:
-                        s.on_fill("S", px, min(size, book.size("B", px)), t, True)
+                self._walk(side, limit, size, t)
 
-    def on_level(self, side, price_c, size):
+    def _walk(self, side, limit, size, t):
+        """Marketable buy: consume price levels from the best one up to the limit."""
+        book, left = self.book, size
+        if side == "B":                                   # buy Up: lift Up asks, cheapest first
+            levels = sorted(p for p in book.asks if p <= limit and p < 100)
+            depth = book.asks
+        else:                                             # buy Down = hit Up bids, highest first
+            levels = sorted((p for p in book.bids if p >= limit and p > 0), reverse=True)
+            depth = book.bids
+        for px in levels:
+            if left <= 1e-9:
+                break
+            got = min(left, depth[px])
+            if got > 0:
+                self.session.on_fill(side, px, got, t, True)
+                left -= got
+
+    def on_level(self, side, price_c, size, t=None):
         o = self.orders[side]
-        if o is not None and o.state != "PENDING" and o.price == price_c:
+        if o is not None and o.state != "PENDING" and o.price == price_c and (t is None or t >= o.live_at):
             o.queue = min(o.queue, size * self.queue_mult)   # cancels are assumed to be behind us
 
     def on_trade(self, taker_side, px, sz, t):
@@ -122,18 +149,32 @@ class PaperExecutor:
         o = self.orders["B" if taker_side == "S" else "S"]
         if o is None or o.state == "PENDING" or sz <= 0:
             return
+        if t < o.live_at:                  # exchange timestamps are not monotonic: this trade
+            self.stale_trades += 1         # happened before our order was resting
+            return
         through = px < o.price if o.side == "B" else px > o.price
+        q_before = o.queue
         if through:
             got = min(o.rem, sz)
         elif px == o.price:
             got = max(0.0, min(o.rem, sz - o.queue)); o.queue = max(0.0, o.queue - sz)
         else:
             got = 0.0
-        if got > 0:
-            o.rem -= got
-            if o.rem < 1e-9:
-                self.orders[o.side] = None
-            self.session.on_fill(o.side, o.price, got, t, False)
+        if got <= 0:
+            return
+        fair = self.session.last.get("fair")
+        edge = None if fair is None else ((fair - o.price) if o.side == "B" else (o.price - fair))
+        share = self.fill_share
+        if self.share_good < 1.0 and edge is not None and edge >= 0:
+            share *= self.share_good
+        got *= share
+        if got < 1e-9:
+            return
+        self.fill_meta.append((t, o.side, o.price, got, o.queue0, q_before, sz, through, edge))
+        o.rem -= got
+        if o.rem < 1e-9 or share < 1.0 and o.rem < 0.5:
+            self.orders[o.side] = None
+        self.session.on_fill(o.side, o.price, got, t, False)
 
 
 class MarketSession:
@@ -175,7 +216,7 @@ class MarketSession:
         k = e[0]
         if k == "P":
             tau = self.exch_time(e[1], e[5])
-            self._tick(tau); self.on_level(e[2], e[3], e[4])
+            self._tick(tau); self.on_level(e[2], e[3], e[4], tau)
         elif k == "T":
             tau = self.exch_time(e[1], e[6])
             self._tick(tau); self.on_trade(e[2], e[3], e[4], tau)
@@ -190,11 +231,11 @@ class MarketSession:
     def on_snapshot(self, bids, asks):
         self.book.snapshot(bids, asks)
 
-    def on_level(self, side, price_c, size):
+    def on_level(self, side, price_c, size, t=None):
         if self.book.ready:
             self.book.change(side, price_c, size)
             if hasattr(self.ex, "on_level"):
-                self.ex.on_level(side, price_c, size)
+                self.ex.on_level(side, price_c, size, t)
 
     def on_trade(self, taker_side, px, sz, t):
         if hasattr(self.ex, "on_trade") and t < self.end_ms + 5000:
@@ -264,6 +305,8 @@ class MarketSession:
         for side, w in (("B", want.bid), ("S", want.ask)):
             o = ex.order(side)
             if o is None:
+                if w is not None and p.join_min > 0 and book.size(side, w) < p.join_min:
+                    w = None                    # nobody else rests there: such fills were the most toxic (step 3)
                 if w is not None:
                     r.placed += 1
                     self._log(td, "place", side=side, price=w, size=p.clip)
@@ -289,7 +332,8 @@ class MarketSession:
         net = r.q_up - r.q_dn
         if ex.taker is not None or abs(net) < self.min_order:
             return
-        side, limit = ("S", bb) if net > 0 else ("B", ba)       # long Up -> buy Down at 100 - bb
+        slip = self.p.flat_slip
+        side, limit = ("S", bb - slip) if net > 0 else ("B", ba + slip)   # long Up -> buy Down at 100 - bb
         self._log(td, "flatten", side=side, limit=limit, size=round(abs(net), 4))
         ex.take(side, limit, abs(net), td)
 

@@ -32,6 +32,8 @@ class Params:
     # inventory policy: 0 = hold everything to settlement; >0 = at this second, stop quoting and
     # buy the short side as a taker until |Up - Down| < min_order (pairs pay 100c at settlement)
     t_flat: float = 0.0
+    flat_slip: int = 3            # intraday close may walk the book this many cents beyond the touch
+    join_min: float = 0.0         # place a quote only where at least this many shares already rest (0 = off)
 
 
 @dataclass

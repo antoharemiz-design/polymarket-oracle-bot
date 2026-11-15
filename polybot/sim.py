@@ -42,10 +42,11 @@ GRID_MS = 50
 
 
 def run_market(rec_dir, start, path, p: Params, mode="maker", lat_ms=150, queue_mult=1.0,
-               outcome=None, dur=300, taker_theta=1.0, journal=None, source="coinbase", events=None):
+               outcome=None, dur=300, taker_theta=1.0, journal=None, source="coinbase", events=None,
+               fill_share=1.0, share_good=1.0, keep_session=False):
     """Simulate one market. `events` may be a pre-built list of merged events (reused across runs)."""
     spot = SpotSeries()
-    ex = PaperExecutor(None, lat_ms, queue_mult)
+    ex = PaperExecutor(None, lat_ms, queue_mult, fill_share, share_good)
     ses = MarketSession(start, p, spot, ex, dur, mode, journal, taker_theta)
     ex.book = ses.book
     end_ms = ses.end_ms
@@ -58,7 +59,10 @@ def run_market(rec_dir, start, path, p: Params, mode="maker", lat_ms=150, queue_
             spot.update(t, e[2])
         else:
             ses.feed(e)                                  # fills and order transitions run on exchange time
-    return ses.settle(outcome) if outcome is not None else ses.settle()
+    r = ses.settle(outcome) if outcome is not None else ses.settle()
+    if keep_session:
+        r.session = ses                                  # fill_meta and grids for calibration studies
+    return r
 
 
 def summarize(results, label=""):

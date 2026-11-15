@@ -242,7 +242,43 @@ class PaperExecutorTest(unittest.TestCase):
         ses.p.t_flat = 240.0
         ses.on_fill("B", 49, 20, 1000)                            # long 20 Up
         ses._flatten(START * 1000 + 241000, 49, 50)
-        self.assertEqual(ex.taker[1:], ("S", 49, 20))             # buy 20 Down at 100 - 49
+        self.assertEqual(ex.taker[1:], ("S", 46, 20))             # buy 20 Down from 100-49, walking up to 3c
+
+    def test_taker_walks_the_book(self):
+        ex, ses = self.make()                                     # bids 49 x200, 48 x300; asks 50 x150, 51 x400
+        ex.take("B", 51, 200, 1000)
+        ex.on_time(1000 + 150 + 250)
+        self.assertAlmostEqual(ses.res.q_up, 200)
+        self.assertAlmostEqual(ses.res.cost, 150 * 0.50 + 50 * 0.51)
+        self.assertAlmostEqual(ses.res.fees, (150 * fee_c(50) + 50 * fee_c(51)) / 100)
+
+    def test_trade_before_order_rested_does_not_fill(self):
+        ex, ses = self.make()
+        ex.place("B", 49, 10, 1000); ex.on_time(1100)             # resting from exchange time 1100
+        ses.on_level("B", 49, 0.0, 1150)
+        ex.on_trade("S", 48, 50, 1090)                            # printed earlier, delivered late
+        self.assertEqual(ses.res.fills, 0); self.assertEqual(ex.stale_trades, 1)
+        ex.on_trade("S", 48, 50, 1200)
+        self.assertAlmostEqual(ses.res.q_up, 10)
+
+    def test_competition_haircuts(self):
+        spot = SpotSeries()
+        ex = PaperExecutor(None, 100, 1.0, fill_share=0.5)
+        ses = MarketSession(START, Params(), spot, ex); ex.book = ses.book
+        ses.on_snapshot([["0.49", "0"]], [["0.51", "100"]])
+        ex.place("B", 49, 10, 1000); ex.on_time(1100)
+        ex.on_trade("S", 49, 4, 1200)
+        self.assertAlmostEqual(ses.res.q_up, 2)                   # half of the at-price fill
+        ex2 = PaperExecutor(None, 100, 1.0, share_good=0.0)
+        ses2 = MarketSession(START, Params(), spot, ex2); ex2.book = ses2.book
+        ses2.on_snapshot([["0.49", "0"]], [["0.51", "100"]])
+        ex2.place("B", 49, 10, 1000); ex2.on_time(1100)
+        ses2.last = {"fair": 52.0}                                # bid 49 below fair 52: a good fill
+        ex2.on_trade("S", 49, 4, 1200)
+        self.assertEqual(ses2.res.fills, 0)                       # competitors take all good fills
+        ses2.last = {"fair": 47.0}                                # bid 49 above fair: toxic, nobody competes
+        ex2.on_trade("S", 49, 4, 1300)
+        self.assertAlmostEqual(ses2.res.q_up, 4)
 
     def test_settlement(self):
         ex, ses = self.make()
