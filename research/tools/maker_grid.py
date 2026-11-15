@@ -176,7 +176,8 @@ for name, cfg, mode in (("P1 ladder rearm pre-20 stop 45s", P1, "ladder"), ("P2 
                         ("R  control", CTL, "maker")):
     PREREG += [(name, 150, 1.0, cfg, mode), (name + " q x2", 150, 2.0, cfg, mode), (name + " lat350", 350, 1.0, cfg, mode)]
 SETS = {"step2": CONFIGS, "momentum": MOMENTUM, "share": SHARE, "rewards": REWARDS, "ladder": LADDER, "ladder2": LADDER2,
-        "early": EARLY, "prereg": PREREG, "early2": EARLY2}
+        "early": EARLY, "prereg": PREREG, "early2": EARLY2,
+        "closure": [c for c in SHARE if c[0] in ("control share<25%", "candidate share<25%", "control share<10%")]}
 
 
 REAL = False
