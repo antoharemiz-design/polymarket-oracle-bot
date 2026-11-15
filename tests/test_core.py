@@ -109,6 +109,26 @@ class StrategyTest(unittest.TestCase):
         p2 = Params(clip=10, max_gross=30)
         self.assertIsNone(decide(p2, 60, 50.0, 0.0, 49, 50, 15, 10).bid)
 
+    def test_directional_shift_moves_both_quotes(self):
+        p = Params(edge=2.0, max_gap=99)
+        # bids never step above the best bid and asks never below the best ask (join, not improve),
+        # so test each side where the fair value keeps it behind the touch
+        self.assertEqual(decide(p, 60, 40.0, 0.0, 45, 55, 0, 0).bid, 38)
+        self.assertEqual(decide(p, 60, 40.0, 0.0, 45, 55, 0, 0, dir_c=3.0).bid, 41)
+        self.assertEqual(decide(p, 60, 60.0, 0.0, 45, 55, 0, 0).ask, 62)
+        self.assertEqual(decide(p, 60, 60.0, 0.0, 45, 55, 0, 0, dir_c=3.0).ask, 65)
+
+    def test_mid_signals(self):
+        from polybot.strategy import MidSignals, directional
+        sig = MidSignals()
+        for sec in range(0, 120):
+            sig.update(sec * 1000, 50.0 if sec < 100 else 60.0)
+        self.assertAlmostEqual(sig.momentum(60), 10.0)          # the jump happened 20 s ago
+        self.assertAlmostEqual(sig.momentum(10), 0.0)
+        self.assertGreater(sig.cci(), 100)                      # a jump to the top of the range
+        p = Params(mom_s=60, mom_w=-0.5)
+        self.assertAlmostEqual(directional(p, sig), -5.0)       # fade: lean against the rise
+
     def test_keep_hysteresis(self):
         p = Params(edge=2.0, edge_cancel=1.0)
         self.assertTrue(keep(p, "B", 48, 49.5, 0, 0))
@@ -216,6 +236,13 @@ class PaperExecutorTest(unittest.TestCase):
         ses.feed(("P", 10_900, "S", 50, 0.0, 10_250))
         ses.feed(("P", 10_950, "S", 52, 9.0, 10_900))            # first event after the match time
         self.assertEqual(ses.res.fills, 0)                       # nothing left at or below the limit
+
+    def test_flatten_buys_the_short_side(self):
+        ex, ses = self.make()
+        ses.p.t_flat = 240.0
+        ses.on_fill("B", 49, 20, 1000)                            # long 20 Up
+        ses._flatten(START * 1000 + 241000, 49, 50)
+        self.assertEqual(ex.taker[1:], ("S", 49, 20))             # buy 20 Down at 100 - 49
 
     def test_settlement(self):
         ex, ses = self.make()

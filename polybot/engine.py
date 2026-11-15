@@ -12,7 +12,7 @@ import dataclasses
 
 from .book import UpBook
 from .fairvalue import TW, FairValue, SpotSeries
-from .strategy import Fair, Params, decide, keep
+from .strategy import Fair, MidSignals, Params, decide, directional, keep
 
 TAKER_DELAY_MS = 250      # exchange hold on marketable orders in crypto up/down markets
 FEE_RATE = 0.07           # taker fee = FEE_RATE * p * (1 - p) per share
@@ -149,6 +149,8 @@ class MarketSession:
         self.fill_log = []            # (t, sign, price_c, shares)
         self.grid_t, self.grid_mid = [], []
         self.min_lag = None           # smallest (receive - exchange) timestamp gap seen, ms
+        self.sig = MidSignals()       # book-mid momentum / CCI for the directional lean
+        self.min_order = 5.0          # exchange minimum order size, shares
         self.halted = False           # set by risk control: pull quotes, place nothing
         self.last = {}                # last decision inputs, for the journal
         executor.session = self
@@ -240,6 +242,7 @@ class MarketSession:
         if not (0 < bb < ba < 100):
             self._pull(td, "book_empty"); return
         self.grid_t.append(td); self.grid_mid.append((bb + ba) / 2.0)
+        self.sig.update(td, (bb + ba) / 2.0)
         comp = None
         if p.use_model and self.mode != "mid":
             comp = self.fv.components(td) if self.spot.ready(self.start) else None
@@ -252,7 +255,12 @@ class MarketSession:
             self._pull(td, "halted"); return
         if self.mode == "taker":
             self._taker(td, elapsed, f, raw, bb, ba); return
-        want = decide(p, elapsed, f, raw, bb, ba, r.q_up, r.q_dn)
+        if p.t_flat > 0 and elapsed >= p.t_flat:
+            self._flatten(td, bb, ba); return
+        dc = directional(p, self.sig)
+        if dc:
+            self.last["dir"] = round(dc, 2)
+        want = decide(p, elapsed, f, raw, bb, ba, r.q_up, r.q_dn, dc)
         for side, w in (("B", want.bid), ("S", want.ask)):
             o = ex.order(side)
             if o is None:
@@ -266,12 +274,24 @@ class MarketSession:
                     why = "gate"
                 elif more_aggressive:
                     why = "requote"
-                elif not keep(p, side, o.price, f, r.q_up, r.q_dn):
+                elif not keep(p, side, o.price, f, r.q_up, r.q_dn, dc):
                     why = "edge_lost"
                 else:
                     continue
                 self._log(td, "cancel", side=side, price=o.price, reason=why)
                 ex.cancel(side, td)
+
+    def _flatten(self, td, bb, ba):
+        """Intraday close: stop quoting, then buy the short side at the touch until the
+        position is paired (a pair pays 100c at settlement whatever the outcome)."""
+        self._pull(td, "flatten")
+        r, ex = self.res, self.ex
+        net = r.q_up - r.q_dn
+        if ex.taker is not None or abs(net) < self.min_order:
+            return
+        side, limit = ("S", bb) if net > 0 else ("B", ba)       # long Up -> buy Down at 100 - bb
+        self._log(td, "flatten", side=side, limit=limit, size=round(abs(net), 4))
+        ex.take(side, limit, abs(net), td)
 
     def _pull(self, td, why):
         for side in ("B", "S"):

@@ -42,14 +42,15 @@ GRID_MS = 50
 
 
 def run_market(rec_dir, start, path, p: Params, mode="maker", lat_ms=150, queue_mult=1.0,
-               outcome=None, dur=300, taker_theta=1.0, journal=None, source="coinbase"):
+               outcome=None, dur=300, taker_theta=1.0, journal=None, source="coinbase", events=None):
+    """Simulate one market. `events` may be a pre-built list of merged events (reused across runs)."""
     spot = SpotSeries()
     ex = PaperExecutor(None, lat_ms, queue_mult)
     ses = MarketSession(start, p, spot, ex, dur, mode, journal, taker_theta)
     ex.book = ses.book
     end_ms = ses.end_ms
     next_dec = ses.start_ms
-    for e in merged(rec_dir, start, path, dur, source=source):
+    for e in (events if events is not None else merged(rec_dir, start, path, dur, source=source)):
         t = e[1]
         while next_dec <= t and next_dec < end_ms:      # decisions see only what had been received
             ses.on_timer(next_dec); next_dec += GRID_MS
