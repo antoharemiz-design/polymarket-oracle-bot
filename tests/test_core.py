@@ -252,6 +252,26 @@ class PaperExecutorTest(unittest.TestCase):
         self.assertAlmostEqual(ses.res.cost, 150 * 0.50 + 50 * 0.51)
         self.assertAlmostEqual(ses.res.fees, (150 * fee_c(50) + 50 * fee_c(51)) / 100)
 
+    def test_real_fill_driven_queue(self):
+        ex, ses = self.make()                                     # bid level 49 shows 200 ahead of us
+        ex.place("B", 49, 10, 1000); ex.on_time(1100)
+        ex.on_real_fills([("B", 49, 195.0)], 1200)                # real makers ahead of us filled 195
+        self.assertEqual(ses.res.fills, 0)
+        ex.on_real_fills([("B", 49, 8.0)], 1300)                  # 5 left ahead, 3 for us
+        self.assertAlmostEqual(ses.res.q_up, 3)
+        ex.on_real_fills([("B", 49, 20.0), ("B", 48, 5.0)], 1400) # a sweep reached 48: our level is gone
+        self.assertAlmostEqual(ses.res.q_up, 10)
+        ex.on_real_fills([("S", 52, 50.0)], 1500)                 # other side: no effect
+        self.assertAlmostEqual(ses.res.q_dn, 0)
+
+    def test_order_log_records_resting_intervals(self):
+        ex, ses = self.make()
+        ex.place("B", 49, 10, 1000); ex.on_time(1100)
+        ex.cancel("B", 1500); ex.on_time(1600)
+        ex.place("S", 52, 10, 2000); ex.on_time(2100)
+        ex.close_log(9999)
+        self.assertEqual(ex.order_log, [("B", 49, 1100, 1600), ("S", 52, 2100, 9999)])
+
     def test_trade_before_order_rested_does_not_fill(self):
         ex, ses = self.make()
         ex.place("B", 49, 10, 1000); ex.on_time(1100)             # resting from exchange time 1100

@@ -59,6 +59,8 @@ def run_market(rec_dir, start, path, p: Params, mode="maker", lat_ms=150, queue_
             spot.update(t, e[2])
         else:
             ses.feed(e)                                  # fills and order transitions run on exchange time
+    if hasattr(ex, "close_log"):
+        ex.close_log(1 << 62)
     r = ses.settle(outcome) if outcome is not None else ses.settle()
     if keep_session:
         r.session = ses                                  # fill_meta and grids for calibration studies

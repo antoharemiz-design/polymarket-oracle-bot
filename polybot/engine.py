@@ -85,6 +85,7 @@ class PaperExecutor:
         self.session = None
         self.fill_meta = []           # (t, side, price, got, queue0, queue_before, trade_size, through, edge_vs_fair)
         self.stale_trades = 0         # trades ignored because they happened before our order rested
+        self.order_log = []           # (side, price, live_at, end_at) resting intervals, exchange time
 
     def order(self, side):
         return self.orders[side]
@@ -115,12 +116,20 @@ class PaperExecutor:
                     o.state = "LIVE"; o.queue = o.queue0 = book.size(side, o.price) * self.queue_mult
                     o.live_at = o.t_eff; o.t_eff = 1 << 62
             elif o.state == "CANCELING":
+                self.order_log.append((side, o.price, o.live_at, t))
                 self.orders[side] = None; s.on_canceled(side, o.price, t)
         if self.taker is not None and self.taker[0] <= t:
             _, side, limit, size = self.taker
             self.taker = None
             if book.ready:
                 self._walk(side, limit, size, t)
+
+    def close_log(self, t_end):
+        """Record intervals of orders still resting when the session ends."""
+        for side in ("B", "S"):
+            o = self.orders[side]
+            if o is not None and o.state != "PENDING":
+                self.order_log.append((side, o.price, o.live_at, t_end))
 
     def _walk(self, side, limit, size, t):
         """Marketable buy: consume price levels from the best one up to the limit."""
@@ -138,6 +147,40 @@ class PaperExecutor:
             if got > 0:
                 self.session.on_fill(side, px, got, t, True)
                 left -= got
+
+    def on_real_fills(self, fills, t):
+        """Fill model driven by the real maker fills of one transaction: [(side, price, size), ...]
+        in Up terms. FIFO at our price: the real volume first consumes the queue ahead of us; any
+        real fill beyond our price means the whole level was consumed, so we are filled in full."""
+        for side in ("B", "S"):
+            o = self.orders[side]
+            if o is None or o.state == "PENDING" or t < o.live_at:
+                continue
+            at = sum(sz for s_, p_, sz in fills if s_ == side and p_ == o.price)
+            deeper = any(s_ == side and (p_ < o.price if side == "B" else p_ > o.price) for s_, p_, _ in fills)
+            if not at and not deeper:
+                continue
+            q_before = o.queue
+            if deeper:
+                got = o.rem
+            else:
+                got = max(0.0, min(o.rem, at - o.queue)); o.queue = max(0.0, o.queue - at)
+            if got <= 0:
+                continue
+            fair = self.session.last.get("fair")
+            edge = None if fair is None else ((fair - o.price) if side == "B" else (o.price - fair))
+            share = self.fill_share
+            if self.share_good < 1.0 and edge is not None and edge >= 0:
+                share *= self.share_good
+            got *= share
+            if got < 1e-9:
+                continue
+            self.fill_meta.append((t, side, o.price, got, o.queue0, q_before, at, deeper, edge))
+            o.rem -= got
+            if o.rem < 1e-9 or share < 1.0 and o.rem < 0.5:
+                self.order_log.append((side, o.price, o.live_at, t))
+                self.orders[side] = None
+            self.session.on_fill(side, o.price, got, t, False)
 
     def on_level(self, side, price_c, size, t=None):
         o = self.orders[side]
@@ -173,6 +216,7 @@ class PaperExecutor:
         self.fill_meta.append((t, o.side, o.price, got, o.queue0, q_before, sz, through, edge))
         o.rem -= got
         if o.rem < 1e-9 or share < 1.0 and o.rem < 0.5:
+            self.order_log.append((o.side, o.price, o.live_at, t))
             self.orders[o.side] = None
         self.session.on_fill(o.side, o.price, got, t, False)
 
@@ -223,6 +267,11 @@ class MarketSession:
         elif k == "B":
             tau = self.exch_time(e[1], e[4])
             self._tick(tau); self.on_snapshot(e[2], e[3])
+        elif k == "R":                                    # ("R", recv, [(side, price, size)], srv)
+            tau = self.exch_time(e[1], e[3])
+            self._tick(tau)
+            if hasattr(self.ex, "on_real_fills") and tau < self.end_ms + 5000:
+                self.ex.on_real_fills(e[2], tau)
 
     def _tick(self, tau):
         if hasattr(self.ex, "on_time"):

@@ -4,7 +4,8 @@ Each market is parsed once and every configuration is simulated on the same even
 Selection is made on markets before SPLIT; markets from SPLIT on are the independent check.
 PnL is reported without rebates (noReb), with rebates (pnl) and per share; t is per market.
 
-usage: maker_grid.py REC_DIR SPLIT_EPOCH [workers=4] [--set NAME] [--dump FILE]
+usage: maker_grid.py REC_DIR SPLIT_EPOCH [workers=4] [--set NAME] [--dump FILE] [--real-fills]
+  --real-fills fill model driven by the real maker fills of each transaction (polybot/realfills.py)
   --set NAME   configuration set: "step2" (default) or "momentum" (neighbourhood of the momentum lean)
   --dump FILE  write per-market results {label: {start: [pnl, pnl_ex_rebate, shares]}} for paired tests
 """
@@ -16,6 +17,7 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 
 sys.path.insert(0, __file__.rsplit("/", 3)[0])
+from polybot.realfills import real_events, trades_of   # noqa: E402
 from polybot.replay import list_markets, merged   # noqa: E402
 from polybot.sim import run_market, summarize     # noqa: E402
 from polybot.strategy import Params               # noqa: E402
@@ -69,9 +71,14 @@ MOMENTUM = [
 SETS = {"step2": CONFIGS, "momentum": MOMENTUM}
 
 
+REAL = False
+
+
 def one_market(args):
-    rec, start, path, outcome, configs = args
+    rec, start, path, outcome, configs, real = args
     events = list(merged(rec, start, path, 300, source="coinbase"))
+    if real:
+        events = real_events(events, rec, start)
     out = []
     for label, lat, qm, over in configs:
         r = run_market(rec, start, path, Params(**over), "maker", lat, qm, outcome, events=events)
@@ -94,6 +101,9 @@ def main():
     configs = CONFIGS
     if "--dump" in args:
         i = args.index("--dump"); dump = args[i + 1]; del args[i:i + 2]
+    real = "--real-fills" in args
+    if real:
+        args.remove("--real-fills")
     if "--set" in args:
         i = args.index("--set"); configs = SETS[args[i + 1]]; del args[i:i + 2]
     rec, split = args[0], int(args[1])
@@ -102,11 +112,15 @@ def main():
     markets = [(s, p) for s, p in list_markets(rec) if str(s) in outcomes]
     res = {c[0]: {"in": [], "out": []} for c in configs}
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        for start, out in ex.map(one_market, [(rec, s, p, outcomes[str(s)], configs) for s, p in markets]):
+        if real:
+            for s, _ in markets:
+                trades_of(rec, s)
+        for start, out in ex.map(one_market, [(rec, s, p, outcomes[str(s)], configs, real) for s, p in markets]):
             for label, r in out:
                 res[label]["out" if start >= split else "in"].append(r)
     n_in = sum(1 for s, _ in markets if s < split)
-    print(f"markets: {n_in} for selection, {len(markets) - n_in} independent; all settled on real resolutions")
+    print(f"markets: {n_in} for selection, {len(markets) - n_in} independent; all settled on real resolutions; "
+          f"fill model: {'real maker fills (FIFO)' if real else 'trade feed'}")
     hdr = f"{'fills':>6}{'sh':>7}{'noReb$':>9}{'t':>6}{'reb$':>7}{'pnl$':>9}{'t':>6}{'c/sh':>7}{'|net|':>6}"
     print(f"{'configuration':<26}| {'selection sample':^64}| {'independent sample':^64}")
     print(f"{'':<26}| {hdr}| {hdr}")
