@@ -177,8 +177,8 @@ class Bot:
                 self.journal.write(now_ms(), start, "redeem", ok=False, error=repr(e)[:200])
 
     def live_exec(self, market):
-        from .live import MarketExec
-        return MarketExec(self.live, market)
+        from .live import LiveMultiExec, MarketExec
+        return (LiveMultiExec if self.cfg.strategy == "ladder" else MarketExec)(self.live, market)
 
 
 class _Feed:

@@ -268,3 +268,95 @@ class MarketExec:
 
     async def close(self):
         await self._cancel_market()
+
+
+class LiveMultiExec(MarketExec):
+    """Live executor for ladder mode: any number of post-only BUY orders keyed by (side, price).
+    Same rules as MarketExec: fills only from cumulative size_matched on the user stream,
+    cancellation confirmed before a level can be re-placed, unknown outcomes cancel the market."""
+
+    def __init__(self, live: LiveClient, market: dict):
+        super().__init__(live, market)
+        self.multi = {}
+
+    def all_orders(self):
+        return list(self.multi.values())
+
+    def order(self, side):
+        return None
+
+    def place_at(self, side, price_c, size, now):
+        key = (side, price_c)
+        if key in self.multi:
+            return
+        o = Order(side, price_c, size, "PENDING")
+        self.multi[key] = o
+        asyncio.create_task(self._place_key(key, o))
+
+    async def _place_key(self, key, o):
+        side = o.side
+        paid = o.price if side == "B" else 100 - o.price
+        try:
+            resp = await self.live.client.place_limit_order(
+                token_id=self._token(side), price=str(Decimal(paid) / 100), size=str(o.rem), side="BUY", post_only=True)
+        except Exception as e:
+            self.live.log(f"ladder place failed with unknown outcome ({e!r}); cancelling all orders in market")
+            self.live.risk.on_error()
+            await self._cancel_market()
+            return
+        self.live.risk.on_ok()
+        if getattr(resp, "ok", False):
+            o.order_id = resp.order_id
+            self.matched.setdefault(o.order_id, Decimal(0))
+            if self.multi.get(key) is o:
+                o.state = "LIVE"
+            self.live.register(o.order_id, self, key)
+        else:
+            if self.multi.get(key) is o:
+                del self.multi[key]
+            self.session.on_reject(side, o.price, now_ms(), getattr(resp, "code", "rejected"))
+
+    def cancel_at(self, key, now):
+        o = self.multi.get(key)
+        if o is None or o.state != "LIVE":
+            return
+        o.state = "CANCELING"
+        asyncio.create_task(self._cancel_key(key, o))
+
+    async def _cancel_key(self, key, o):
+        for attempt in range(3):
+            try:
+                resp = await self.live.client.cancel_order(order_id=o.order_id)
+                break
+            except Exception as e:
+                self.live.log(f"ladder cancel attempt {attempt + 1} failed: {e!r}")
+                self.live.risk.on_error()
+                await asyncio.sleep(0.05 * (attempt + 1))
+        else:
+            await self._cancel_market()
+            return
+        self.live.risk.on_ok()
+        if self.multi.get(key) is o:
+            del self.multi[key]
+        if o.order_id in resp.canceled:
+            self.session.on_canceled(o.side, o.price, now_ms())
+        else:
+            self.session._log(now_ms(), "cancel_not_applied", side=o.side, price=o.price,
+                              reason=resp.not_canceled.get(o.order_id, "unknown"))
+
+    async def _cancel_market(self):
+        await super()._cancel_market()
+        self.multi = {}
+
+    def on_order_event(self, key, payload):
+        side = key[0]
+        prev = self.matched.get(payload.id, Decimal(0))
+        cur = Decimal(payload.size_matched)
+        if cur > prev:
+            self.matched[payload.id] = cur
+            price_c = int(round(float(payload.price) * 100))
+            self.session.on_fill(side, price_c if side == "B" else 100 - price_c, float(cur - prev), now_ms(), False)
+        done = payload.order_event_type == "CANCELLATION" or cur >= Decimal(payload.original_size)
+        o = self.multi.get(key)
+        if done and o is not None and o.order_id == payload.id:
+            del self.multi[key]
