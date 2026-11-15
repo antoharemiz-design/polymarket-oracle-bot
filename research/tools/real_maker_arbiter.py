@@ -87,7 +87,7 @@ def one_market(args):
             j = bisect.bisect_right(gt, t) - 1
             return gm[j] if j >= 0 and gt[j] >= t - 500 else None
         iv = collections.defaultdict(list)                    # side -> [(live_at, end, price)]
-        for side, price, a, b in ses.ex.order_log:
+        for side, price, a, b, *_ in ses.ex.order_log:
             iv[side].append((a, b, price))
         at_price = collections.defaultdict(float)             # (tx, side, P) -> real size
         through = {}                                          # (tx, side, our P, live_at) -> t

@@ -34,6 +34,23 @@ class Params:
     t_flat: float = 0.0
     flat_slip: int = 3            # intraday close may walk the book this many cents beyond the touch
     join_min: float = 0.0         # place a quote only where at least this many shares already rest (0 = off)
+    # hide behind the queue (step B): our share of a price level = our size / (our size + resting size)
+    max_share: float = 1.0        # place only if our share of the level would be below this (1 = off)
+    keep_share: float = 1.0       # cancel a resting quote once its share of the level exceeds this (1 = off)
+    # ladder mode (step C): place once, hold to settlement. Levels in cents away from the reference mid:
+    # Up bids at mid - d0 - k*step and Down bids at (100 - mid) - d0 - k*step, k = 0..levels-1
+    lad_place: float = 5.0        # seconds after the window opens (negative = before the window)
+    lad_d0: int = 2
+    lad_step: int = 3
+    lad_levels: int = 4
+    lad_rearm: bool = False       # re-place a level at the same price after it fills completely
+    lad_stop: float = 240.0       # cancel what still rests at this second
+    lad_lo: int = 3               # never quote below this price (cents) on either side
+    # liquidity rewards (step D). BTC 5m markets have NO reward pool now (rate 0, checked 2026-11-15);
+    # a non-zero rate is only for what-if runs. Score per programs/liquidity-rewards: ((v - s) / v)^2 * size
+    reward_rate: float = 0.0      # market reward pool, $ per day
+    reward_max_spread: float = 4.5
+    reward_min_size: float = 50.0
 
 
 @dataclass

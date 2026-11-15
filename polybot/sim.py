@@ -33,7 +33,7 @@ import math
 import os
 import statistics
 
-from .engine import MarketSession, PaperExecutor, Result  # noqa: F401
+from .engine import MarketSession, MultiPaperExecutor, PaperExecutor, Result  # noqa: F401
 from .fairvalue import SpotSeries
 from .replay import list_markets, merged
 from .strategy import Params
@@ -46,11 +46,11 @@ def run_market(rec_dir, start, path, p: Params, mode="maker", lat_ms=150, queue_
                fill_share=1.0, share_good=1.0, keep_session=False):
     """Simulate one market. `events` may be a pre-built list of merged events (reused across runs)."""
     spot = SpotSeries()
-    ex = PaperExecutor(None, lat_ms, queue_mult, fill_share, share_good)
+    ex = (MultiPaperExecutor if mode == "ladder" else PaperExecutor)(None, lat_ms, queue_mult, fill_share, share_good)
     ses = MarketSession(start, p, spot, ex, dur, mode, journal, taker_theta)
     ex.book = ses.book
     end_ms = ses.end_ms
-    next_dec = ses.start_ms
+    next_dec = ses.start_ms + int(1000 * min(0.0, p.lad_place)) if mode == "ladder" else ses.start_ms
     for e in (events if events is not None else merged(rec_dir, start, path, dur, source=source)):
         t = e[1]
         while next_dec <= t and next_dec < end_ms:      # decisions see only what had been received
@@ -62,6 +62,10 @@ def run_market(rec_dir, start, path, p: Params, mode="maker", lat_ms=150, queue_
     if hasattr(ex, "close_log"):
         ex.close_log(1 << 62)
     r = ses.settle(outcome) if outcome is not None else ses.settle()
+    for side, price, a, b, filled, q0, ff in getattr(ex, "order_log", []):
+        r.orders_live += 1
+        if filled > 0:
+            r.orders_filled += 1; r.filled_shares += filled; r.ttf.append(ff - a)
     if keep_session:
         r.session = ses                                  # fill_meta and grids for calibration studies
     return r

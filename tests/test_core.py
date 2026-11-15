@@ -129,6 +129,20 @@ class StrategyTest(unittest.TestCase):
         p = Params(mom_s=60, mom_w=-0.5)
         self.assertAlmostEqual(directional(p, sig), -5.0)       # fade: lean against the rise
 
+    def test_share_filters(self):
+        def session(bids, p):
+            ex = PaperExecutor(None, 100)
+            ses = MarketSession(START, p, SpotSeries(), ex, mode="mid"); ex.book = ses.book
+            ses.on_snapshot(bids, [["0.52", "100"]])
+            ses.on_timer(START * 1000 + 60000)
+            return ex
+        p = Params(clip=10, max_share=0.25, edge=1.0, use_model=False)
+        # mid 50, wanted bid = best bid 48
+        self.assertEqual(session([["0.47", "20"], ["0.48", "100"]], p).order("B").price, 48)   # share 10/110
+        self.assertIsNone(session([["0.47", "100"], ["0.48", "20"]], p).order("B"))             # share 10/30
+        self.assertEqual(session([["0.47", "100"], ["0.48", "20"]], Params(clip=10, edge=1.0, use_model=False))
+                         .order("B").price, 48)                                                  # filter off
+
     def test_keep_hysteresis(self):
         p = Params(edge=2.0, edge_cancel=1.0)
         self.assertTrue(keep(p, "B", 48, 49.5, 0, 0))
@@ -270,7 +284,7 @@ class PaperExecutorTest(unittest.TestCase):
         ex.cancel("B", 1500); ex.on_time(1600)
         ex.place("S", 52, 10, 2000); ex.on_time(2100)
         ex.close_log(9999)
-        self.assertEqual(ex.order_log, [("B", 49, 1100, 1600), ("S", 52, 2100, 9999)])
+        self.assertEqual(ex.order_log, [("B", 49, 1100, 1600, 0.0, 200.0, 0), ("S", 52, 2100, 9999, 0.0, 0.0, 0)])
 
     def test_trade_before_order_rested_does_not_fill(self):
         ex, ses = self.make()
@@ -309,6 +323,41 @@ class PaperExecutorTest(unittest.TestCase):
         self.assertAlmostEqual(r.pnl, 10 - 9.5 + rebate)
         self.assertEqual(r.outcome_src, "actual")
         self.assertAlmostEqual(ses.settle(1).pnl_ex_rebate, 10 - 9.5)
+
+    def test_ladder_places_once_and_holds(self):
+        from polybot.engine import MultiPaperExecutor
+        p = Params(clip=10, max_net=15, lad_place=5, lad_d0=2, lad_step=3, lad_levels=2, lad_stop=240)
+        ex = MultiPaperExecutor(None, 100)
+        ses = MarketSession(START, p, SpotSeries(), ex, mode="ladder"); ex.book = ses.book
+        ses.on_snapshot([["0.49", "100"]], [["0.51", "100"]])           # mid 50
+        t0 = START * 1000 + 6000
+        ses.on_timer(t0); ex.on_time(t0 + 100)
+        self.assertEqual(sorted(ex.multi), [("B", 45), ("B", 48), ("S", 52), ("S", 55)])
+        ex.on_real_fills([("B", 48, 3.0), ("B", 47, 5.0)], t0 + 200)    # sweep through 48: level filled
+        self.assertAlmostEqual(ses.res.q_up, 10)
+        ses.on_timer(t0 + 300)
+        self.assertNotIn(("B", 48), ex.multi)                              # no re-arm by default
+        ex.on_real_fills([("B", 45, 50.0)], t0 + 400)                      # 0 resting ahead at 45 when placed
+        ses.on_timer(t0 + 500); ex.on_time(t0 + 600)
+        self.assertAlmostEqual(ses.res.q_up, 20)
+        ses.on_timer(START * 1000 + 241000); ex.on_time(START * 1000 + 241200)
+        self.assertEqual(ex.multi, {})                                     # everything pulled at lad_stop
+
+    def test_reward_score(self):
+        ex, ses = self.make()                                     # book: bids 49 x200, 48 x300; asks 50 x150, 51 x400
+        ses.p = Params(reward_rate=1440.0, reward_min_size=50)    # $1 per minute-sample at 100% share
+        ex.place("B", 49, 100, 0); ex.place("S", 50, 100, 0); ex.on_time(200)
+        ses._reward_sample(49.5)
+        v = 4.5; S = lambda d: ((v - d) / v) ** 2
+        mine = S(0.5) * 100
+        others_b = S(0.5) * 200 + S(1.5) * 300; others_s = S(0.5) * 150 + S(1.5) * 400
+        q_all = max(min(others_b + mine, others_s + mine), max(others_b + mine, others_s + mine) / 3)
+        self.assertAlmostEqual(ses.res.reward_share_min, mine / q_all)
+        r = ses.settle(0)
+        self.assertAlmostEqual(r.reward, mine / q_all)
+        ex2, ses2 = self.make()                                   # orders below the minimum size do not score
+        ex2.place("B", 49, 10, 0); ex2.on_time(200); ses2._reward_sample(49.5)
+        self.assertEqual(ses2.res.reward_share_min, 0.0)
 
     def test_taker_fills_pay_fee_and_earn_no_rebate(self):
         ex, ses = self.make()
