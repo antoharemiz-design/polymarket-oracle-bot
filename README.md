@@ -110,6 +110,33 @@ stop-loss, предполагаемая задержка для paper-режим
 4. `python -m polybot check`: REST round trip должен быть заметно меньше 250 мс.
 5. Первый live-запуск: `STRAT_CLIP=5`, `RISK_DAILY_STOP_USD=10`, и сверка журнала с балансом.
 
+## Тест liquidity rewards (H10)
+
+Единственная гипотеза, которую исторические данные не закрыли: награды за котировки на
+«стабильных» рынках. Модель M1 (официальная формула) даёт плюс во всех трёх проверенных периодах.
+Фактическую выплату можно узнать только с живыми ордерами. План, пороги и числа —
+`research/07_new_niches.md`, раздел 8. Тест не запускался.
+
+```bash
+.venv/bin/python -m polybot lp-select
+```
+
+```bash
+.venv/bin/python -m polybot lp-paper
+```
+
+```bash
+.venv/bin/python -m polybot lp-live --i-understand-live
+```
+
+```bash
+.venv/bin/python -m polybot lp-earnings
+```
+
+```bash
+.venv/bin/python -m polybot lp-report live
+```
+
 ## Ограничения, о которых нужно знать
 
 - Модель исполнения не учитывает влияние собственных ордеров на рынок.

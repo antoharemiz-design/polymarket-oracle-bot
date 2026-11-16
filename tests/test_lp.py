@@ -1,0 +1,269 @@
+"""Liquidity-rewards test module (polybot/lp.py): scoring, quoting rules, fills, stop, report."""
+import asyncio
+import importlib.util
+import os
+import tempfile
+import unittest
+
+from polybot import lp
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+M = {"cond": "C1", "yes": "Y1", "no": "N1", "N": 20.0, "v": 4.5, "min": 20.0, "rate": 10.0, "tick": 0.01}
+
+
+class ScoringTest(unittest.TestCase):
+    def test_order_score(self):
+        self.assertAlmostEqual(lp.order_score(4.5, 0.0), 1.0)
+        self.assertAlmostEqual(lp.order_score(4.5, 1.5), (3.0 / 4.5) ** 2)
+        self.assertEqual(lp.order_score(4.5, 4.5), 0.0)
+        self.assertEqual(lp.order_score(4.5, -0.1), 0.0)
+
+    def test_side_score_respects_min_size(self):
+        levels = [(0.49, 30.0), (0.48, 10.0)]          # the 10-share level is below min size 20
+        self.assertAlmostEqual(lp.side_score(levels, 0.50, 4.5, 20.0, "bid"), lp.order_score(4.5, 1.0) * 30)
+
+    def test_m1_alone_takes_the_pool(self):
+        self.assertAlmostEqual(lp.m1_fraction([], [], 0.49, 0.51, 20, 4.5, 20), 1.0)
+
+    def test_m1_equal_two_sided_competitor(self):
+        # one other maker with the same size at the same prices: competition bound (Qb + Qa) / 2 = our Q
+        frac = lp.m1_fraction([(0.49, 20.0)], [(0.51, 20.0)], 0.49, 0.51, 20, 4.5, 20)
+        self.assertAlmostEqual(frac, 0.5)
+
+    def test_m1_one_sided_rules(self):
+        one = lp.m1_fraction([(0.49, 20.0)], [(0.51, 20.0)], 0.49, None, 20, 4.5, 20)
+        two = lp.m1_fraction([(0.49, 20.0)], [(0.51, 20.0)], 0.49, 0.51, 20, 4.5, 20)
+        self.assertLess(one, two)
+        q = lp.order_score(4.5, 1.0) * 20
+        self.assertAlmostEqual(one, (q / 3) / (q + q / 3))
+        # midpoint outside [0.10, 0.90]: one side scores nothing
+        self.assertEqual(lp.m1_fraction([(0.04, 20.0)], [(0.06, 20.0)], 0.04, None, 20, 4.5, 20), 0.0)
+
+    def test_m1_below_min_size_scores_nothing(self):
+        self.assertEqual(lp.m1_fraction([], [], 0.49, 0.51, 10, 4.5, 20), 0.0)
+
+
+class QuotingTest(unittest.TestCase):
+    def test_join_best_inside_zone(self):
+        self.assertEqual(lp.targets([(0.48, 50)], [(0.52, 50)], 0.01, 4.5, 0.0, 60), (0.48, 0.52))
+
+    def test_outside_zone_no_quotes(self):
+        self.assertEqual(lp.targets([(0.40, 50)], [(0.60, 50)], 0.01, 4.5, 0.0, 60), (None, None))
+
+    def test_position_cap_withdraws_one_side(self):
+        self.assertEqual(lp.targets([(0.48, 50)], [(0.52, 50)], 0.01, 4.5, 60.0, 60), (None, 0.52))
+        self.assertEqual(lp.targets([(0.48, 50)], [(0.52, 50)], 0.01, 4.5, -60.0, 60), (0.48, None))
+
+    def test_without_mine(self):
+        self.assertEqual(lp.without_mine([(0.48, 50.0), (0.47, 20.0)], {0.48: 20.0}), [(0.48, 30.0), (0.47, 20.0)])
+        self.assertEqual(lp.without_mine([(0.48, 20.0)], {0.48: 20.0}), [])
+
+    def test_crosses(self):
+        self.assertEqual(lp.crosses((0, "B", 0.52), 0.48, 0.52), "ask")      # taker buys YES at our ask
+        self.assertEqual(lp.crosses((1, "S", 0.48), 0.48, 0.52), "ask")      # taker sells NO = buys YES at 0.52
+        self.assertEqual(lp.crosses((0, "S", 0.48), 0.48, 0.52), "bid")
+        self.assertEqual(lp.crosses((1, "B", 0.52), 0.48, 0.52), "bid")      # taker buys NO = sells YES at 0.48
+        self.assertIsNone(lp.crosses((0, "B", 0.51), 0.48, 0.52))
+
+
+class ClassifierTest(unittest.TestCase):
+    def test_same_as_research_classifier(self):
+        spec = importlib.util.spec_from_file_location("h10_groups_src", os.path.join(ROOT, "research/tools/h10_groups.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(lp.NEWS.pattern, mod.NEWS.pattern)
+        self.assertEqual(lp.STABLE_FIRST.pattern, mod.STABLE_FIRST.pattern)
+
+    def test_examples(self):
+        self.assertTrue(lp.topic_news("Will Rene Haas be the next CEO of NVIDIA?"))
+        self.assertTrue(lp.topic_news("US x Iran Effective Ceasefire by December 31?"))
+        self.assertFalse(lp.topic_news("Will Josh Allen have 3,849.5+ passing yards in the 2026-27 NFL regular season?"))
+        self.assertFalse(lp.topic_news("Will Zelenskyy post 40-59 posts from November 13 to November 20, 2026?"))
+        self.assertFalse(lp.topic_news("Will West Bromwich Albion be promoted to Premier League?"))
+
+
+class FakeExec(lp.PaperExec):
+    def __init__(self):
+        super().__init__(trades_fn=lambda cond: [])
+        self.queue, self.merged, self.cancel_all_calls = [], [], 0
+
+    async def fills(self, markets):
+        out, self.queue = self.queue, []
+        return out
+
+    async def merge(self, m, pairs):
+        self.merged.append((m["cond"], pairs))
+        return pairs
+
+    async def cancel_all(self):
+        self.cancel_all_calls += 1
+        await super().cancel_all()
+
+
+def make_test(book, cfg=None, ex=None):
+    tmp = tempfile.mkdtemp()
+    cfg = cfg or lp.LPConfig(lp_dir=tmp)
+    ex = ex or FakeExec()
+    j = lp.Journal(os.path.join(tmp, "t.jsonl"))
+    t = lp.LPTest(cfg, ex, j, [dict(M)], books_fn=lambda toks: {"Y1": book[0]}, rewards_fn=lambda: {})
+    _open.append(j)
+    return t, ex, os.path.join(tmp, "t.jsonl")
+
+
+_open = []
+
+
+def tearDownModule():
+    for j in _open:
+        j.close()
+
+
+CFGS = {"C1": {"v": 4.5, "min": 20.0, "rate": 10.0}}
+
+
+class LoopTest(unittest.TestCase):
+    def test_places_both_sides_and_samples_m1(self):
+        t, ex, path = make_test([([(0.48, 100.0)], [(0.52, 100.0)], 0.01)])
+        asyncio.run(t.step(1000.0, CFGS))
+        s = t.st["C1"]
+        self.assertEqual((s.orders["bid"][1], s.orders["ask"][1]), (0.48, 0.52))
+        ev = lp.load_events(os.path.dirname(path), "t")
+        m1 = [e for e in ev if e["event"] == "m1"]
+        self.assertEqual(len(m1), 1)
+        q = lp.order_score(4.5, 2.0) * 20
+        comp = lp.order_score(4.5, 2.0) * 100          # (Qb + Qa) / 2 of the other orders
+        self.assertAlmostEqual(m1[0]["frac"], q / (comp + q))
+
+    def test_paper_quotes_do_not_churn(self):
+        # a paper order is not in the public book: the book must be read as is, so the quote stays put
+        t, ex, path = make_test([([(0.48, 20.0), (0.47, 50.0)], [(0.52, 20.0), (0.53, 50.0)], 0.01)])
+        for k in range(10):
+            asyncio.run(t.step(1000.0 + 5 * k, CFGS))
+        ev = lp.load_events(os.path.dirname(path), "t")
+        self.assertEqual(sum(1 for e in ev if e["event"] == "place"), 2)
+        self.assertEqual(sum(1 for e in ev if e["event"] == "cancel"), 0)
+        self.assertEqual((t.st["C1"].orders["bid"][1], t.st["C1"].orders["ask"][1]), (0.48, 0.52))
+
+    def test_live_book_excludes_our_own_order(self):
+        # on the exchange our 20 at 0.48 is part of the 0.48 level; the others' best bid is still 0.48 (30 left)
+        class InBook(FakeExec):
+            in_book = True
+        t, ex, path = make_test([([(0.48, 50.0)], [(0.52, 50.0)], 0.01)], ex=InBook())
+        for k in range(6):
+            asyncio.run(t.step(1000.0 + 5 * k, CFGS))
+        ev = lp.load_events(os.path.dirname(path), "t")
+        self.assertEqual(sum(1 for e in ev if e["event"] == "place"), 2)
+        m1 = [e for e in ev if e["event"] == "m1"]
+        q = lp.order_score(4.5, 2.0) * 20
+        self.assertAlmostEqual(m1[-1]["frac"], q / (lp.order_score(4.5, 2.0) * 50 + q))       # first sample: not yet removed
+
+    def test_fill_markout_and_merge(self):
+        book = [([(0.48, 100.0)], [(0.52, 100.0)], 0.01)]
+        t, ex, path = make_test(book)
+        asyncio.run(t.step(1000.0, CFGS))
+        bid_id, ask_id = t.st["C1"].orders["bid"][0], t.st["C1"].orders["ask"][0]
+        ex.queue = [{"order": bid_id, "mkt": "C1", "side": "bid", "price": 0.48, "size": 20.0, "ts": 1001.0, "done": True},
+                    {"order": ask_id, "mkt": "C1", "side": "ask", "price": 0.52, "size": 20.0, "ts": 1002.0, "done": True}]
+        asyncio.run(t.step(1005.0, CFGS))
+        s = t.st["C1"]
+        self.assertEqual(ex.merged, [("C1", 20.0)])     # 20 YES + 20 NO merged back into $20
+        self.assertAlmostEqual(s.yes, 0.0); self.assertAlmostEqual(s.no, 0.0)
+        self.assertAlmostEqual(s.cash, -20 * 0.48 - 20 * 0.48 + 20)     # earned the 4c spread on 20 pairs
+        book[0] = ([(0.45, 100.0)], [(0.49, 100.0)], 0.01)              # mid falls to 0.47
+        asyncio.run(t.step(1070.0, CFGS))
+        mk = [e for e in lp.load_events(os.path.dirname(path), "t") if e["event"] == "markout" and e["horizon"] == 60]
+        self.assertEqual(len(mk), 2)
+        by_side = {e["side"]: e["markout"] for e in mk}
+        self.assertAlmostEqual(by_side["bid"], 0.47 - 0.48)
+        self.assertAlmostEqual(by_side["ask"], 0.52 - 0.47)
+
+    def test_stop_loss(self):
+        book = [([(0.48, 100.0)], [(0.52, 100.0)], 0.01)]
+        t, ex, path = make_test(book)
+        asyncio.run(t.step(1000.0, CFGS))
+        bid_id = t.st["C1"].orders["bid"][0]
+        ex.queue = [{"order": bid_id, "mkt": "C1", "side": "bid", "price": 0.48, "size": 200.0, "ts": 1001.0, "done": True}]
+        book[0] = ([(0.18, 100.0)], [(0.22, 100.0)], 0.01)              # 200 YES bought at 0.48 now marked at 0.20
+        asyncio.run(t.step(1100.0, CFGS))
+        self.assertTrue(t.stopped and t.stopped.startswith("stop_loss"))
+        self.assertEqual(ex.cancel_all_calls, 1)
+        self.assertEqual(t.st["C1"].orders, {"bid": None, "ask": None})
+        asyncio.run(t.step(1200.0, CFGS))
+        self.assertEqual(t.st["C1"].orders, {"bid": None, "ask": None})   # stays out after the stop
+
+    def test_position_cap_in_loop(self):
+        book = [([(0.48, 100.0)], [(0.52, 100.0)], 0.01)]
+        t, ex, path = make_test(book)
+        asyncio.run(t.step(1000.0, CFGS))
+        bid_id = t.st["C1"].orders["bid"][0]
+        ex.queue = [{"order": bid_id, "mkt": "C1", "side": "bid", "price": 0.48, "size": 60.0, "ts": 1001.0, "done": True}]
+        asyncio.run(t.step(1005.0, CFGS))
+        asyncio.run(t.step(1010.0, CFGS))
+        s = t.st["C1"]
+        self.assertIsNone(s.orders["bid"])              # +60 YES = 3N: no more bids
+        self.assertIsNotNone(s.orders["ask"])
+
+    def test_capital_guard(self):
+        book = [([(0.48, 100.0)], [(0.52, 100.0)], 0.01)]
+        cfg = lp.LPConfig(lp_dir=tempfile.mkdtemp(), capital_usd=30.0, quote_budget_usd=20.0)
+        t, ex, path = make_test(book, cfg)
+        asyncio.run(t.step(1000.0, CFGS))
+        bid_id = t.st["C1"].orders["bid"][0]
+        ex.queue = [{"order": bid_id, "mkt": "C1", "side": "bid", "price": 0.48, "size": 25.0, "ts": 1001.0, "done": True}]
+        asyncio.run(t.step(1005.0, CFGS))               # exposure 25 * 0.5 = 12.5 >= reserve 10
+        asyncio.run(t.step(1010.0, CFGS))
+        self.assertIsNone(t.st["C1"].orders["bid"])
+        self.assertIsNotNone(t.st["C1"].orders["ask"])
+
+    def test_reward_removed_pulls_quotes(self):
+        t, ex, path = make_test([([(0.48, 100.0)], [(0.52, 100.0)], 0.01)])
+        asyncio.run(t.step(1000.0, CFGS))
+        asyncio.run(t.step(1005.0, {"C1": {"v": 4.5, "min": 20.0, "rate": 0.0}}))
+        self.assertEqual(t.st["C1"].orders, {"bid": None, "ask": None})
+
+
+class PaperFillTest(unittest.TestCase):
+    def test_public_trade_fills_first_in_queue(self):
+        trades = [(2e9, 0, "S", 0.48, 15.0, "k1"), (2e9, 0, "S", 0.48, 15.0, "k2"), (2e9, 0, "B", 0.51, 5.0, "k3")]
+        ex = lp.PaperExec(trades_fn=lambda cond: trades)
+        ex.since = 0
+
+        async def go():
+            oid = await ex.place(M, "bid", 0.48, 20.0)
+            await ex.place(M, "ask", 0.52, 20.0)
+            for o in ex.orders.values():
+                o["t"] = 0
+            return oid, await ex.fills([M])
+        oid, f = asyncio.run(go())
+        self.assertEqual([(x["side"], x["size"], x["done"]) for x in f], [("bid", 15.0, False), ("bid", 5.0, True)])
+        self.assertNotIn(oid, ex.orders)
+
+
+class ReportTest(unittest.TestCase):
+    def events(self, earned, markout, contracts):
+        ev = [{"event": "start", "ts": 0.0, "markets": ["C1"]}]
+        for k in range(7 * 24 * 60):                    # one m1 sample a minute for 7 days, $1/day in total
+            ev.append({"event": "m1", "ts": 60.0 * k, "mkt": "C1", "usd": 1.0 / 1440})
+        for d in range(7):
+            ev.append({"event": "earnings", "ts": 0.0, "day": f"1970-01-0{d + 1}", "by_market": {"C1": earned / 7}})
+        ev.append({"event": "fill", "ts": 1.0, "mkt": "C1", "side": "bid", "price": 0.5, "size": contracts})
+        ev.append({"event": "markout", "ts": 2.0, "mkt": "C1", "horizon": 60, "side": "bid", "price": 0.5,
+                   "size": contracts, "markout": markout})
+        ev.append({"event": "end", "ts": 7 * 86400.0, "pnl": -1.0})
+        return ev
+
+    def test_pass(self):
+        s = lp.summarize(self.events(earned=5.0, markout=-0.015, contracts=100.0), lp.LPConfig())
+        self.assertAlmostEqual(s["reward_ratio"], 5.0 / 7.0, places=3)
+        self.assertEqual(s["verdict"], "PASS")
+
+    def test_fail_reasons(self):
+        s = lp.summarize(self.events(earned=3.0, markout=-0.03, contracts=100.0), lp.LPConfig())
+        self.assertIn("reward >= 0.6 x M1", s["verdict"])
+        self.assertIn("markout60 >= -2.1 c", s["verdict"])
+        s = lp.summarize(self.events(earned=7.0, markout=-0.01, contracts=500.0), lp.LPConfig())
+        self.assertIn("fill rate", s["verdict"])
+
+
+if __name__ == "__main__":
+    unittest.main()
