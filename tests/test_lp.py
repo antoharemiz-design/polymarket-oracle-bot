@@ -265,5 +265,111 @@ class ReportTest(unittest.TestCase):
         self.assertIn("fill rate", s["verdict"])
 
 
+class SelectionTest(unittest.TestCase):
+    def row(self, c, m1, cap=20.0, ev=None):
+        return {"cond": c, "event": ev or c, "m1_usd_day": m1, "quote_cap": cap}
+
+    def test_concentration_cap_drops_dominant_market(self):
+        cfg = lp.LPConfig(markets_max=3, quote_budget_usd=100, max_share=0.4)
+        rows = [self.row("big", 64.0), self.row("a", 5.0), self.row("b", 4.0), self.row("c", 4.0), self.row("d", 3.0)]
+        out = [x["cond"] for x in lp.choose(rows, cfg)]
+        self.assertNotIn("big", out)
+        self.assertEqual(out, ["a", "b", "c"])
+
+    def test_one_market_per_event_and_budget(self):
+        cfg = lp.LPConfig(markets_max=5, quote_budget_usd=45, max_share=1.0)
+        rows = [self.row("a", 5.0, ev="E"), self.row("b", 4.0, ev="E"), self.row("c", 3.0), self.row("d", 2.0)]
+        self.assertEqual([x["cond"] for x in lp.choose(rows, cfg)], ["a", "c"])
+
+
+class WindowTest(unittest.TestCase):
+    def test_window_summary_and_resilience(self):
+        calls = {"n": 0}
+        book = ([(0.48, 100.0)], [(0.52, 100.0)], 0.01)
+
+        def books_fn(toks):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise OSError("network down")
+            return {"Y1": book}
+        tmp = tempfile.mkdtemp()
+        cfg = lp.LPConfig(lp_dir=tmp, poll_s=0.0, window_s=1800.0, test_days=0.0)
+        j = lp.Journal(os.path.join(tmp, "w.jsonl"))
+        _open.append(j)
+        clock = {"t": 1800.0 * 10}
+        t = lp.LPTest(cfg, FakeExec(), j, [dict(M)], books_fn=books_fn,
+                      rewards_fn=lambda: {"C1": {"v": 4.5, "min": 20.0, "rate": 10.0}}, clock=lambda: clock["t"])
+
+        async def go():
+            cfgs = {"C1": {"v": 4.5, "min": 20.0, "rate": 10.0}}
+            for k in range(4):
+                try:
+                    await t.step(clock["t"], cfgs)
+                except OSError:
+                    t.errors += 1
+                clock["t"] += 600.0                      # 4 steps over 40 minutes: crosses one window boundary
+        asyncio.run(go())
+        ev = lp.load_events(tmp, "w")
+        w = [e for e in ev if e["event"] == "window"]
+        self.assertEqual(len(w), 1)
+        mk = w[0]["markets"]["C1"]
+        self.assertEqual(mk["samples"], 2)               # the failed step took no sample
+        self.assertEqual(mk["places"], 2)
+        self.assertGreater(mk["m1_usd_day"], 0)
+        self.assertEqual(mk["comp_levels"], 2.0)         # one level on each side inside the zone
+        self.assertTrue(os.path.exists(os.path.join(tmp, "status.json")))
+
+    def test_run_survives_errors(self):
+        tmp = tempfile.mkdtemp()
+        n = {"k": 0}
+
+        def books_fn(toks):
+            n["k"] += 1
+            raise OSError("down")
+        cfg = lp.LPConfig(lp_dir=tmp, poll_s=0.0, test_days=0.0)
+        j = lp.Journal(os.path.join(tmp, "r.jsonl"))
+        _open.append(j)
+        clock = {"t": 0.0}
+
+        def tick():
+            clock["t"] += 10.0
+            return clock["t"]
+        cfg.test_days = 50.0 / 86400                     # five iterations of the clock
+        t = lp.LPTest(cfg, FakeExec(), j, [dict(M)], books_fn=books_fn, rewards_fn=lambda: {}, clock=tick)
+        asyncio.run(t.run())
+        self.assertGreaterEqual(t.errors, 1)
+        self.assertIn("end", [e["event"] for e in lp.load_events(tmp, "r")])
+
+
+class Phase1Test(unittest.TestCase):
+    def wins(self, values, share_b=0.3, markouts=None):
+        ev = [{"event": "start", "ts": 0.0}]
+        for k, v in enumerate(values):
+            mk = {"A": {"m1_usd_day": v * (1 - share_b), "fills": 0, "contracts": 0.0, "comp_levels": 2.0, "markout60": []},
+                  "B": {"m1_usd_day": v * share_b, "fills": 0, "contracts": 0.0, "comp_levels": 1.0, "markout60": []}}
+            if markouts and k == 0:
+                mk["A"]["markout60"] = markouts; mk["A"]["fills"] = len(markouts)
+                mk["A"]["contracts"] = sum(w for _, w in markouts)
+            ev.append({"event": "window", "start": 1800.0 * k, "end": 1800.0 * (k + 1), "m1_usd_day": v, "markets": mk})
+        return ev
+
+    def test_pass_and_fail(self):
+        stable = [10.0, 11.0, 9.0, 10.0] * 24          # 96 windows = 48 h
+        r = lp.phase1(self.wins(stable, share_b=0.5, markouts=[[0.5, 20.0], [-1.0, 20.0]]))
+        self.assertEqual(r["verdict"], "PASS")
+        self.assertAlmostEqual(r["max_share_last24"], 0.5)
+        self.assertAlmostEqual(r["cv"], (0.5 ** 0.5) / 10)
+        jumpy = [1.0, 30.0] * 48
+        r = lp.phase1(self.wins(jumpy, share_b=0.5, markouts=[[0.5, 20.0], [-1.0, 20.0]]))
+        self.assertIn("M1 CV", r["verdict"])
+
+    def test_tail_and_concentration(self):
+        stable = [10.0] * 96
+        r = lp.phase1(self.wins(stable, share_b=0.1, markouts=[[0.0, 90.0], [-12.0, 10.0]]))
+        self.assertIn("no market > 50%", r["verdict"])
+        self.assertIn("markout60 p5", r["verdict"])
+        self.assertAlmostEqual(r["markout60_p5_c"], -12.0)
+
+
 if __name__ == "__main__":
     unittest.main()
