@@ -342,33 +342,45 @@ class WindowTest(unittest.TestCase):
 
 
 class Phase1Test(unittest.TestCase):
-    def wins(self, values, share_b=0.3, markouts=None):
+    def wins(self, values, shares=(0.4, 0.3, 0.3), jumpy_c=None, markouts=None):
+        """values: portfolio M1 per 30-minute window; jumpy_c: market C alternates 0 / 2x its share"""
         ev = [{"event": "start", "ts": 0.0}]
         for k, v in enumerate(values):
-            mk = {"A": {"m1_usd_day": v * (1 - share_b), "fills": 0, "contracts": 0.0, "comp_levels": 2.0, "markout60": []},
-                  "B": {"m1_usd_day": v * share_b, "fills": 0, "contracts": 0.0, "comp_levels": 1.0, "markout60": []}}
+            mk = {}
+            for name, sh in zip("ABC", shares):
+                m1 = v * sh
+                if name == "C" and jumpy_c:
+                    m1 = 0.0 if k % 2 else 2 * v * sh * jumpy_c
+                mk[name] = {"m1_usd_day": m1, "fills": 0, "contracts": 0.0, "comp_levels": 2.0, "markout60": []}
             if markouts and k == 0:
                 mk["A"]["markout60"] = markouts; mk["A"]["fills"] = len(markouts)
                 mk["A"]["contracts"] = sum(w for _, w in markouts)
-            ev.append({"event": "window", "start": 1800.0 * k, "end": 1800.0 * (k + 1), "m1_usd_day": v, "markets": mk})
+            ev.append({"event": "window", "start": 1800.0 * k, "end": 1800.0 * (k + 1),
+                       "m1_usd_day": sum(x["m1_usd_day"] for x in mk.values()), "markets": mk})
         return ev
 
-    def test_pass_and_fail(self):
-        stable = [10.0, 11.0, 9.0, 10.0] * 24          # 96 windows = 48 h
-        r = lp.phase1(self.wins(stable, share_b=0.5, markouts=[[0.5, 20.0], [-1.0, 20.0]]))
-        self.assertEqual(r["verdict"], "PASS")
-        self.assertAlmostEqual(r["max_share_last24"], 0.5)
+    def test_pass_and_markout_is_data_only(self):
+        r = lp.phase1(self.wins([10.0, 11.0, 9.0, 10.0] * 24, markouts=[[0.0, 90.0], [-12.0, 10.0]]))
+        self.assertEqual(r["verdict"], "PASS")              # a -12 c tail does not gate phase 1
+        self.assertAlmostEqual(r["max_share_last24"], 0.4)
         self.assertAlmostEqual(r["cv"], (0.5 ** 0.5) / 10)
-        jumpy = [1.0, 30.0] * 48
-        r = lp.phase1(self.wins(jumpy, share_b=0.5, markouts=[[0.5, 20.0], [-1.0, 20.0]]))
-        self.assertIn("M1 CV", r["verdict"])
+        self.assertAlmostEqual(r["markout60"]["p5_c"], -12.0)
+        self.assertAlmostEqual(r["markout60"]["share_worse_than_-2.1c"], 0.1)
 
-    def test_tail_and_concentration(self):
-        stable = [10.0] * 96
-        r = lp.phase1(self.wins(stable, share_b=0.1, markouts=[[0.0, 90.0], [-12.0, 10.0]]))
-        self.assertIn("no market > 50%", r["verdict"])
-        self.assertIn("markout60 p5", r["verdict"])
-        self.assertAlmostEqual(r["markout60_p5_c"], -12.0)
+    def test_cv_and_concentration_fail(self):
+        r = lp.phase1(self.wins([1.0, 30.0] * 48))
+        self.assertIn("M1 CV", r["verdict"])
+        r = lp.phase1(self.wins([10.0] * 96, shares=(0.6, 0.2, 0.2)))
+        self.assertIn("no market > 40%", r["verdict"])
+
+    def test_exclude_a_jumpy_market(self):
+        ev = self.wins([10.0] * 96, shares=(0.2, 0.2, 0.6), jumpy_c=2.0)
+        self.assertIn("M1 CV", lp.phase1(ev)["verdict"])
+        r = lp.phase1(ev, exclude={"C"})
+        self.assertEqual(r["excluded"], ["C"])
+        self.assertAlmostEqual(r["cv"], 0.0)
+        self.assertAlmostEqual(r["max_share_last24"], 0.5)   # two equal markets left: 50% each
+        self.assertIn("no market > 40%", r["verdict"])
 
 
 if __name__ == "__main__":

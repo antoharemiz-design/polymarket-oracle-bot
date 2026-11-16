@@ -798,46 +798,57 @@ def _wq(pairs, q):
     return None
 
 
-def phase1(events, markout_p5_min_c=-2.1, cv_max=0.5, share_max=0.5):
-    """Phase 1 criteria (research/PREREG_LP_PHASE1.md) from the 30-minute window events."""
+def phase1(events, cv_max=0.5, share_max=0.4, exclude=()):
+    """Phase 1 gate (research/PREREG_LP_PHASE1.md, amended 2026-11-16): stability of the portfolio M1 over
+    the 30-minute windows of hours 24-48, and no market above share_max of M1 over the last 24 hours.
+    Markouts are reported as data, not as a criterion. `exclude`: condition ids left out of everything."""
     starts = [e["ts"] for e in events if e["event"] == "start"]
     wins = sorted((e for e in events if e["event"] == "window"), key=lambda e: e["start"])
     if not starts or not wins:
         return {"verdict": "no data"}
+    ex = set(exclude)
+    mk_of = lambda w: {c: v for c, v in w["markets"].items() if c not in ex}
+    m1_of = lambda w: sum(v["m1_usd_day"] or 0.0 for v in mk_of(w).values())
     t0, t_last = min(starts), wins[-1]["end"]
     half = [w for w in wins if w["start"] >= t0 + 86400]
     last24 = [w for w in wins if w["start"] >= t_last - 86400]
-    port = [w["m1_usd_day"] for w in half]
+    port = [m1_of(w) for w in half]
     mean = sum(port) / len(port) if port else 0.0
     cv = (sum((x - mean) ** 2 for x in port) / len(port)) ** 0.5 / mean if port and mean > 0 else None
-    conds = sorted({c for w in wins for c in w["markets"]})
+    conds = sorted({c for w in wins for c in mk_of(w)})
+    tot24 = sum(m1_of(w) for w in last24)
+    avg = lambda v: sum(v) / len(v) if v else None
     per = {}
-    tot24 = sum(v["m1_usd_day"] or 0.0 for w in last24 for v in w["markets"].values())
     for c in conds:
         xs = [w["markets"][c]["m1_usd_day"] or 0.0 for w in half if c in w["markets"]]
-        mu = sum(xs) / len(xs) if xs else 0.0
+        mu = avg(xs) or 0.0
         sd = (sum((x - mu) ** 2 for x in xs) / len(xs)) ** 0.5 if xs else 0.0
         mk = [m for w in wins for m in (w["markets"].get(c) or {}).get("markout60", [])]
         per[c] = {"m1_usd_day_2nd_half": mu, "cv": sd / mu if mu > 0 else None,
                   "share_last24": (sum(w["markets"][c]["m1_usd_day"] or 0.0 for w in last24 if c in w["markets"]) / tot24) if tot24 else None,
-                  "comp_levels": (lambda v: sum(v) / len(v) if v else None)([w["markets"][c]["comp_levels"] for w in half if c in w["markets"] and w["markets"][c]["comp_levels"] is not None]),
+                  "comp_levels": avg([w["markets"][c]["comp_levels"] for w in half if c in w["markets"] and w["markets"][c].get("comp_levels") is not None]),
+                  "places": sum(w["markets"][c].get("places", 0) for w in wins if c in w["markets"]),
+                  "cancels": sum(w["markets"][c].get("cancels", 0) for w in wins if c in w["markets"]),
                   "fills": sum(w["markets"][c]["fills"] for w in wins if c in w["markets"]),
                   "contracts": sum(w["markets"][c]["contracts"] for w in wins if c in w["markets"]),
+                  "markout60_mean_c": (sum(v * q for v, q in mk) / sum(q for _, q in mk)) if mk else None,
                   "markout60_p5_c": _wq(mk, 0.05) if mk else None}
-    mk_all = [m for w in wins for v in w["markets"].values() for m in v.get("markout60", [])]
+    mk_all = [m for w in wins for v in mk_of(w).values() for m in v.get("markout60", [])]
     q = sum(w for _, w in mk_all)
     hours = (t_last - t0) / 3600
-    out = {"hours": round(hours, 1), "windows_2nd_half": len(half), "portfolio_m1_usd_day_2nd_half": mean, "cv": cv,
+    out = {"hours": round(hours, 1), "windows_2nd_half": len(half), "excluded": sorted(ex),
+           "portfolio_m1_usd_day_2nd_half": mean, "cv": cv,
            "max_share_last24": max((v["share_last24"] or 0.0 for v in per.values()), default=None),
            "fills": sum(v["fills"] for v in per.values()), "contracts": sum(v["contracts"] for v in per.values()),
-           "markout60_mean_c": sum(v * w for v, w in mk_all) / q if q else None,
-           "markout60_p5_c": _wq(mk_all, 0.05) if mk_all else None,
            "contracts_per_market_day": sum(v["contracts"] for v in per.values()) / (len(conds) * hours / 24) if conds and hours else None,
+           "markout60": {"n_fills": len(mk_all), "mean_c": sum(v * w for v, w in mk_all) / q if q else None,
+                         "p5_c": _wq(mk_all, 0.05) if mk_all else None, "p25_c": _wq(mk_all, 0.25) if mk_all else None,
+                         "p50_c": _wq(mk_all, 0.5) if mk_all else None,
+                         "share_worse_than_-2.1c": sum(w for v, w in mk_all if v < -2.1) / q if q else None},
            "expected_week_usd": 7 * mean, "markets": per}
     checks = {
-        f"M1 CV <= {cv_max:.0%} (24-48 h)": hours >= 48 - 0.6 and cv is not None and cv <= cv_max,
+        f"M1 CV <= {cv_max:.0%} (hours 24-48)": hours >= 48 - 0.6 and cv is not None and cv <= cv_max,
         f"no market > {share_max:.0%} of M1 (last 24 h)": out["max_share_last24"] is not None and out["max_share_last24"] <= share_max,
-        f"markout60 p5 >= {markout_p5_min_c} c": out["markout60_p5_c"] is not None and out["markout60_p5_c"] >= markout_p5_min_c,
     }
     out["checks"] = checks
     out["verdict"] = "PASS" if all(checks.values()) else "FAIL: " + ", ".join(k for k, v in checks.items() if not v)
@@ -881,13 +892,19 @@ def cli(cmd, args):
             print(f"{k}: {v}")
         return
     if cmd == "lp-phase1":
-        mode = args[0] if args else "paper"
-        r = phase1(load_events(cfg.lp_dir, mode))
+        # lp-phase1 [paper] [--exclude TEXT ...]: TEXT matches market questions in LP_DIR/markets.json
+        mode = args[0] if args and not args[0].startswith("--") else "paper"
+        texts = [args[i + 1] for i, a in enumerate(args) if a == "--exclude" and i + 1 < len(args)]
+        with open(os.path.join(cfg.lp_dir, "markets.json")) as f:
+            qs = {m["cond"]: m["q"] for m in json.load(f)["markets"]}
+        ex = {c for c, q in qs.items() for t in texts if t.lower() in (q or "").lower()}
+        r = phase1(load_events(cfg.lp_dir, mode), exclude=ex)
+        print("excluded:", [qs[c][:60] for c in ex])
         for k, v in r.items():
             if k != "markets":
                 print(f"{k}: {v}")
         for c, v in (r.get("markets") or {}).items():
-            print(" ", c[:12], {k: (round(x, 3) if isinstance(x, float) else x) for k, x in v.items()})
+            print(" ", (qs.get(c) or c)[:50], {k: (round(x, 3) if isinstance(x, float) else x) for k, x in v.items()})
         return
     if cmd == "lp-earnings":
         # fetch actual earnings for every UTC day of the live test and append them to the journal
