@@ -235,6 +235,7 @@ class Service:
             markets = await asyncio.to_thread(self.select_markets, cfg)
             if len(markets) < cfg.markets_min:
                 return await self._idle(stop, "error", f"only {len(markets)} markets pass the filters, need {cfg.markets_min}")
+            now = self.clock()                          # the run's clock starts when quoting starts, after selection
             _write_json(mpath, {"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "markets": markets})
             run = {"started": now, "test_days": cfg.test_days, "mode": self.mode}
             self.save_run(run)

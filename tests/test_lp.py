@@ -265,6 +265,13 @@ class ReportTest(unittest.TestCase):
         self.assertIn("fill rate", s["verdict"])
 
 
+class MedianTest(unittest.TestCase):
+    def test_median(self):
+        self.assertAlmostEqual(lp.median([0, 9.26, 11.73, 9.81, 0, 0]), 4.63)
+        self.assertAlmostEqual(lp.median([1, 3, 2]), 2)
+        self.assertEqual(lp.median([]), 0.0)
+
+
 class SelectionTest(unittest.TestCase):
     def row(self, c, m1, cap=20.0, ev=None):
         return {"cond": c, "event": ev or c, "m1_usd_day": m1, "quote_cap": cap}

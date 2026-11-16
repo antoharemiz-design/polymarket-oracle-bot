@@ -27,6 +27,13 @@ git -C "$ROOT/src" fetch -q origin "$BRANCH"
 NEW=$(git -C "$ROOT/src" rev-parse "origin/$BRANCH")
 CUR=$(basename "$(readlink -f "$ROOT/current" 2>/dev/null || echo none)")
 if [ "$MODE" = timer ] && { [ "$NEW" = "$CUR" ] || [ -e "$ROOT/releases/.bad/$NEW" ]; }; then exit 0; fi
+# commits that change no runtime file (reports, research, docs) are not worth a restart of the bot
+if [ "$MODE" = timer ] && [ -d "$ROOT/releases/$CUR" ] && \
+   [ -z "$(git -C "$ROOT/src" diff --name-only "$CUR" "$NEW" -- polybot deploy requirements.txt 2> /dev/null)" ] && \
+   git -C "$ROOT/src" cat-file -e "$CUR^{commit}" 2> /dev/null; then
+  [ -e "$ROOT/releases/.noop-$NEW" ] || { touch "$ROOT/releases/.noop-$NEW"; log "no runtime changes in ${NEW:0:10}; staying on ${CUR:0:10}"; }
+  exit 0
+fi
 
 REL=$ROOT/releases/$NEW
 mark_bad() { mkdir -p "$ROOT/releases/.bad"; touch "$ROOT/releases/.bad/$1"; }

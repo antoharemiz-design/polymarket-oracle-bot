@@ -251,6 +251,12 @@ def _rows(cand, rw, bk, cfg):
     return rows
 
 
+def median(vals):
+    v = sorted(vals)
+    n = len(v)
+    return 0.0 if not n else v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+
 def choose(rows, cfg):
     """Greedy by M1 per dollar of quote capital, one market per event, within markets_max and the quote
     budget; then, while one market carries more than max_share of the predicted M1, drop it and refill."""
@@ -300,7 +306,7 @@ def select(cfg: LPConfig, now=None, log=print, sleep=time.sleep):
         vals = sorted(sn[c]["m1_usd_day"] if c in sn else 0.0 for sn in snaps)
         x = dict(next(sn[c] for sn in snaps if c in sn))
         x["m1_snapshots"] = [round(sn[c]["m1_usd_day"], 3) if c in sn else 0.0 for sn in snaps]
-        x["m1_usd_day"] = vals[len(vals) // 2]
+        x["m1_usd_day"] = median(vals)
         rows.append(x)
     out = choose(rows, cfg)
     cap = sum(x["quote_cap"] for x in out)
