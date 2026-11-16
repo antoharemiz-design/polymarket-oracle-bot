@@ -1,0 +1,6 @@
+[Unit]
+Description=polybot health check: restart a dead or silent bot, alert after 3 restarts in a row
+
+[Service]
+Type=oneshot
+ExecStart=/opt/polybot/bin/polybot-health

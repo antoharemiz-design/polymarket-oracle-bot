@@ -1,0 +1,10 @@
+[Unit]
+Description=polybot health check every 5 minutes
+
+[Timer]
+OnActiveSec=3min
+OnUnitActiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

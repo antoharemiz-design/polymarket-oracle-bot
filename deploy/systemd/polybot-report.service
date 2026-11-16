@@ -1,0 +1,9 @@
+[Unit]
+Description=polybot: publish status.md to polybot-reports and read control.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=polybot
+Group=polybot
+ExecStart=/opt/polybot/bin/polybot-report

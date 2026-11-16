@@ -498,8 +498,31 @@ class LiveExec:
             self.log(f"earnings for {day} failed: {e!r}")
             return None
 
+    def start_heartbeat(self):
+        """Exchange-side dead-man switch: if heartbeats stop (process or server dies), Polymarket cancels
+        our open orders. Once started it cannot be disarmed for the session."""
+        self.hb_task = asyncio.create_task(self._heartbeat())
+
+    async def _heartbeat(self):
+        from polymarket import OrderHeartbeatMismatchError
+        hb = ""
+        while True:
+            try:
+                try:
+                    r = await self.c.send_order_heartbeat(heartbeat_id=hb)
+                except OrderHeartbeatMismatchError as e:
+                    r = await self.c.send_order_heartbeat(heartbeat_id=e.heartbeat_id)
+                hb = r.heartbeat_id
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.log(f"heartbeat error: {e!r}")
+            await asyncio.sleep(5)
+
     async def close(self):
         await self.cancel_all()
+        if getattr(self, "hb_task", None):
+            self.hb_task.cancel()
         await self.c.close()
 
 
@@ -542,8 +565,11 @@ class MarketState:
 
 class LPTest:
     def __init__(self, cfg: LPConfig, ex, journal: Journal, markets, books_fn=books, rewards_fn=rewards_config,
-                 log=print, clock=time.time):
+                 log=print, clock=time.time, control_fn=None):
         self.cfg, self.ex, self.j, self.log, self.clock = cfg, ex, journal, log, clock
+        self.control_fn = control_fn                    # returns "run" or "stop"; "stop" pulls every quote
+        self.paused = False
+        self.end_reason = None
         self.books_fn, self.rewards_fn = books_fn, rewards_fn
         self.st = {m["cond"]: MarketState(m) for m in markets}
         self.pending = []                               # (due ts, horizon, cond, side, price, size)
@@ -637,7 +663,7 @@ class LPTest:
             if over:
                 cap = min(cap, abs(s.pos()))           # capital guard: no side may grow the position
             want = dict(zip(("bid", "ask"), targets(ob, oa, tick, c["v"], s.pos(), cap)))
-            if self.stopped or c["rate"] <= 0:
+            if self.stopped or self.paused or c["rate"] <= 0:
                 want = {"bid": None, "ask": None}
             for side in ("bid", "ask"):
                 cur = s.orders[side]
@@ -720,6 +746,11 @@ class LPTest:
         try:
             while self.clock() < t_end and not self.stopped:
                 now = self.clock()
+                if self.control_fn is not None:
+                    paused = self.control_fn() == "stop"
+                    if paused != self.paused:
+                        self.paused = paused
+                        self.j.write("pause" if paused else "resume")
                 try:
                     if now - cfg_t > 3600:
                         allr = await asyncio.to_thread(self.rewards_fn)
@@ -736,11 +767,15 @@ class LPTest:
                         for x in self.st.values():
                             x.orders = {"bid": None, "ask": None}
                 await asyncio.sleep(max(0.0, self.cfg.poll_s - (self.clock() - now)))
+        except asyncio.CancelledError:
+            self.end_reason = "cancelled"
+            raise
         finally:
             await self.ex.cancel_all()
             if self.win is not None:
                 self._close_window(self.clock())
-            self.j.write("end", reason=self.stopped or "time", pnl=self.pnl())
+            self.end_reason = self.end_reason or self.stopped or "time"
+            self.j.write("end", reason=self.end_reason, pnl=self.pnl())
 
 
 # --------------------------------------------------------------------------------------------------

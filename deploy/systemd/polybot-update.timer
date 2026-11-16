@@ -1,0 +1,10 @@
+[Unit]
+Description=polybot auto-update check every 10 minutes
+
+[Timer]
+OnActiveSec=10min
+OnUnitActiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

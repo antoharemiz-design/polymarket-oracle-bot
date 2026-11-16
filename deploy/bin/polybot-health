@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""polybot health check (systemd timer, every 5 minutes, root).
+
+Healthy = the service is active and has written service_status.json within the last 5 minutes.
+Otherwise it is restarted. After 3 restarts in a row: alert (status.md, optional Telegram); in live mode
+the bot is stopped instead (stopping cancels every order) so it does not trade in a crash loop.
+A stop requested with `polybot stop` (flag file DATA/.stopped) is respected.
+"""
+import json
+import os
+import subprocess
+import time
+import urllib.parse
+import urllib.request
+
+DATA = os.environ.get("POLYBOT_DATA", "/var/lib/polybot")
+ETC = os.environ.get("POLYBOT_ETC", "/etc/polybot")
+STATE = os.path.join(DATA, "health_state.json")
+
+
+def cfg(key, default=""):
+    try:
+        with open(os.path.join(ETC, "env")) as f:
+            vals = [line.split("=", 1)[1].strip() for line in f if line.startswith(key + "=")]
+        return vals[-1] if vals else default
+    except OSError:
+        return default
+
+
+def read(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write(path, obj):
+    with open(path + ".tmp", "w") as f:
+        json.dump(obj, f)
+    os.replace(path + ".tmp", path)
+
+
+def log(msg):
+    os.makedirs(os.path.join(DATA, "logs"), exist_ok=True)
+    with open(os.path.join(DATA, "logs", "health.log"), "a") as f:
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()) + msg + "\n")
+    print(msg)
+
+
+def telegram(text):
+    token, chat = cfg("TELEGRAM_BOT_TOKEN"), cfg("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+    try:
+        body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=body, timeout=15)
+    except Exception as e:
+        log(f"telegram failed: {e!r}")
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", *args], capture_output=True, text=True).returncode
+
+
+def main():
+    now = time.time()
+    st = read(STATE, {}) or {}
+    st.setdefault("count", 0)
+    if os.path.exists(os.path.join(DATA, ".stopped")):
+        st.update(ts=now, note="stopped by `polybot stop`")
+        write(STATE, st)
+        return
+    status = read(os.path.join(DATA, "service_status.json"), None)
+    age = now - status["ts"] if status and status.get("ts") else None
+    active = systemctl("is-active", "--quiet", "polybot") == 0
+    if active and age is not None and age < 300:
+        if st.get("count"):
+            log("healthy again")
+        st.update(ts=now, count=0, alert=False, alerted=False, message="")
+        write(STATE, st)
+        return
+    reason = "service is not running" if not active else (
+        "no service status yet" if age is None else f"no status for {age / 60:.0f} min")
+    st["count"] += 1
+    st.update(ts=now, last_restart=now, reason=reason)
+    live = cfg("POLYBOT_MODE", "paper") == "live"
+    if st["count"] >= 3:
+        st["alert"] = True
+        if live:
+            systemctl("stop", "polybot")
+            open(os.path.join(DATA, ".stopped"), "w").close()
+            st["message"] = f"{st['count']} restarts in a row ({reason}); live bot STOPPED, orders cancelled. Investigate, then: sudo polybot start"
+        else:
+            systemctl("restart", "polybot")
+            st["message"] = f"{st['count']} restarts in a row ({reason}); still restarting (paper)"
+        if not st.get("alerted"):
+            telegram("polybot ALERT: " + st["message"])
+            st["alerted"] = True
+    else:
+        systemctl("restart", "polybot")
+        st["message"] = f"restarted ({reason}), {st['count']} in a row"
+    log(st["message"])
+    write(STATE, st)
+
+
+if __name__ == "__main__":
+    main()

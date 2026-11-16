@@ -1,0 +1,7 @@
+[Unit]
+Description=polybot: deploy the newest tested commit of the configured branch, roll back on a failed health check
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/polybot/bin/polybot-update

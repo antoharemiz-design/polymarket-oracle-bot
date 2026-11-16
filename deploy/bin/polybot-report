@@ -1,0 +1,85 @@
+#!/bin/bash
+# Publish status.md to the private polybot-reports repository and apply control.md from it.
+# systemd timer every 5 minutes, runs as the bot user. The server key can write only to that repository.
+set -uo pipefail
+ROOT=${POLYBOT_ROOT:-/opt/polybot}
+DATA=${POLYBOT_DATA:-/var/lib/polybot}
+ETC=${POLYBOT_ETC:-/etc/polybot}
+cfg() { sed -n "s/^$1=//p" "$ETC/env" 2>/dev/null | tail -1; }
+REPO=$(cfg POLYBOT_REPORTS_REPO)
+W=$DATA/reports
+mkdir -p "$DATA/logs"
+LOG=$DATA/logs/report.log
+note() {   # note <ok:true|false> <message>
+  python3 - "$DATA/report_state.json" "$1" "$2" <<'PY'
+import json, sys, time
+json.dump({"ts": time.time(), "ok": sys.argv[2] == "true", "message": sys.argv[3]}, open(sys.argv[1], "w"))
+PY
+  echo "$(date -u +%FT%TZ) $2" >> "$LOG"
+  echo "$2"
+}
+[ -n "$REPO" ] || { note false "POLYBOT_REPORTS_REPO is not set in $ETC/env"; exit 0; }
+export GIT_SSH_COMMAND="ssh -i $DATA/.ssh/reports_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=$DATA/.ssh/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=20"
+POLYBOT_MODE=$(cfg POLYBOT_MODE)
+POLYBOT_BRANCH=$(cfg POLYBOT_BRANCH)
+export POLYBOT_DATA=$DATA POLYBOT_MODE POLYBOT_BRANCH
+
+if [ ! -d "$W/.git" ]; then
+  rm -rf "$W"
+  if ! git clone -q "$REPO" "$W" >> "$LOG" 2>&1; then
+    note false "no access to $REPO yet: create the private repository and add the server deploy key with write access (README_install.md, step 4)"
+    exit 0
+  fi
+fi
+cd "$W" || exit 0
+git config user.name "polybot-server"
+git config user.email "polybot@localhost"
+git fetch -q origin >> "$LOG" 2>&1 || { note false "git fetch from $REPO failed (network or deploy key)"; exit 0; }
+BR=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+BR=${BR:-main}
+if git rev-parse -q --verify "origin/$BR" > /dev/null; then
+  git checkout -q -B "$BR" "origin/$BR"
+else
+  git checkout -q --orphan "$BR" 2> /dev/null || true        # empty repository: first commit
+fi
+
+if [ ! -f control.md ]; then
+  cat > control.md <<'EOF'
+# Управление ботом
+
+Сервер читает этот файл каждые 5 минут.
+
+- `mode: run`  — бот работает
+- `mode: stop` — бот снимает все котировки и ждёт (процесс и данные сохраняются)
+
+Чтобы остановить: нажмите карандаш (Edit), замените `run` на `stop`, нажмите Commit changes.
+
+mode: run
+EOF
+fi
+mode=$(sed -n 's/^mode:[[:space:]]*\([A-Za-z]*\).*/\1/p' control.md | tail -1 | tr 'A-Z' 'a-z')
+[ "$mode" = stop ] || mode=run
+python3 - "$DATA/control.json" "$mode" <<'PY'
+import json, os, sys, time
+p = sys.argv[1]
+json.dump({"mode": sys.argv[2], "ts": time.time()}, open(p + ".tmp", "w"))
+os.replace(p + ".tmp", p)
+PY
+
+if ! "$ROOT/current/.venv/bin/python" -m polybot status-md > status.md.new 2>> "$LOG"; then
+  note false "status.md could not be rendered (see $LOG)"; rm -f status.md.new; exit 0
+fi
+mv status.md.new status.md
+git add -A
+if git diff --cached --quiet; then note true "nothing new to publish"; exit 0; fi
+# the last automatic status commit is amended, so the history only grows when someone edits control.md
+if [ "$(git log -1 --format='%an|%s' 2> /dev/null)" = "polybot-server|status" ]; then
+  git commit -q --amend -m status
+else
+  git commit -q -m status
+fi
+if git push -q --force-with-lease origin "HEAD:$BR" >> "$LOG" 2>&1; then
+  note true "status.md published (control: $mode)"
+else
+  note false "push to $REPO failed: is 'Allow write access' ticked for the deploy key?"
+fi

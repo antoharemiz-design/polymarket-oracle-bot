@@ -5,6 +5,8 @@
   python -m polybot check                          verify keys, balance and API access; places nothing
   python -m polybot sim REC_DIR [...]              backtest on recorded ticks (see polybot/sim.py)
   python -m polybot outcomes REC_DIR               fetch resolutions for recorded markets
+  python -m polybot service                        long-running server service (systemd unit polybot), see polybot/service.py
+  python -m polybot status-md                      status.md of the server service
   python -m polybot lp-select | lp-paper | lp-live --i-understand-live | lp-earnings | lp-report
                                                    liquidity-rewards test (H10), see polybot/lp.py
 """
@@ -39,6 +41,9 @@ def main():
         except KeyboardInterrupt:
             print("stopped")
         return
+    if cmd in ("service", "status-md"):
+        from .service import main as service_main
+        service_main(args); return
     if cmd.startswith("lp-"):
         from .lp import cli
         cli(cmd, args[1:]); return
