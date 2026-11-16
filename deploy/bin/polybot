@@ -8,6 +8,7 @@
 #   polybot keys              enter Polymarket keys (hidden input); stored only in /etc/polybot/env
 #   polybot mode paper|live   switch mode; live asks for confirmation and needs keys and the main branch
 #   polybot new-run           archive the finished run and start a new one
+#   polybot telegram          optional alerts in Telegram (asks for the bot token and chat id)
 #   polybot update            deploy the newest commit now
 #   polybot report            publish status.md now (shows the error if the deploy key is missing)
 #   polybot version
@@ -92,6 +93,20 @@ case "$cmd" in
     [ -n "${2:-}" ] || { echo "usage: polybot branch NAME"; exit 1; }
     set_kv POLYBOT_BRANCH "$2"; "$ROOT/bin/polybot-update" --force
     ;;
+  telegram)
+    need_root telegram
+    echo "1) In Telegram open @BotFather, send /newbot, copy the token. 2) Send any message to your new bot."
+    t=$(ask_secret "bot token (hidden): ")
+    [ -n "$t" ] || { echo "nothing changed"; exit 0; }
+    chat=$(curl -fsS --max-time 20 "https://api.telegram.org/bot$t/getUpdates" | python3 -c '
+import json, sys
+r = json.load(sys.stdin).get("result") or []
+print(r[-1]["message"]["chat"]["id"] if r and "message" in r[-1] else "")' 2> /dev/null || true)
+    [ -n "$chat" ] || { echo "no message found: send any message to your bot first, then run sudo polybot telegram again"; exit 1; }
+    set_kv TELEGRAM_BOT_TOKEN "$t"; set_kv TELEGRAM_CHAT_ID "$chat"
+    curl -fsS --max-time 20 "https://api.telegram.org/bot$t/sendMessage" -d chat_id="$chat" -d text="polybot: alerts are on" > /dev/null \
+      && echo "test message sent to chat $chat; alerts are on"
+    ;;
   new-run)
     need_root new-run
     m=$(cfg POLYBOT_MODE); m=${m:-paper}
@@ -110,6 +125,6 @@ case "$cmd" in
     echo "release $(basename "$(readlink -f "$ROOT/current")"), branch $(cfg POLYBOT_BRANCH), mode $(cfg POLYBOT_MODE)"
     ;;
   *)
-    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
     ;;
 esac

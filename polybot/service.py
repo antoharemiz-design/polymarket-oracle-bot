@@ -303,7 +303,8 @@ def render_status(data, now=None, log_lines=50):
     age = now - st["ts"] if st.get("ts") else None
     alive = age is not None and age < 180
     out = ["# polybot — статус", "",
-           f"Обновлено: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(now))} (сервер пишет этот файл каждые 5 минут)", ""]
+           f"Обновлено: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(now))} (сервер публикует этот файл раз в 15 минут, "
+           "сразу — если бот упал, сменилась фаза или есть тревога)", ""]
     if hs.get("alert"):
         out += [f"> ⚠ **ТРЕВОГА:** {hs.get('message', '')}", ""]
     run_line = "—"
@@ -313,7 +314,9 @@ def render_status(data, now=None, log_lines=50):
         run_line = (f"начат {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(st['run_started']))}, "
                     f"прошло {min(el, tot):.1f} ч из {tot:.0f}" + (", завершён" if st.get("run_completed") else f", осталось {max(0, tot - el):.1f} ч"))
     rows = [("Бот", f"✅ работает ({mode})" if alive else f"❌ не отвечает {_ago(age)}"),
-            ("Фаза", f"{st.get('phase', '—')}" + (f" — {st['detail']}" if st.get("detail") else "")),
+            ("Фаза", {"selecting": "selecting — отбор рынков (6 снимков книги, ~25 минут)", "running": "running — котирует",
+                      "complete": "complete — прогон завершён"}.get(st.get("phase"), st.get("phase", "—"))
+             + (f" — {st['detail']}" if st.get("detail") else "")),
             ("Прогон", run_line),
             ("Версия", f"ветка {st.get('branch', '—')}, коммит {str(st.get('release', '—'))[:10]}"),
             ("Последние данные рынка", _ago(now - loop_st["ts"]) + " назад" if loop_st.get("ts") else "—"),

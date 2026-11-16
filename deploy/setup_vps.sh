@@ -97,7 +97,8 @@ POLYBOT_MODE=paper
 POLYBOT_ALLOW_LIVE=no
 POLYBOT_BRANCH=$BRANCH
 POLYBOT_DATA=$DATA
-POLYBOT_MARKETS=$ROOT/current/deploy/phase1_markets.json
+# empty: the markets are selected at the first start (6 book snapshots, ~25 min), as pre-registered
+POLYBOT_MARKETS=
 POLYBOT_REPORTS_REPO=$REPORTS
 POLYBOT_AUTO_UPDATE=yes
 LP_TEST_DAYS=2
