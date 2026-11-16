@@ -125,7 +125,7 @@ def fetch(snap_path, out):
     json.dump(data, open(f"{out}/history.json", "w"))
 
 
-def simulate(p, h, recenter):
+def simulate(p, h, recenter, log=None):
     """worst-case fills of a two-sided quote at mid(prev) -/+ s.
     returns per period [pnl, fills buy, fills sell, reward-weighted active days, peak inventory $]."""
     mids = sorted(h["mids"])
@@ -173,9 +173,13 @@ def simulate(p, h, recenter):
             if buy_yes and y >= ask - 1e-9 and used[(k, "a")] < N and pos > -cap + 1e-9:
                 q = min(N - used[(k, "a")], sz, pos + cap); used[(k, "a")] += q
                 pos -= q; cash += q * ask; ns += 1
+                if log is not None:
+                    log.append((part, ts, -q, ask))
             elif not buy_yes and y <= bid + 1e-9 and used[(k, "b")] < N and pos < cap - 1e-9:
                 q = min(N - used[(k, "b")], sz, cap - pos); used[(k, "b")] += q
                 pos += q; cash -= q * bid; nb += 1
+                if log is not None:
+                    log.append((part, ts, q, bid))
             peak = max(peak, abs(pos) * (m0 if pos > 0 else 1 - m0))
         if abs(pos) >= cap - 1e-9 and ms[-1][0] > last_t:
             one_sided += ms[-1][0] - last_t
