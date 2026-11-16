@@ -334,11 +334,16 @@ def render_status(data, now=None, log_lines=50):
         cv_all = ((sum((x - mu) ** 2 for x in port) / len(port)) ** 0.5 / mu) if port and mu > 0 else None
         mk = r.get("markout60") or {}
         fmt = lambda x, f="{:.2f}": "—" if x is None else f.format(x)
+        ticks = sorted({round(e["ts"]) for e in events if e["event"] in ("m1", "pnl")})
+        down_h = sum(b - a for a, b in zip(ticks, ticks[1:]) if b - a > 300) / 3600
+        n_starts = sum(1 for e in events if e["event"] == "start")
+        gone = [e for e in events if e["event"] == "reward_removed"]
+        removed = set(gone[-1]["markets"]) if gone and now - gone[-1]["ts"] < 7200 else set()
         out += ["## Ход прогона", "",
                 f"- 30-минутных окон: {len(wins)}; M1 портфеля в среднем ${mu:.2f}/день; CV по всем окнам {fmt(cv_all, '{:.0%}')}; "
                 f"CV в часы 24–48: {fmt(r.get('cv'), '{:.0%}') if r.get('windows_2nd_half') else 'ещё нет'}",
                 f"- крупнейшая доля рынка в M1 за последние 24 ч: {fmt(r.get('max_share_last24'), '{:.0%}')} (порог 40%)",
-                f"- простой: {r.get('downtime_h', 0)} ч; запусков процесса: {r.get('process_starts', 0)}",
+                f"- простой: {down_h:.2f} ч; запусков процесса: {n_starts}",
                 f"- исполнений: {r.get('fills', 0)}, контрактов {r.get('contracts', 0):.0f}; markout 60 с: среднее {fmt(mk.get('mean_c'))} ц, "
                 f"p5 {fmt(mk.get('p5_c'))} ц, доля хуже −2.1 ц {fmt(mk.get('share_worse_than_-2.1c'), '{:.0%}')}", ""]
         last = wins[-1]["markets"] if wins else {}
@@ -353,7 +358,8 @@ def render_status(data, now=None, log_lines=50):
             m = last.get(c) or {}
             p = per.get(c) or {}
             yn = pos.get(c) or [0, 0]
-            out.append(f"| {(markets.get(c) or {}).get('q', c)[:70]} | {fmt(m.get('m1_usd_day'))} | {fmt(p.get('share_last24'), '{:.0%}')} | "
+            name = (markets.get(c) or {}).get("q", c)[:70] + (" (награда снята, не котируем)" if c in removed else "")
+            out.append(f"| {name} | {fmt(m.get('m1_usd_day'))} | {fmt(p.get('share_last24'), '{:.0%}')} | "
                        f"{fmt(m.get('comp_levels'), '{:.1f}')} | {p.get('fills', 0)} | {yn[0]:.0f} / {yn[1]:.0f} |")
         out.append("")
         errs = [e for e in events if e["event"] == "error"][-5:]

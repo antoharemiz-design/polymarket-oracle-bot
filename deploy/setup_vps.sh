@@ -117,11 +117,17 @@ KEY=$DATA/.ssh/reports_ed25519
 if [ ! -f "$KEY" ]; then
   runuser -u polybot -- ssh-keygen -q -t ed25519 -N "" -C "polybot@$(hostname)" -f "$KEY"
 fi
-# GitHub's SSH host keys from its TLS-authenticated API, so the first connection cannot be intercepted
-curl -fsS --max-time 20 https://api.github.com/meta | python3 -c '
+# GitHub's SSH host keys from its TLS-authenticated API, so the first connection cannot be intercepted.
+# Fallback: GitHub's published Ed25519 key (fingerprint SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU,
+# docs.github.com "GitHub's SSH key fingerprints").
+if ! curl -fsS --max-time 20 https://api.github.com/meta 2> /dev/null | python3 -c '
 import json, sys
 for k in json.load(sys.stdin)["ssh_keys"]:
-    print("github.com", k)' > "$DATA/.ssh/known_hosts.new" && mv "$DATA/.ssh/known_hosts.new" "$DATA/.ssh/known_hosts"
+    print("github.com", k)' > "$DATA/.ssh/known_hosts.new" 2> /dev/null || [ ! -s "$DATA/.ssh/known_hosts.new" ]; then
+  echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$DATA/.ssh/known_hosts.new"
+  echo "GitHub API unavailable; using GitHub's published Ed25519 host key"
+fi
+mv "$DATA/.ssh/known_hosts.new" "$DATA/.ssh/known_hosts"
 chown polybot:polybot "$DATA/.ssh/known_hosts"; chmod 644 "$DATA/.ssh/known_hosts"
 echo "reports repository: $REPORTS"
 

@@ -32,9 +32,9 @@ ask_secret() { local v; read -r -s -p "$1" v < /dev/tty; echo >&2; echo "$v"; }
 cmd=${1:-help}
 case "$cmd" in
   status)
-    runuser -u polybot -- env POLYBOT_DATA="$DATA" POLYBOT_MODE="$(cfg POLYBOT_MODE)" POLYBOT_BRANCH="$(cfg POLYBOT_BRANCH)" \
-      "$ROOT/current/.venv/bin/python" -m polybot status-md 2>/dev/null || \
-      env POLYBOT_DATA="$DATA" POLYBOT_MODE="$(cfg POLYBOT_MODE)" "$ROOT/current/.venv/bin/python" -m polybot status-md
+    if [ "$(id -u)" = 0 ]; then as=(runuser -u polybot --); else as=(); fi
+    "${as[@]}" env PYTHONPATH="$ROOT/current" POLYBOT_DATA="$DATA" POLYBOT_MODE="$(cfg POLYBOT_MODE)" \
+      POLYBOT_BRANCH="$(cfg POLYBOT_BRANCH)" "$ROOT/current/.venv/bin/python" -m polybot status-md
     echo; echo "systemd: $(systemctl is-active polybot) | reports: $(python3 -c "import json;s=json.load(open('$DATA/report_state.json'));print(s['message'])" 2>/dev/null || echo 'not run yet')"
     ;;
   logs)

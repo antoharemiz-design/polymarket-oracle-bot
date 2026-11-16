@@ -66,20 +66,24 @@ json.dump({"mode": sys.argv[2], "ts": time.time()}, open(p + ".tmp", "w"))
 os.replace(p + ".tmp", p)
 PY
 
-if ! "$ROOT/current/.venv/bin/python" -m polybot status-md > status.md.new 2>> "$LOG"; then
-  note false "status.md could not be rendered (see $LOG)"; rm -f status.md.new; exit 0
+if ! PYTHONPATH="$ROOT/current" "$ROOT/current/.venv/bin/python" -m polybot status-md > "$DATA/status.md.new" 2>> "$LOG"; then
+  note false "status.md could not be rendered (see $LOG)"; rm -f "$DATA/status.md.new"; exit 0
 fi
-mv status.md.new status.md
+# Publish at most every 15 minutes, or at once when the bot state, phase or an alert line changes.
+# Plain commits, never a rewrite of history: an edit of control.md on GitHub can never be lost or rejected.
+key() { grep -E '^\| (Бот|Фаза|Проверка здоровья) \||ТРЕВОГА' "$1" 2> /dev/null; }
+last=$(git log -1 --format=%ct -- status.md 2> /dev/null || echo 0); last=${last:-0}
+if [ -f status.md ] && [ $(( $(date +%s) - last )) -lt 840 ] && [ "$(key status.md)" = "$(key "$DATA/status.md.new")" ]; then
+  rm -f "$DATA/status.md.new"; note true "control: $mode; status.md unchanged in substance, next publish within 15 min"; exit 0
+fi
+mv "$DATA/status.md.new" status.md
 git add -A
-if git diff --cached --quiet; then note true "nothing new to publish"; exit 0; fi
-# the last automatic status commit is amended, so the history only grows when someone edits control.md
-if [ "$(git log -1 --format='%an|%s' 2> /dev/null)" = "polybot-server|status" ]; then
-  git commit -q --amend -m status
-else
-  git commit -q -m status
-fi
-if git push -q --force-with-lease origin "HEAD:$BR" >> "$LOG" 2>&1; then
-  note true "status.md published (control: $mode)"
-else
-  note false "push to $REPO failed: is 'Allow write access' ticked for the deploy key?"
-fi
+if git diff --cached --quiet; then note true "nothing new to publish (control: $mode)"; exit 0; fi
+git commit -q -m status
+for _ in 1 2 3; do
+  if git push -q origin "HEAD:$BR" >> "$LOG" 2>&1; then
+    note true "status.md published (control: $mode)"; exit 0
+  fi
+  git fetch -q origin >> "$LOG" 2>&1 && git rebase -q "origin/$BR" >> "$LOG" 2>&1 || { git rebase --abort > /dev/null 2>&1; break; }
+done
+note false "push to $REPO failed: is 'Allow write access' ticked for the deploy key? (details: $LOG)"
