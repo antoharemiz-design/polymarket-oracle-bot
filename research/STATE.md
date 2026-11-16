@@ -12,7 +12,12 @@
 - Проверка здоровья: `scratchpad/lp_health.sh` (перезапускает упавший прогон на оставшееся время).
   Плановая задача «LP phase 1 hourly health check» (trig_01CLyiqqNzCJYZrokqXMFg97) — каждый час в :16;
   напоминание об отчёте — 2026-11-18 11:25 UTC (trig_01WbrDHYcvgWr6D1k96Bp44f).
-- Отчёт: `python -m polybot lp-phase1 paper` с LP_LP_DIR на lp1 и lp_shadow.
+- Отчёт: `python -m polybot lp-phase1 paper` с LP_LP_DIR на lp1 и lp_shadow (downtime_h — суммарный простой).
+- Инцидент 11:22 UTC 16 ноября: виртуальная машина перезагрузилась через ~4 минуты простоя сессии,
+  отвязанные процессы умерли (диск цел). Простой ~4.5 мин, перезапуск в 11:26. Защита: отслеживаемая
+  фоновая задача (Bash, run_in_background=true, timeout 7200000), которая держит сессию и каждые 5 минут
+  запускает проверку; по окончании (≈2 ч) запускается заново:
+  `S=/tmp/claude-0/-home-user-polymarket-oracle-bot/c360c924-1e39-5774-8519-3160b6e287d4/scratchpad; for i in $(seq 1 23); do echo "--- $(date -u +%FT%TZ) up $(cut -d' ' -f1 /proc/uptime)s"; bash $S/lp_health.sh; sleep 300; done >> $S/health.log 2>&1`
 - Решения пользователя (поправка в PREREG_LP_PHASE1.md): фаза 1 гейтится только по CV M1 ≤ 50%
   (часы 24–48) и доле рынка ≤ 40% (последние 24 ч); markout — данные, критерий фазы 2 на 200–400
   исполнениях. Отчёт — с таблицей без рынка Hasan Piker (`lp-phase1 paper --exclude "Hasan Piker"`).

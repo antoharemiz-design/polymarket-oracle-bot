@@ -836,7 +836,10 @@ def phase1(events, cv_max=0.5, share_max=0.4, exclude=()):
     mk_all = [m for w in wins for v in mk_of(w).values() for m in v.get("markout60", [])]
     q = sum(w for _, w in mk_all)
     hours = (t_last - t0) / 3600
+    ticks = sorted({round(e["ts"]) for e in events if e["event"] in ("m1", "pnl")})
+    downtime = sum(b - a for a, b in zip(ticks, ticks[1:]) if b - a > 300)
     out = {"hours": round(hours, 1), "windows_2nd_half": len(half), "excluded": sorted(ex),
+           "downtime_h": round(downtime / 3600, 2), "process_starts": len(starts),
            "portfolio_m1_usd_day_2nd_half": mean, "cv": cv,
            "max_share_last24": max((v["share_last24"] or 0.0 for v in per.values()), default=None),
            "fills": sum(v["fills"] for v in per.values()), "contracts": sum(v["contracts"] for v in per.values()),
