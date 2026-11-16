@@ -222,6 +222,21 @@ class LoopTest(unittest.TestCase):
         self.assertEqual(t.st["C1"].orders, {"bid": None, "ask": None})
 
 
+class RestoreTest(unittest.TestCase):
+    def test_restore_positions_from_journal(self):
+        t, ex, path = make_test([([(0.48, 100.0)], [(0.52, 100.0)], 0.01)])
+        ev = [{"event": "fill", "mkt": "C1", "side": "bid", "price": 0.48, "size": 30.0},
+              {"event": "fill", "mkt": "C1", "side": "ask", "price": 0.52, "size": 20.0},
+              {"event": "merge", "mkt": "C1", "pairs": 20.0},
+              {"event": "fill", "mkt": "OTHER", "side": "bid", "price": 0.5, "size": 5.0}]
+        self.assertEqual(t.restore(ev), 2)
+        s = t.st["C1"]
+        self.assertAlmostEqual(s.yes, 10.0); self.assertAlmostEqual(s.no, 0.0)
+        self.assertAlmostEqual(s.cash, -30 * 0.48 - 20 * 0.48 + 20)
+        # the restored position counts against the 3N limit: 50 more YES would breach 60
+        self.assertEqual(lp.targets([(0.48, 100.0)], [(0.52, 100.0)], 0.01, 4.5, s.pos() + 50, 60), (None, 0.52))
+
+
 class PaperFillTest(unittest.TestCase):
     def test_public_trade_fills_first_in_queue(self):
         trades = [(2e9, 0, "S", 0.48, 15.0, "k1"), (2e9, 0, "S", 0.48, 15.0, "k2"), (2e9, 0, "B", 0.51, 5.0, "k3")]

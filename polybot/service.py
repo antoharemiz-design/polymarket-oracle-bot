@@ -229,6 +229,7 @@ class Service:
                 self.save_run(run)
             return await self._idle(stop, "complete", "run finished; start a new one with: sudo polybot new-run")
         mpath = os.path.join(self.run_dir, "markets.json")
+        resumed = bool(run)
         if not run:
             self.phase = "selecting"
             self.write_status()
@@ -256,8 +257,11 @@ class Service:
             kw["books_fn"] = self.books_fn
         if self.rewards_fn:
             kw["rewards_fn"] = self.rewards_fn
+        prior = lp.load_events(self.run_dir, self.mode) if resumed else []
         self.test = lp.LPTest(cfg, ex, journal, markets, log=self.log.info, clock=self.clock,
                               control_fn=self.control_for_test, **kw)
+        if prior:
+            self.log.info(f"positions restored from the journal: {self.test.restore(prior)} fills")
         self.phase = "running"
         self.write_status()
         task = asyncio.create_task(self.test.run())

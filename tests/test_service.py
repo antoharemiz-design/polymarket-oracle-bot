@@ -97,6 +97,19 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(len(starts), 2)
         self.assertLess(starts[1]["config"]["test_days"], 30 / 86400)  # only the time left
 
+    def test_resume_restores_positions(self):
+        tmp = tempfile.mkdtemp()
+        e, kw = make(tmp, LP_TEST_DAYS=str(30 / 86400))
+        with e:
+            asyncio.run(run_for(service.Service(**kw), 0.3))
+            with open(os.path.join(tmp, "paper", "paper.jsonl"), "a") as f:     # a fill recorded before the restart
+                f.write(json.dumps({"event": "fill", "ts": time.time(), "mkt": "C1", "side": "bid", "price": 0.48,
+                                    "size": 20.0, "fill_ts": time.time(), "order": "x"}) + "\n")
+            svc = service.Service(**kw)
+            asyncio.run(run_for(svc, 0.3))
+        self.assertAlmostEqual(svc.test.st["C1"].yes, 20.0)
+        self.assertIn("restored", [x["event"] for x in events(tmp)])
+
     def test_control_stop_pulls_quotes(self):
         tmp = tempfile.mkdtemp()
         with open(os.path.join(tmp, "control.json"), "w") as f:

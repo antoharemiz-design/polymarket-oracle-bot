@@ -471,6 +471,14 @@ class LiveExec:
             self.log(f"trade list failed: {e!r}")
         return out
 
+    async def balances(self, m):
+        """On-chain shares (YES, NO) held by the wallet in market m."""
+        out = []
+        for tok in (m["yes"], m["no"]):
+            b = await self.c.get_balance_allowance(asset_type="CONDITIONAL", token_id=tok)
+            out.append(b.balance / 1e6)
+        return tuple(out)
+
     async def merge(self, m, pairs):
         try:
             h = await self.c.merge_positions(condition_id=m["cond"], amount="max")
@@ -606,6 +614,41 @@ class LPTest:
 
     def pnl(self):
         return sum(s.mtm() for s in self.st.values())
+
+    def restore(self, events):
+        """Rebuild positions and cash of a resumed run from its own journal (fills and merges), so a restart
+        keeps the position limit and the mark-to-market stop. Returns the number of fills replayed."""
+        n = 0
+        for e in events:
+            s = self.st.get(e.get("mkt"))
+            if s is None:
+                continue
+            if e["event"] == "fill":
+                if e["side"] == "bid":
+                    s.yes += e["size"]; s.cash -= e["size"] * e["price"]
+                else:
+                    s.no += e["size"]; s.cash -= e["size"] * (1 - e["price"])
+                n += 1
+            elif e["event"] == "merge":
+                s.yes -= e["pairs"]; s.no -= e["pairs"]; s.cash += e["pairs"]
+        if n:
+            self.j.write("restored", fills=n, positions={c: [x.yes, x.no, round(x.cash, 6)] for c, x in self.st.items()})
+        return n
+
+    async def reconcile(self):
+        """Live: adopt the on-chain YES / NO balances when they differ from the tracked position (a fill we
+        never saw, or a restart without the journal). Cash is shared across markets and is not reconciled."""
+        if not hasattr(self.ex, "balances"):
+            return
+        for cond, s in self.st.items():
+            try:
+                yes, no = await self.ex.balances(s.m)
+            except Exception as e:
+                self.log(f"balance read failed for {cond[:10]}: {e!r}")
+                continue
+            if abs(yes - s.yes) > 0.01 or abs(no - s.no) > 0.01:
+                self.j.write("reconcile", mkt=cond, tracked=[s.yes, s.no], chain=[yes, no])
+                s.yes, s.no = yes, no
 
     def apply_fill(self, f):
         s = self.st[f["mkt"]]
@@ -749,6 +792,7 @@ class LPTest:
         t_end = self.clock() + self.cfg.test_days * 86400
         cfgs, cfg_t = {}, -1e18
         self.j.write("start", markets=[s.m["cond"] for s in self.st.values()], config=dataclasses.asdict(self.cfg))
+        await self.reconcile()
         try:
             while self.clock() < t_end and not self.stopped:
                 now = self.clock()
@@ -976,7 +1020,10 @@ def cli(cmd, args):
     if len(sel) < cfg.markets_min:
         raise SystemExit(f"only {len(sel)} markets selected; need {cfg.markets_min}")
     if cmd == "lp-paper":
-        asyncio.run(LPTest(cfg, PaperExec(every_s=cfg.fills_every_s), Journal(os.path.join(cfg.lp_dir, "paper.jsonl")), sel).run())
+        prior = load_events(cfg.lp_dir, "paper") if os.environ.get("LP_RESUME") == "1" else []
+        t = LPTest(cfg, PaperExec(every_s=cfg.fills_every_s), Journal(os.path.join(cfg.lp_dir, "paper.jsonl")), sel)
+        t.restore(prior)                                  # LP_RESUME=1: continue the same run after a restart
+        asyncio.run(t.run())
         return
     if cmd == "lp-live":
         if "--i-understand-live" not in args:
