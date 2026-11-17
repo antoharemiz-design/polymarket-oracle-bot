@@ -144,3 +144,73 @@ checks: {'M1 CV <= 50% (hours 24-48)': False, 'no market > 40% of M1 (last 24 h)
 verdict: FAIL: M1 CV <= 50% (hours 24-48)
 ```
 
+## 2026-11-17 05:16 UTC — контейнерные прогоны (запасные данные), 18 ч
+
+### lp1, 5 рынков (утренний отбор)
+
+```
+excluded: []
+hours: 17.8
+windows_2nd_half: 0
+excluded: []
+downtime_h: 0.0
+process_starts: 4
+portfolio_m1_usd_day_2nd_half: 0.0
+cv: None
+max_share_last24: 0.3136691862665554
+fills: 6
+contracts: 85.99
+contracts_per_market_day: 23.244867306057742
+markout60: {'n_fills': 6, 'mean_c': 0.6221072217699732, 'p5_c': 0.5, 'p25_c': 0.5, 'p50_c': 0.5, 'share_worse_than_-2.1c': 0.0}
+expected_week_usd: 0.0
+checks: {'M1 CV <= 50% (hours 24-48)': False, 'no market > 40% of M1 (last 24 h)': True}
+verdict: FAIL: M1 CV <= 50% (hours 24-48)
+  Will PAN win the most seats in the 2027 Chihuahua  {'m1_usd_day_2nd_half': 0.0, 'cv': None, 'share_last24': 0.029, 'comp_levels': None, 'places': 19, 'cancels': 19, 'fills': 0, 'contracts': 0.0, 'markout60_mean_c': None, 'markout60_p5_c': None}
+  Will the 10-year Treasury yield hit 5.17% in Novem {'m1_usd_day_2nd_half': 0.0, 'cv': None, 'share_last24': 0.314, 'comp_levels': None, 'places': 891, 'cancels': 887, 'fills': 0, 'contracts': 0.0, 'markout60_mean_c': None, 'markout60_p5_c': None}
+  Will Donald Trump publicly insult Hasan Piker by N {'m1_usd_day_2nd_half': 0.0, 'cv': None, 'share_last24': 0.152, 'comp_levels': None, 'places': 80, 'cancels': 76, 'fills': 1, 'contracts': 1.0, 'markout60_mean_c': 5.0, 'markout60_p5_c': 5.0}
+  Will the median home value in the US be between $4 {'m1_usd_day_2nd_half': 0.0, 'cv': None, 'share_last24': 0.297, 'comp_levels': None, 'places': 521, 'cancels': 513, 'fills': 5, 'contracts': 84.99, 'markout60_mean_c': 0.571, 'markout60_p5_c': 0.5}
+  Will the Ornn B200 Index hit $5.00 (LOW) by Decemb {'m1_usd_day_2nd_half': 0.0, 'cv': None, 'share_last24': 0.209, 'comp_levels': None, 'places': 259, 'cancels': 253, 'fills': 0, 'contracts': 0.0, 'markout60_mean_c': None, 'markout60_p5_c': None}
+```
+
+### lp1 без Hasan Piker
+
+```
+excluded: ['Will Donald Trump publicly insult Hasan Piker by November 30']
+hours: 17.8
+windows_2nd_half: 0
+excluded: ['0x8e0d13a3035e7505f7dd93731f5a8c50511ae843e6dca94b0c024b3578939835']
+downtime_h: 0.0
+process_starts: 4
+portfolio_m1_usd_day_2nd_half: 0.0
+cv: None
+max_share_last24: 0.36991482087538224
+fills: 5
+contracts: 84.99
+contracts_per_market_day: 28.718183398387133
+markout60: {'n_fills': 5, 'mean_c': 0.5705965407695023, 'p5_c': 0.5, 'p25_c': 0.5, 'p50_c': 0.5, 'share_worse_than_-2.1c': 0.0}
+expected_week_usd: 0.0
+checks: {'M1 CV <= 50% (hours 24-48)': False, 'no market > 40% of M1 (last 24 h)': True}
+verdict: FAIL: M1 CV <= 50% (hours 24-48)
+```
+
+### lp_shadow, 30 рынков (только распределение markout)
+
+```
+excluded: []
+hours: 18.2
+windows_2nd_half: 0
+excluded: []
+downtime_h: 0.0
+process_starts: 4
+portfolio_m1_usd_day_2nd_half: 0.0
+cv: None
+max_share_last24: 0.10862556178994692
+fills: 24
+contracts: 296.87
+contracts_per_market_day: 13.04026753365718
+markout60: {'n_fills': 24, 'mean_c': 1.3571596995317814, 'p5_c': 0.5, 'p25_c': 0.5, 'p50_c': 1.0, 'share_worse_than_-2.1c': 0.0}
+expected_week_usd: 0.0
+checks: {'M1 CV <= 50% (hours 24-48)': False, 'no market > 40% of M1 (last 24 h)': True}
+verdict: FAIL: M1 CV <= 50% (hours 24-48)
+```
+
