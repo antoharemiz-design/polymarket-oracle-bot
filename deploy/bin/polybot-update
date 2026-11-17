@@ -64,6 +64,13 @@ install_runtime() {   # scripts and units of the release being switched to
   install -d -m 755 "$ROOT/bin"
   install -m 755 "$1"/deploy/bin/* "$ROOT/bin/"
   ln -sf "$ROOT/bin/polybot" /usr/local/bin/polybot
+  # Ubuntu's needrestart restarts services after every unattended package upgrade (6 restarts in 20 min on
+  # 17 Nov, 06:17-06:37 UTC). The bot resumes safely, but each restart pulls all quotes: exclude it.
+  if [ -d /etc/needrestart ]; then
+    install -d /etc/needrestart/conf.d
+    printf '%s\n' '# polybot: never restarted by needrestart after package upgrades (a restart pulls all quotes)' \
+      '$nrconf{override_rc}{qr(^polybot)} = 0;' > /etc/needrestart/conf.d/polybot.conf
+  fi
   if [ -z "${POLYBOT_NO_SYSTEMD:-}" ]; then
     install -m 644 "$1"/deploy/systemd/* /etc/systemd/system/
     systemctl daemon-reload
