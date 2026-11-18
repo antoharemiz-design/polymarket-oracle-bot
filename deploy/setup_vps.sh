@@ -97,7 +97,7 @@ POLYBOT_MODE=paper
 POLYBOT_ALLOW_LIVE=no
 POLYBOT_BRANCH=$BRANCH
 POLYBOT_DATA=$DATA
-# empty: the markets are selected at the first start (6 book snapshots, ~25 min), as pre-registered
+# empty: the markets are selected at the first start (48 book snapshots 30 min apart, one day), as pre-registered
 POLYBOT_MARKETS=
 POLYBOT_REPORTS_REPO=$REPORTS
 POLYBOT_AUTO_UPDATE=yes

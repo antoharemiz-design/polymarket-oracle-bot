@@ -1,7 +1,9 @@
 """Liquidity-rewards test module (polybot/lp.py): scoring, quoting rules, fills, stop, report."""
 import asyncio
 import importlib.util
+import json
 import os
+import time
 import tempfile
 import unittest
 
@@ -304,6 +306,66 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual([x["cond"] for x in lp.choose(rows, cfg)], ["a", "c"])
 
 
+class DaySelectionTest(unittest.TestCase):
+    """One-day selection (research/PREREG_LP_PHASE1B.md): snapshots on disk, median M1 with 0 where we cannot
+    quote, hard filter on the median number of competitor levels."""
+    REW = {c: {"rate": 10.0, "v": 4.5, "min": 20.0} for c in "ABC"}
+
+    def meta(self, c):
+        return {"question": f"Will test market {c} resolve YES?", "active": True, "closed": False, "acceptingOrders": True,
+                "clobTokenIds": json.dumps([f"Y{c}", f"N{c}"]), "createdAt": "2026-01-01T00:00:00Z",
+                "endDate": "2027-06-01T00:00:00Z", "events": [{"id": "E" + c}]}
+
+    def books(self, toks):
+        k = self.calls = self.calls + 1
+        lone = ([(0.48, 100.0)], [(0.52, 100.0)], 0.01)                                 # 2 levels in the zone
+        busy = ([(0.48, 100.0), (0.47, 100.0)], [(0.52, 100.0), (0.53, 100.0)], 0.01)   # 4 levels
+        wide = ([(0.40, 100.0), (0.39, 100.0)], [(0.60, 100.0), (0.61, 100.0)], 0.01)   # best prices outside the zone
+        bk = {"YA": lone, "YB": busy, "YC": busy if k == 1 else wide}
+        return {t: bk[t] for t in toks}
+
+    def setUp(self):
+        self.tmp, self.calls, self.t = tempfile.mkdtemp(), 0, [time.time()]
+        self.cfg = lp.LPConfig(lp_dir=self.tmp, select_snapshots=3, select_gap_s=1800, markets_min=1, max_share=1.0)
+
+    def run_select(self, sleep=None, gamma_fn=None):
+        def adv(s):
+            self.t[0] += s
+        return lp.select(self.cfg, log=lambda *_: None, sleep=sleep or adv, clock=lambda: self.t[0],
+                         rewards_fn=lambda: self.REW, gamma_fn=gamma_fn or (lambda rw: {c: self.meta(c) for c in rw}),
+                         books_fn=self.books)
+
+    def test_comp_levels(self):
+        bids, asks = [(0.48, 100.0), (0.47, 5.0), (0.45, 100.0)], [(0.52, 100.0), (0.56, 100.0)]
+        self.assertEqual(lp.comp_levels(bids, asks, 0.50, 4.5, 20.0), 2)   # 0.47 too small, 0.45 / 0.56 outside
+
+    def test_filter_median_and_resume_after_stop(self):
+        def stop_now(_):
+            raise lp.SelectionStopped()
+        with self.assertRaises(lp.SelectionStopped):
+            self.run_select(sleep=stop_now)                 # stopped after the first snapshot
+        with open(os.path.join(self.tmp, "selection", "snapshots.jsonl")) as f:
+            self.assertEqual(len(f.readlines()), 1)
+
+        def no_gamma(rw):
+            raise AssertionError("candidates must come from disk on resume")
+        out = self.run_select(gamma_fn=no_gamma)
+        self.assertEqual(self.calls, 3)                     # 1 before the stop + 2 after, not 3 new ones
+        self.assertEqual([x["cond"] for x in out], ["B"])   # A: 2 competitor levels; C: in the zone 1 of 3 times
+        b = out[0]
+        self.assertEqual(b["comp_levels_median"], 4)
+        self.assertEqual(len(b["m1_snapshots"]), 3)
+        self.assertGreater(b["m1_usd_day"], 0)
+        with open(os.path.join(self.tmp, "selection", "summary.json")) as f:
+            sm = json.load(f)
+        # C is outside the zone in 2 of 3 snapshots: 0 levels there, median 0, so the filter drops it too
+        self.assertEqual((sm["snapshots"], sm["candidates_quotable"], sm["passed_filter"]), (3, 3, 1))
+        self.assertEqual(sm["stats"]["C"][1], 0.0)          # median M1 of C is 0: outside the zone 2 of 3 times
+        self.assertAlmostEqual(sm["span_h"], 1.0)
+        with open(os.path.join(self.tmp, "markets.json")) as f:
+            self.assertEqual([m["cond"] for m in json.load(f)["markets"]], ["B"])
+
+
 class WindowTest(unittest.TestCase):
     def test_window_summary_and_resilience(self):
         calls = {"n": 0}
@@ -403,6 +465,20 @@ class Phase1Test(unittest.TestCase):
         self.assertAlmostEqual(r["cv"], 0.0)
         self.assertAlmostEqual(r["max_share_last24"], 0.5)   # two equal markets left: 50% each
         self.assertIn("no market > 40%", r["verdict"])
+
+    def test_h10_closure_rule(self):
+        ev = self.wins([10.0, 11.0, 9.0, 10.0] * 24)       # portfolio M1 of hours 24-48: $10/day
+        r = lp.phase1(ev, m1_per_100_min=10.0, quote_cap_usd=100.0)
+        self.assertEqual((r["verdict"], r["h10_closed"]), ("PASS", False))
+        r = lp.phase1(ev, m1_per_100_min=10.0, quote_cap_usd=200.0)      # $5 per $100
+        self.assertTrue(r["h10_closed"])
+        self.assertIn("H10 closes", r["verdict"])
+        ev[0]["quote_cap"] = 50.0                                          # from the start event: $20 per $100
+        r = lp.phase1(ev, m1_per_100_min=10.0)
+        self.assertAlmostEqual(r["m1_per_100usd_2nd_half"], 20.0)
+        self.assertFalse(r["h10_closed"])
+        self.assertIsNone(lp.phase1(ev)["h10_closed"])                    # rule off: phase 1 as before
+        self.assertFalse(lp.phase1(self.wins([1.0] * 20), m1_per_100_min=10.0, quote_cap_usd=100.0)["h10_closed"])  # < 48 h
 
 
 if __name__ == "__main__":

@@ -48,8 +48,9 @@ class LPConfig:
     sample_s: float = 60.0
     window_s: float = 1800.0           # phase 1: summary written to the journal every 30 minutes
     fills_every_s: float = 15.0        # paper: how often the public tape is polled for fills
-    select_snapshots: int = 6          # selection: book snapshots, median M1 per market
-    select_gap_s: float = 300.0
+    select_snapshots: int = 48         # selection (PREREG_LP_PHASE1B): 48 book snapshots 30 minutes apart = one day,
+    select_gap_s: float = 1800.0       # median M1 per market; a snapshot where we cannot quote counts as 0
+    min_comp_levels: float = 3.0       # hard filter: median competitor price levels in the reward zone >= 3
     max_share: float = 0.4             # selection: no market may carry more than this share of predicted M1
     test_days: float = 7.0
     min_age_days: float = 7.0          # H10N: markets younger than a week carried the November loss
@@ -60,6 +61,8 @@ class LPConfig:
     reward_ratio_min: float = 0.6      # actual REWARD / M1 prediction for the same quotes
     markout60_min_c: float = -2.1      # cents per contract; break-even at 0.6 x M1 in the worst observed week
     fill_rate_max: float = 30.0        # contracts per market-day; the backtest's worst case (first in queue)
+    # H10 closure rule (PREREG_LP_PHASE1B): portfolio M1 in hours 24-48 per $100 of quote capital
+    m1_per_100_min: float = 10.0
 
 
 def from_env() -> LPConfig:
@@ -225,14 +228,27 @@ def _ts(iso):
 
 
 # --------------------------------------------------------------------------------------------------
-# market selection
+# market selection (research/PREREG_LP_PHASE1B.md)
+
+class SelectionStopped(Exception):
+    """Raised by the sleep function given to select() when the service stops; the snapshots taken so far are on
+    disk and the next start continues the same selection."""
+
+
+def comp_levels(bids, asks, mid, v_c, min_size) -> int:
+    """Competitors in the reward zone: price levels of other orders within v cents of the midpoint that carry at
+    least rewards_min_size, both sides together. The same measure as comp_levels in the test loop."""
+    n = sum(1 for p, z in bids if 0 <= (mid - p) * 100 < v_c and z + 1e-9 >= min_size)
+    return n + sum(1 for p, z in asks if 0 <= (p - mid) * 100 < v_c and z + 1e-9 >= min_size)
+
 
 def _rows(cand, rw, bk, cfg):
-    """Quote, M1 prediction and capital per candidate market for one book snapshot."""
+    """Quote, M1 prediction, competitor levels and capital per candidate market for one book snapshot. Markets
+    where we cannot quote (no reward, best prices outside the zone, mid outside [mid_lo, mid_hi]) are absent."""
     rows = {}
     for c, m in cand:
         tok = json.loads(m["clobTokenIds"])[0]
-        if tok not in bk:
+        if tok not in bk or c not in rw:
             continue
         bids, asks, tick = bk[tok]
         r = rw[c]
@@ -247,6 +263,7 @@ def _rows(cand, rw, bk, cfg):
         rows[c] = {"cond": c, "q": m.get("question"), "yes": tok, "no": json.loads(m["clobTokenIds"])[1],
                    "event": str((m.get("events") or [{}])[0].get("id") or c), "N": n, "v": r["v"], "min": r["min"],
                    "rate": r["rate"], "tick": tick, "mid": mid, "m1_usd_day": r["rate"] * frac,
+                   "comp_levels": comp_levels(bids, asks, mid, r["v"], r["min"]),
                    "quote_cap": n * (bid + 1 - ask), "neg_risk": bool(m.get("negRisk")), "end": m["endDate"]}
     return rows
 
@@ -276,13 +293,8 @@ def choose(rows, cfg):
         banned.add(top["cond"])
 
 
-def select(cfg: LPConfig, now=None, log=print, sleep=time.sleep):
-    """Stable (classification A), at least a week old, at least two weeks left, mid in [0.15, 0.85],
-    reward size <= max_min_size, best prices inside the reward zone. M1 is the median over
-    select_snapshots book snapshots (a market outside the zone in a snapshot counts as 0 there)."""
-    now = now or time.time()
-    rw = {c: r for c, r in rewards_config().items() if r["rate"] > 0 and r["min"] <= cfg.max_min_size}
-    meta = gamma_markets(rw)
+def _candidates(meta, cfg, now):
+    """Stable (classification A), active, at least min_age_days old, at least min_days_left to go, not a game."""
     cand = []
     for c, m in meta.items():
         q = m.get("question") or ""
@@ -293,31 +305,118 @@ def select(cfg: LPConfig, now=None, log=print, sleep=time.sleep):
             continue
         if m.get("gameStartTime"):
             continue
-        cand.append((c, m))
-    toks = [json.loads(m["clobTokenIds"])[0] for _, m in cand]
+        cand.append((c, {"question": q, "clobTokenIds": m["clobTokenIds"], "endDate": m["endDate"],
+                         "negRisk": bool(m.get("negRisk")), "events": [{"id": (m.get("events") or [{}])[0].get("id")}]}))
+    return cand
+
+
+_SNAP_FIELDS = ("m1_usd_day", "comp_levels", "mid", "N", "v", "min", "rate", "tick", "quote_cap")
+
+
+def select(cfg: LPConfig, now=None, log=print, sleep=time.sleep, clock=time.time,
+           rewards_fn=None, gamma_fn=None, books_fn=None):
+    """Market selection over one day (research/PREREG_LP_PHASE1B.md).
+
+    The candidate set is fixed at the first snapshot. Then select_snapshots book snapshots are taken
+    select_gap_s apart; each snapshot re-reads the reward config, so a market whose reward is removed, whose
+    best prices leave the reward zone or whose mid leaves [mid_lo, mid_hi] counts as M1 = 0 and 0 competitor
+    levels there. Per market: M1 = median over all snapshots, competitor levels = median over all snapshots.
+    Hard filter: median competitor levels >= min_comp_levels. Then choose(): M1 per dollar, one market per
+    event, quote budget, no market above max_share of the predicted M1.
+
+    Every snapshot is appended to <lp_dir>/selection/snapshots.jsonl, so a restart (update, reboot) continues
+    the selection instead of starting the day again. sleep() may raise SelectionStopped."""
+    rewards_fn, gamma_fn, books_fn = rewards_fn or rewards_config, gamma_fn or gamma_markets, books_fn or books
+    n_snap = max(1, cfg.select_snapshots)
+    sdir = os.path.join(cfg.lp_dir, "selection")
+    os.makedirs(sdir, exist_ok=True)
+    cpath, spath = os.path.join(sdir, "candidates.json"), os.path.join(sdir, "snapshots.jsonl")
+    rewarded = lambda: {c: r for c, r in rewards_fn().items() if r["rate"] > 0 and r["min"] <= cfg.max_min_size}
+    saved = None
+    if os.path.exists(cpath):
+        with open(cpath) as f:
+            saved = json.load(f)
+    if saved:
+        cand = [(c, m) for c, m in saved["cand"]]
+    else:
+        now = now or clock()
+        cand = _candidates(gamma_fn(rewarded()), cfg, now)
+        with open(cpath + ".tmp", "w") as f:
+            json.dump({"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "cand": cand}, f)
+        os.replace(cpath + ".tmp", cpath)
     snaps = []
-    for k in range(max(1, cfg.select_snapshots)):
-        if k:
-            sleep(cfg.select_gap_s)
-        snaps.append(_rows(cand, rw, books(toks), cfg))
-        log(f"selection snapshot {k + 1}/{cfg.select_snapshots}: {len(snaps[-1])} markets quotable")
-    rows = []
-    for c in set().union(*snaps):
-        vals = sorted(sn[c]["m1_usd_day"] if c in sn else 0.0 for sn in snaps)
-        x = dict(next(sn[c] for sn in snaps if c in sn))
-        x["m1_snapshots"] = [round(sn[c]["m1_usd_day"], 3) if c in sn else 0.0 for sn in snaps]
-        x["m1_usd_day"] = median(vals)
+    if os.path.exists(spath):
+        with open(spath) as f:
+            for line in f:
+                try:
+                    snaps.append(json.loads(line))
+                except ValueError:
+                    pass                                   # a line cut by a crash; that snapshot is taken again
+    if snaps or saved:
+        log(f"selection continues: {len(cand)} candidates fixed at {saved['time'] if saved else '?'}, "
+            f"{len(snaps)}/{n_snap} snapshots on disk")
+    else:
+        log(f"selection starts: {len(cand)} candidates, {n_snap} snapshots every {cfg.select_gap_s / 60:.0f} min")
+    while len(snaps) < n_snap:
+        if snaps:
+            wait = snaps[-1]["ts"] + cfg.select_gap_s - clock()
+            if wait > 0:
+                sleep(wait)
+        try:
+            rw = rewarded()
+            live = [(c, m) for c, m in cand if c in rw]
+            rows = _rows(live, rw, books_fn([json.loads(m["clobTokenIds"])[0] for _, m in live]), cfg)
+        except SelectionStopped:
+            raise
+        except Exception as e:                              # the public API failed even after retries
+            log(f"selection snapshot failed ({e!r:.200}); next try in 5 minutes")
+            sleep(min(300.0, cfg.select_gap_s))
+            continue
+        snap = {"k": len(snaps) + 1, "ts": clock(),
+                "rows": {c: [round(x[k], 6) if isinstance(x[k], float) else x[k] for k in _SNAP_FIELDS] for c, x in rows.items()}}
+        with open(spath, "a") as f:
+            f.write(json.dumps(snap) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        snaps.append(snap)
+        log(f"selection snapshot {len(snaps)}/{n_snap}: {len(rows)} markets quotable")
+    # aggregate
+    rows, stats = [], {}
+    for c, m in cand:
+        vals = [s["rows"].get(c) for s in snaps]
+        seen = [v for v in vals if v]
+        if not seen:
+            continue
+        last = dict(zip(_SNAP_FIELDS, seen[-1]))            # the latest reward parameters and quote
+        m1s = [v[0] if v else 0.0 for v in vals]
+        comps = [v[1] if v else 0 for v in vals]
+        x = {"cond": c, "q": m.get("question"), "yes": json.loads(m["clobTokenIds"])[0], "no": json.loads(m["clobTokenIds"])[1],
+             "event": str((m.get("events") or [{}])[0].get("id") or c), "N": last["N"], "v": last["v"], "min": last["min"],
+             "rate": last["rate"], "tick": last["tick"], "mid": last["mid"], "quote_cap": last["quote_cap"],
+             "neg_risk": bool(m.get("negRisk")), "end": m["endDate"],
+             "m1_usd_day": median(m1s), "comp_levels_median": median(comps), "quotable_share": len(seen) / len(vals),
+             "m1_snapshots": [round(v, 3) for v in m1s]}
+        stats[c] = [(m.get("question") or "")[:90], round(x["m1_usd_day"], 3), x["comp_levels_median"], round(x["quotable_share"], 3)]
         rows.append(x)
-    out = choose(rows, cfg)
+    passed = [x for x in rows if x["comp_levels_median"] + 1e-9 >= cfg.min_comp_levels]
+    out = choose(passed, cfg)
     cap = sum(x["quote_cap"] for x in out)
     tot = sum(x["m1_usd_day"] for x in out)
-    log(f"candidates {len(rows)}; selected {len(out)} markets, quote capital ${cap:.0f}, "
-        f"median M1 prediction ${tot:.2f}/day, largest share {max((x['m1_usd_day'] / tot for x in out), default=0):.0%}")
+    span_h = (snaps[-1]["ts"] - snaps[0]["ts"]) / 3600 if snaps else 0.0
+    gap_h = max((b["ts"] - a["ts"] for a, b in zip(snaps, snaps[1:])), default=0.0) / 3600
+    log(f"selection over {len(snaps)} snapshots ({span_h:.1f} h, longest gap {gap_h:.1f} h): candidates quotable at least "
+        f"once {len(rows)}; median competitor levels >= {cfg.min_comp_levels:g}: {len(passed)}; with median M1 > 0: "
+        f"{sum(1 for x in passed if x['m1_usd_day'] > 0)}")
+    log(f"selected {len(out)} markets, quote capital ${cap:.0f}, median M1 prediction ${tot:.2f}/day, "
+        f"largest share {max((x['m1_usd_day'] / tot for x in out), default=0):.0%}")
     if len(out) < cfg.markets_min:
         log(f"fewer than {cfg.markets_min} markets pass the filters; the test should not start")
-    os.makedirs(cfg.lp_dir, exist_ok=True)
+    with open(os.path.join(sdir, "summary.json"), "w") as f:
+        json.dump({"snapshots": len(snaps), "span_h": span_h, "longest_gap_h": gap_h, "min_comp_levels": cfg.min_comp_levels,
+                   "candidates_quotable": len(rows), "passed_filter": len(passed), "selected": [x["cond"] for x in out],
+                   "stats": stats}, f)
     with open(os.path.join(cfg.lp_dir, "markets.json"), "w") as f:
-        json.dump({"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "markets": out}, f, indent=1)
+        json.dump({"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock())), "markets": out}, f, indent=1)
     return out
 
 
@@ -791,7 +890,8 @@ class LPTest:
     async def run(self):
         t_end = self.clock() + self.cfg.test_days * 86400
         cfgs, cfg_t = {}, -1e18
-        self.j.write("start", markets=[s.m["cond"] for s in self.st.values()], config=dataclasses.asdict(self.cfg))
+        self.j.write("start", markets=[s.m["cond"] for s in self.st.values()], config=dataclasses.asdict(self.cfg),
+                     quote_cap=sum(float(s.m.get("quote_cap") or 0.0) for s in self.st.values()))
         await self.reconcile()
         try:
             while self.clock() < t_end and not self.stopped:
@@ -883,10 +983,12 @@ def _wq(pairs, q):
     return None
 
 
-def phase1(events, cv_max=0.5, share_max=0.4, exclude=()):
+def phase1(events, cv_max=0.5, share_max=0.4, exclude=(), m1_per_100_min=None, quote_cap_usd=None):
     """Phase 1 gate (research/PREREG_LP_PHASE1.md, amended 2026-11-16): stability of the portfolio M1 over
     the 30-minute windows of hours 24-48, and no market above share_max of M1 over the last 24 hours.
-    Markouts are reported as data, not as a criterion. `exclude`: condition ids left out of everything."""
+    Markouts are reported as data, not as a criterion. `exclude`: condition ids left out of everything.
+    m1_per_100_min (research/PREREG_LP_PHASE1B.md): H10 closes if the portfolio M1 of hours 24-48 per $100 of
+    quote capital is below it. Quote capital: quote_cap_usd, else the latest start event's quote_cap."""
     starts = [e["ts"] for e in events if e["event"] == "start"]
     wins = sorted((e for e in events if e["event"] == "window"), key=lambda e: e["start"])
     if not starts or not wins:
@@ -934,12 +1036,25 @@ def phase1(events, cv_max=0.5, share_max=0.4, exclude=()):
                          "p50_c": _wq(mk_all, 0.5) if mk_all else None,
                          "share_worse_than_-2.1c": sum(w for v, w in mk_all if v < -2.1) / q if q else None},
            "expected_week_usd": 7 * mean, "markets": per}
+    if quote_cap_usd is None:
+        quote_cap_usd = next((e.get("quote_cap") for e in sorted((e for e in events if e["event"] == "start"),
+                                                                  key=lambda e: -e["ts"]) if e.get("quote_cap")), None)
+    out["quote_cap_usd"] = quote_cap_usd
+    out["m1_per_100usd_2nd_half"] = mean * 100 / quote_cap_usd if quote_cap_usd and port else None
+    full = hours >= 48 - 0.6
     checks = {
-        f"M1 CV <= {cv_max:.0%} (hours 24-48)": hours >= 48 - 0.6 and cv is not None and cv <= cv_max,
+        f"M1 CV <= {cv_max:.0%} (hours 24-48)": full and cv is not None and cv <= cv_max,
         f"no market > {share_max:.0%} of M1 (last 24 h)": out["max_share_last24"] is not None and out["max_share_last24"] <= share_max,
     }
+    out["h10_closed"] = None
+    if m1_per_100_min is not None:
+        keep = full and out["m1_per_100usd_2nd_half"] is not None and out["m1_per_100usd_2nd_half"] >= m1_per_100_min
+        checks[f"M1 >= ${m1_per_100_min:g}/day per $100 of quotes (hours 24-48)"] = keep
+        out["h10_closed"] = bool(full and not keep)
     out["checks"] = checks
     out["verdict"] = "PASS" if all(checks.values()) else "FAIL: " + ", ".join(k for k, v in checks.items() if not v)
+    if out["h10_closed"]:
+        out["verdict"] += " -> H10 closes (PREREG_LP_PHASE1B)"
     return out
 
 
@@ -984,9 +1099,11 @@ def cli(cmd, args):
         mode = args[0] if args and not args[0].startswith("--") else "paper"
         texts = [args[i + 1] for i, a in enumerate(args) if a == "--exclude" and i + 1 < len(args)]
         with open(os.path.join(cfg.lp_dir, "markets.json")) as f:
-            qs = {m["cond"]: m["q"] for m in json.load(f)["markets"]}
+            ms = json.load(f)["markets"]
+        qs = {m["cond"]: m["q"] for m in ms}
         ex = {c for c, q in qs.items() for t in texts if t.lower() in (q or "").lower()}
-        r = phase1(load_events(cfg.lp_dir, mode), exclude=ex)
+        qcap = sum(float(m.get("quote_cap") or 0.0) for m in ms if m["cond"] not in ex) or None
+        r = phase1(load_events(cfg.lp_dir, mode), exclude=ex, m1_per_100_min=cfg.m1_per_100_min, quote_cap_usd=qcap)
         print("excluded:", [qs[c][:60] for c in ex])
         for k, v in r.items():
             if k != "markets":

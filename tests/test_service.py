@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from polybot import lp, service
 
@@ -153,6 +154,38 @@ class ServiceTest(unittest.TestCase):
         md = service.render_status(tmp)
         for s in ("# polybot — статус", "| Бот |", "complete", "## Ход прогона", "## Рынки", "Will the test market", "## Лог"):
             self.assertIn(s, md)
+
+    def test_day_selection_stops_and_resumes(self):
+        tmp = tempfile.mkdtemp()
+        rew = {"CB": {"rate": 10.0, "v": 4.5, "min": 20.0}}
+        meta = {"CB": {"question": "Will the test market B resolve YES?", "active": True, "closed": False,
+                       "acceptingOrders": True, "clobTokenIds": json.dumps(["YB", "NB"]), "createdAt": "2026-01-01T00:00:00Z",
+                       "endDate": "2027-06-01T00:00:00Z", "events": [{"id": "EB"}]}}
+        busy = {"YB": ([(0.48, 100.0), (0.47, 100.0)], [(0.52, 100.0), (0.53, 100.0)], 0.01)}
+        base = {"POLYBOT_MARKETS": "", "LP_SELECT_SNAPSHOTS": "2", "LP_SELECT_GAP_S": "3600", "LP_MARKETS_MIN": "1",
+                "LP_TEST_DAYS": str(30 / 86400), "LP_POLL_S": "0.01", "LP_SAMPLE_S": "0.05"}
+        kw = dict(data=tmp, mode="paper", books_fn=lambda toks: busy, rewards_fn=lambda: rew, trades_fn=lambda c: [],
+                  geoblock_fn=lambda: {"blocked": False, "country": "FI"})
+        snaps = os.path.join(tmp, "paper", "selection", "snapshots.jsonl")
+        with mock.patch.object(lp, "rewards_config", lambda: rew), mock.patch.object(lp, "gamma_markets", lambda rw: meta), \
+                mock.patch.object(lp, "books", lambda toks: busy):
+            with Env(**base):
+                t0 = time.time()
+                asyncio.run(run_for(service.Service(**kw), 0.5))   # stop while waiting 1 h for snapshot 2
+                self.assertLess(time.time() - t0, 10)
+                with open(snaps) as f:
+                    self.assertEqual(len(f.readlines()), 1)
+                self.assertFalse(os.path.exists(os.path.join(tmp, "paper", "run.json")))
+                self.assertIn("снимок 1 из 2", service.render_status(tmp))
+            with Env(**dict(base, LP_SELECT_GAP_S="0.01")):
+                asyncio.run(run_for(service.Service(**kw), 1.0))   # continues: one more snapshot, then quoting
+        with open(snaps) as f:
+            self.assertEqual(len(f.readlines()), 2)
+        self.assertTrue(os.path.exists(os.path.join(tmp, "paper", "run.json")))
+        self.assertEqual([m["cond"] for m in rj(os.path.join(tmp, "paper", "markets.json"))["markets"]], ["CB"])
+        ev = events(tmp)
+        self.assertIn("place", [x["event"] for x in ev])
+        self.assertGreater(next(x for x in ev if x["event"] == "start")["quote_cap"], 0)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ import logging
 import logging.handlers
 import os
 import signal
+import threading
 import time
 import urllib.request
 
@@ -85,6 +86,7 @@ class Service:
         self.log = self._logger()
         self.test = None
         self.phase, self.detail = "starting", ""
+        self._sel_stop = threading.Event()
         self.geo = {"t": 0.0, "blocked": None, "country": None}
 
     def _logger(self):
@@ -179,11 +181,15 @@ class Service:
             self.log.info(f"markets from {path}: {len(ms)}")
             return ms
 
-        def sleep(sec):
+        def sleep(sec):                         # wakes every few seconds: status stays fresh, a stop is seen at once
             end = time.time() + sec
             while time.time() < end:
+                if self._sel_stop.is_set():
+                    raise lp.SelectionStopped()
                 self.write_status()
-                time.sleep(min(20.0, max(0.0, end - time.time())))
+                time.sleep(min(2.0, max(0.0, end - time.time())))
+            if self._sel_stop.is_set():
+                raise lp.SelectionStopped()
         return lp.select(cfg, log=self.log.info, sleep=sleep)
 
     async def _status_loop(self):
@@ -233,7 +239,17 @@ class Service:
         if not run:
             self.phase = "selecting"
             self.write_status()
-            markets = await asyncio.to_thread(self.select_markets, cfg)
+            self._sel_stop.clear()
+            sel = asyncio.create_task(asyncio.to_thread(self.select_markets, cfg))
+            waiter = asyncio.create_task(stop.wait())
+            done, _ = await asyncio.wait({sel, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            if sel not in done:
+                self._sel_stop.set()
+                self.log.info("stop requested during selection; the snapshots taken so far are kept")
+                await asyncio.gather(sel, return_exceptions=True)
+                return
+            waiter.cancel()
+            markets = sel.result()
             if len(markets) < cfg.markets_min:
                 return await self._idle(stop, "error", f"only {len(markets)} markets pass the filters, need {cfg.markets_min}")
             now = self.clock()                          # the run's clock starts when quoting starts, after selection
@@ -318,8 +334,18 @@ def render_status(data, now=None, log_lines=50):
         tot = (st["run_ends"] - st["run_started"]) / 3600
         run_line = (f"начат {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(st['run_started']))}, "
                     f"прошло {min(el, tot):.1f} ч из {tot:.0f}" + (", завершён" if st.get("run_completed") else f", осталось {max(0, tot - el):.1f} ч"))
+    cfg = lp.from_env()
+    sel_line = "selecting — отбор рынков"
+    spath = os.path.join(run_dir, "selection", "snapshots.jsonl")
+    if os.path.exists(spath):
+        with open(spath) as f:
+            k = sum(1 for _ in f)
+        left = max(0, cfg.select_snapshots - k) * cfg.select_gap_s / 3600
+        sel_line += f": снимок {k} из {cfg.select_snapshots} (каждые {cfg.select_gap_s / 60:.0f} мин), до старта котирования ~{left:.1f} ч"
+    else:
+        sel_line += f": {cfg.select_snapshots} снимков книги каждые {cfg.select_gap_s / 60:.0f} мин"
     rows = [("Бот", f"✅ работает ({mode})" if alive else f"❌ не отвечает {_ago(age)}"),
-            ("Фаза", {"selecting": "selecting — отбор рынков (6 снимков книги, ~25 минут)", "running": "running — котирует",
+            ("Фаза", {"selecting": sel_line, "running": "running — котирует",
                       "complete": "complete — прогон завершён"}.get(st.get("phase"), st.get("phase", "—"))
              + (f" — {st['detail']}" if st.get("detail") else "")),
             ("Прогон", run_line),
@@ -335,7 +361,8 @@ def render_status(data, now=None, log_lines=50):
     out += ["| | |", "|---|---|"] + [f"| {a} | {b} |" for a, b in rows] + [""]
     events = lp.load_events(run_dir, mode)
     if events:
-        r = lp.phase1(events)
+        qcap = sum(float(m.get("quote_cap") or 0.0) for m in markets.values()) or None
+        r = lp.phase1(events, m1_per_100_min=cfg.m1_per_100_min, quote_cap_usd=qcap)
         wins = [e for e in events if e["event"] == "window"]
         port = [w["m1_usd_day"] for w in wins]
         mu = sum(port) / len(port) if port else 0.0
@@ -351,6 +378,9 @@ def render_status(data, now=None, log_lines=50):
                 f"- 30-минутных окон: {len(wins)}; M1 портфеля в среднем ${mu:.2f}/день; CV по всем окнам {fmt(cv_all, '{:.0%}')}; "
                 f"CV в часы 24–48: {fmt(r.get('cv'), '{:.0%}') if r.get('windows_2nd_half') else 'ещё нет'}",
                 f"- крупнейшая доля рынка в M1 за последние 24 ч: {fmt(r.get('max_share_last24'), '{:.0%}')} (порог 40%)",
+                f"- M1 в часы 24–48 на $100 котировок: "
+                + (f"${r['m1_per_100usd_2nd_half']:.2f}/день" if r.get("m1_per_100usd_2nd_half") is not None else "ещё нет")
+                + f" (меньше ${cfg.m1_per_100_min:g} — H10 закрывается; котировки на {fmt(qcap, '${:.0f}')})",
                 f"- простой: {down_h:.2f} ч; запусков процесса: {n_starts}",
                 f"- исполнений: {r.get('fills', 0)}, контрактов {r.get('contracts', 0):.0f}; markout 60 с: среднее {fmt(mk.get('mean_c'))} ц, "
                 f"p5 {fmt(mk.get('p5_c'))} ц, доля хуже −2.1 ц {fmt(mk.get('share_worse_than_-2.1c'), '{:.0%}')}", ""]
