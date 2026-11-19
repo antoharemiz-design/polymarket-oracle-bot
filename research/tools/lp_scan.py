@@ -2,6 +2,7 @@
 (capital, number of markets, category, reward size, quote placement). Read-only public data.
 
     python research/tools/lp_scan.py OUT_DIR --until EPOCH [--every 1800]
+    python research/tools/lp_scan.py OUT_DIR --once        one snapshot now (if the last is older than 5 min), then exit
 
 Every `every` seconds (aligned to the last snapshot on disk, so a restart continues the schedule):
   snap_<UTC>.json.gz  {"ts", "rw": {cond: [rate, v, min]}, "books": {cond: [tick, bids, asks]}}
@@ -73,8 +74,10 @@ def write_gz(path, obj):
 
 
 def main():
-    out, until = sys.argv[1], float(sys.argv[sys.argv.index("--until") + 1])
-    every = float(sys.argv[sys.argv.index("--every") + 1]) if "--every" in sys.argv else 1800.0
+    out = sys.argv[1]
+    once = "--once" in sys.argv
+    until = time.time() + 600 if once else float(sys.argv[sys.argv.index("--until") + 1])
+    every = 300.0 if once else float(sys.argv[sys.argv.index("--every") + 1]) if "--every" in sys.argv else 1800.0
     os.makedirs(out, exist_ok=True)
     stamp = lambda t: time.strftime("%Y%m%dT%H%M%S", time.gmtime(t))
     while time.time() < until:
@@ -83,6 +86,9 @@ def main():
         last = time.mktime(time.strptime(snaps[-1][5:20], "%Y%m%dT%H%M%S")) - time.timezone if snaps else 0
         wait = last + every - time.time()
         if wait > 0:
+            if once:
+                print(f"{stamp(time.time())} last snapshot is {time.time() - last:.0f} s old; nothing to do", flush=True)
+                return
             time.sleep(min(wait, 60))
             continue
         t0 = time.time()
@@ -101,6 +107,8 @@ def main():
             write_gz(os.path.join(out, f"snap_{stamp(t0)}.json.gz"),
                      {"ts": t0, "rw": {c: [r["rate"], r["v"], r["min"]] for c, r in rw.items()}, "books": books})
             print(f"{stamp(t0)} snapshot: {len(rw)} rewarded, {len(books)} books, {time.time() - t0:.0f} s", flush=True)
+            if once:
+                return
         except Exception as e:
             print(f"{stamp(t0)} snapshot failed: {e!r:.300}", flush=True)
             time.sleep(120)
