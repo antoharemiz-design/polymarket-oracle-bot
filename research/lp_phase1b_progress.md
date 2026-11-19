@@ -18,7 +18,7 @@
 
 Выбранные рынки:
 - Will Tesla sell a Cybercab for 30k or less in 2026?
-- Will Jan Oblak (Atlético Madrid) record the most clean sheets in the 2026–27 season?
+- Will Jan Oblak (Atlético Madrid) record the most clean sheets in the 2… (название обрезано в status.md)
 - GTA VI Online released by June 30, 2027?
 - Will Space Exploration Technologies’ market capitalization be between … (тот же рынок был в фазе 1)
 - Will the next Qwen Max model (3.9+) debut at a score of at least 1500 …
