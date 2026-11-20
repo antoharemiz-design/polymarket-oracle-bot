@@ -52,6 +52,7 @@ def main():
     arg = lambda k, d: type(d)(sys.argv[sys.argv.index(k) + 1]) if k in sys.argv else d
     top, rnd, days = arg("--top", 150), arg("--random", 100), arg("--days", 7)
     cats = arg("--categories", "")                    # e.g. weather_fees,finance_prices_fees: short-dated study
+    conds_file = arg("--conds", "")                   # JSON list of condition ids: study exactly these markets
     meta, snaps = L.load(scan)
     s = snaps[-1]
     conf = L.Conf("fills", max_min=200) if not cats else L.Conf("fills", max_min=200, min_age_days=0, min_days_left=0.04)
@@ -66,6 +67,15 @@ def main():
             rows.append((e[0] / e[2], c, r, e))
     rows.sort(reverse=True)
     pick = rows[:top] + random.Random(7).sample(rows[top:], min(rnd, max(0, len(rows) - top)))
+    if conds_file:                                    # the given markets, whatever their current state
+        with open(conds_file) as f:
+            want = json.load(f)
+        pick = []
+        for c in want:
+            r = s["rw"].get(c) or next((sn["rw"][c] for sn in reversed(snaps) if c in sn["rw"]), None)
+            if r and c in meta:
+                pick.append((0.0, c, r, None))
+        top = len(pick)
     now = time.time()
     since = now - days * 86400
     res = []

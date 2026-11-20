@@ -120,6 +120,7 @@ class Conf:
     comp_min: float = 3.0
     topic: bool = True
     category: str = ""                     # fee_type filter ("" = any)
+    exclude: tuple = ()                    # fee_types never quoted (phase 2: economics, finance_prices)
     max_share: float = 0.4
     min_age_days: float = 7.0              # H10N filters; short-dated recurring markets (weather, daily prices)
     min_days_left: float = 14.0            # are excluded by them
@@ -133,6 +134,8 @@ def eligible(meta_c, now, conf):
     if conf.topic and lp.topic_news(meta_c.get("question") or ""):
         return False
     if conf.category and (meta_c.get("fee_type") or "none") != conf.category:
+        return False
+    if (meta_c.get("fee_type") or "none") in conf.exclude:
         return False
     try:
         if now - lp._ts(meta_c["created"]) < conf.min_age_days * 86400 or lp._ts(meta_c["end"]) - now < conf.min_days_left * 86400:
@@ -272,6 +275,30 @@ def category_grid(meta):
     return [Conf(f"category {c}, budget $300", budget=300, category=c, markets_max=30, markets_min=1) for c in cats]
 
 
+TOXIC = ("economics_fees", "finance_prices_fees")
+
+
+def phase2_grid(meta):
+    """User's phase 2 rules (20 Nov): no age / days-left filters, min_size up to 200, economics and finance prices
+    excluded, size scaled per market (marginal, k <= 5), no market above 40% of predicted M1, $300 / $500.
+    Kept from phase 1B: topic filter (classification A), >= 3 competitor levels. Sensitivity rows change one rule."""
+    p2 = dict(alloc="marginal", kmax=5, max_min=200, min_age_days=0, min_days_left=0, exclude=TOXIC,
+              markets_max=40, max_share=0.4)
+    out = [Conf("phase 1B rule ($100, 5 markets, k=1, min<=20, >=7d old, >=14d left)")]
+    for b in (100, 300, 500):
+        out.append(Conf(f"PHASE 2 rules, budget ${b}", budget=b, **p2))
+    for b in (300, 500):
+        out += [Conf(f"  sens ${b}: no size scaling (k=1)", budget=b, **dict(p2, kmax=1)),
+                Conf(f"  sens ${b}: long-dated only (>=7d old, >=14d left)", budget=b, **dict(p2, min_age_days=7, min_days_left=14)),
+                Conf(f"  sens ${b}: min_size <= 20 only", budget=b, **dict(p2, max_min=20)),
+                Conf(f"  sens ${b}: economics + finance allowed", budget=b, **dict(p2, exclude=())),
+                Conf(f"  sens ${b}: no competitor filter", budget=b, **dict(p2, comp_min=0)),
+                Conf(f"  sens ${b}: no topic filter", budget=b, **dict(p2, topic=False)),
+                Conf(f"  sens ${b}: improve price by 1 tick", budget=b, **dict(p2, place="improve")),
+                Conf(f"  sens ${b}: weather only", budget=b, **dict(p2, category="weather_fees", markets_min=1))]
+    return out
+
+
 def horizon_grid(meta):
     """Short-dated markets: no age / days-left filters (still: topic filter, >= 1 day left, comp >= 3)."""
     out = [Conf(f"budget ${b}, any horizon, all categories", budget=b, markets_max=30, min_age_days=0,
@@ -280,6 +307,58 @@ def horizon_grid(meta):
         out.append(Conf(f"category {c}, any horizon, budget $300", budget=300, category=c, markets_max=30,
                         markets_min=1, min_age_days=0, min_days_left=1, max_min=100))
     return out
+
+
+def run_rolling(conf, meta, snaps, lookback_h, step_h, start_h):
+    """Re-select every step_h hours on the trailing lookback_h hours (30-minute grid), evaluate on the next step_h
+    hours; the portfolio changes at each step, as a bot with rolling selection would. Returns the evaluation of all
+    steps together: mean M1, M1 per $100 of the average quote capital, CV of 30-minute means, largest share."""
+    t0 = snaps[0]["ts"]
+    t, end = t0 + start_h * 3600, snaps[-1]["ts"]
+    steps, port_by_win, per, caps, preds, turnover, prev, khours = [], {}, {}, [], [], [], None, {}
+    while t < end:
+        sel = []
+        for s_ in snaps:
+            if t - lookback_h * 3600 <= s_["ts"] < t and (not sel or s_["ts"] - sel[-1]["ts"] >= 1790):
+                sel.append(s_)
+        ev = [s_ for s_ in snaps if t <= s_["ts"] < t + step_h * 3600]
+        if len(sel) < 4 or not ev:
+            t += step_h * 3600
+            continue
+        r = run(conf, meta, sel, ev)
+        caps.append(r["cap"]); preds.append(r["pred"])
+        cur = set(r["selected"])
+        if prev is not None:
+            turnover.append(len(cur - prev) / max(1, len(cur)))
+        prev = cur
+        # re-evaluate per snapshot to pool the windows across steps
+        chosen = list(zip(r["selected"], r["ks"]))
+        for c, k in chosen:                           # market-hours at size k (for the fill cost: lp_net.py)
+            kh = khours.setdefault(c, {})
+            kh[k] = kh.get(k, 0.0) + step_h
+        for s_ in ev:
+            tot = 0.0
+            for c, k in chosen:
+                rr, bk = s_["rw"].get(c), s_["books"].get(c)
+                e = evaluate(rr, bk, conf.place, k) if rr and bk else None
+                m = e[0] if e else 0.0
+                per[c] = per.get(c, 0.0) + m; tot += m
+            port_by_win.setdefault(int((s_["ts"] - t0) // 1800), []).append(tot)
+        steps.append(r)
+        t += step_h * 3600
+    if not port_by_win:
+        return {"conf": dataclasses.asdict(conf), "steps": 0}
+    wm = [sum(v) / len(v) for v in port_by_win.values()]
+    mean = sum(wm) / len(wm)
+    sd = (sum((x - mean) ** 2 for x in wm) / len(wm)) ** 0.5
+    cap = sum(caps) / len(caps)
+    totm = sum(per.values())
+    return {"conf": dataclasses.asdict(conf), "steps": len(steps), "cap": cap, "pred": sum(preds) / len(preds),
+            "real": mean, "real_per100": mean * 100 / cap if cap else None, "cv": sd / mean if mean else None,
+            "max_share": max(per.values()) / totm if totm else None, "turnover": sum(turnover) / len(turnover) if turnover else None,
+            "n": sum(r["n"] for r in steps) / len(steps), "selected": sorted({c for r in steps for c in r["selected"]}),
+            "hours": (len(port_by_win) * 0.5), "khours": khours,
+            "m1_by_market": {c: v / max(1, sum(len(x) for x in port_by_win.values())) * len(port_by_win) / len(port_by_win) for c, v in per.items()}}
 
 
 def main():
@@ -294,10 +373,34 @@ def main():
             sel.append(s)
     ev = [s for s in snaps if s["ts"] >= t0 + split * 3600]
     print(f"{len(snaps)} snapshots: selection {len(sel)} ({split:g} h), evaluation {len(ev)}", flush=True)
+    if "--rolling" in sys.argv:                      # --rolling LOOKBACK_H,STEP_H,START_H
+        lb, step, start = (float(x) for x in sys.argv[sys.argv.index("--rolling") + 1].split(","))
+        print(f"rolling: re-select every {step:g} h on the last {lb:g} h, from hour {start:g}")
+        confs = phase2_grid(meta) if grid in ("phase2", "all") else GRIDS[grid]
+        results = []
+        f = lambda x, p="{:.2f}": "—" if x is None else p.format(x)
+        for conf in confs:
+            r = run_rolling(conf, meta, snaps, lb, step, start)
+            results.append(r)
+            if not r.get("steps"):
+                print(f"{conf.name:55s} no steps"); continue
+            print(f"{conf.name:55s} steps {r['steps']:2d} n {r['n']:4.1f} cap ${r['cap']:6.0f} pred ${r['pred']:7.2f} "
+                  f"real ${f(r['real'])} ({f(r['real_per100'])}/100) cv {f(r['cv'], '{:.0%}')} "
+                  f"share {f(r['max_share'], '{:.0%}')} turnover {f(r['turnover'], '{:.0%}')}", flush=True)
+        if "--json" in sys.argv:
+            with open(sys.argv[sys.argv.index("--json") + 1], "w") as fh:
+                json.dump(results, fh)
+        if "--conds-out" in sys.argv:                 # markets chosen by the main phase 2 rows, for lp_fills --conds
+            sel = sorted({c for r in results if r.get("steps") and r["conf"]["name"].startswith("PHASE 2") for c in r["selected"]})
+            with open(sys.argv[sys.argv.index("--conds-out") + 1], "w") as fh:
+                json.dump(sel, fh)
+            print(f"{len(sel)} markets chosen by the PHASE 2 rows written for the fill study")
+        return
     names = list(GRIDS) + ["category", "horizon"] if grid == "all" else grid.split(",")
     results = []
     for g in names:
-        confs = category_grid(meta) if g == "category" else horizon_grid(meta) if g == "horizon" else GRIDS[g]
+        confs = (category_grid(meta) if g == "category" else horizon_grid(meta) if g == "horizon"
+                 else phase2_grid(meta) if g == "phase2" else GRIDS[g])
         print(f"\n## {g}")
         for conf in confs:
             r = run(conf, meta, sel, ev)
