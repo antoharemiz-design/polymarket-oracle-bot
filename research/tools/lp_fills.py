@@ -95,9 +95,23 @@ def main():
         mk = {60: [], 600: [], 3600: [], "last": []}
         rebate = []
         fr, rr = m.get("fee_rate") or 0.0, m.get("rebate_rate") or 0.0
+        try:
+            t_end = lp._ts(m["end"])
+        except Exception:
+            t_end = None
+        by_htl = {}                                   # hours to the market's end -> [markout1h x q, q, contracts]
         for ts, buy_yes, y, z in tr:
             q = min(z, mn)
             rebate.append((fr * y * (1 - y) * rr * 100, q))
+            if t_end is not None:
+                htl = (t_end - ts) / 3600
+                b = "<0" if htl < 0 else "0-2" if htl < 2 else "2-6" if htl < 6 else "6-12" if htl < 12 else "12-24" if htl < 24 else ">24"
+                j = bisect.bisect_left(tt, ts + 3600)
+                if 0 <= j < len(tt) and tt[j] > ts:
+                    v = (((y - pp[j]) if buy_yes else (pp[j] - y)) * 100)
+                    acc = by_htl.setdefault(b, [0.0, 0.0, 0.0])
+                    acc[0] += v * q; acc[1] += q
+                by_htl.setdefault(b, [0.0, 0.0, 0.0])[2] += q
             for h in (60, 600, 3600, "last"):
                 j = len(tt) - 1 if h == "last" else bisect.bisect_left(tt, ts + h)
                 if 0 <= j < len(tt) and tt[j] > ts:
@@ -106,7 +120,7 @@ def main():
                     mk[h].append((((y - mid) if buy_yes else (mid - y)) * 100, q))
         w = lambda xs: (sum(v * q for v, q in xs) / sum(q for _, q in xs)) if xs and sum(q for _, q in xs) else None
         rec.update(markout60_c=w(mk[60]), markout600_c=w(mk[600]), markout3600_c=w(mk[3600]), markout_last_c=w(mk["last"]),
-                   last_mid=pp[-1] if pp else None, rebate_c=w(rebate),
+                   last_mid=pp[-1] if pp else None, rebate_c=w(rebate), by_hours_to_end=by_htl,
                    worse_than_2c_600=(sum(q for v, q in mk[600] if v < -2.1) / sum(q for _, q in mk[600])) if mk[600] else None)
         res.append(rec)
         if i % 25 == 0:
