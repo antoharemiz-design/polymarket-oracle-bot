@@ -63,14 +63,63 @@ class LPConfig:
     fill_rate_max: float = 30.0        # contracts per market-day; the backtest's worst case (first in queue)
     # H10 closure rule (PREREG_LP_PHASE1B): portfolio M1 in hours 24-48 per $100 of quote capital
     m1_per_100_min: float = 10.0
+    # phase 2 (research/PREREG_PHASE2.md): the portfolio is re-selected every rebalance_h hours from the book
+    # snapshots of the last lookback_h hours; markets leave the portfolio through an exit (reduce-only quotes,
+    # then a taker order). phase = 1 keeps the one-off selection of phases 1 / 1B.
+    phase: int = 1
+    lookback_h: float = 24.0           # warm-up and selection window
+    snapshot_gap_s: float = 1800.0     # snapshots of every rewarded market's book, 30 minutes apart
+    rebalance_h: float = 3.0
+    kmax: int = 1                      # quote size up to kmax x rewards_min_size, allocated step by step
+    exclude_categories: str = ""       # fee categories never quoted (comma-separated feeType values)
+    min_hours_left: float = 0.0        # never select a market this close to its endDate
+    exit_at_end: int = 0               # 1: exit by endDate (reduce from exit_reduce_h, close by exit_flatten_h before it);
+                                       # 0: no endDate exit (weather trades its measured day after endDate)
+    exit_reduce_h: float = 1.0         # last hour before endDate: only the side that reduces the position is quoted
+    exit_window_h: float = 1.0         # a market leaving the portfolio has this long to exit through quotes
+    exit_flatten_h: float = 0.25       # then (or this close to endDate) the rest is closed by a taker order
+    dust_shares: float = 5.0           # positions below this are left alone (the exchange's minimum order)
+    inv_reduce_h: float = 0.0          # a position held this long: only the reducing side is quoted (0 = off)
+    inv_flatten_h: float = 0.0         # a position held this long is closed by a taker order (0 = off)
+    exit_mid_lo: float = 0.10          # phase 2: the mid leaving [exit_mid_lo, exit_mid_hi] (the outcome becoming
+    exit_mid_hi: float = 0.90          # clear before resolution) starts the market's exit
+    pos_limit_usd: float = 1e9         # per market: the position may not grow beyond this many dollars
+    snapshots_keep_h: float = 30.0     # snapshot files older than this are deleted
 
 
-def from_env() -> LPConfig:
+# phase 2 settings (research/PREREG_PHASE2.md, user's decisions of 20 November); LP_* variables still override them
+PHASE2 = {"quote_budget_usd": 300.0, "capital_usd": 500.0, "stop_loss_usd": 100.0, "markets_min": 1, "markets_max": 40,
+          "max_min_size": 200.0, "min_age_days": 0.0, "min_days_left": 0.0, "kmax": 5, "min_hours_left": 1.0,
+          "exclude_categories": "economics_fees,finance_prices_fees,mentions_fees,culture_fees",
+          "pos_limit_usd": 50.0, "fills_every_s": 30.0, "test_days": 2.0,
+          # exit rule (user, 20 Nov: no position into resolution, out within an hour): a position is never held
+          # longer than 1 h (reduce-only quotes after 30 min, a taker order at 1 h); markets leave on rebalance,
+          # reward removal or the mid leaving [0.10, 0.90]
+          "exit_at_end": 0, "inv_reduce_h": 0.5, "inv_flatten_h": 1.0}
+
+
+def from_env(phase=None) -> LPConfig:
+    """Settings from LP_* environment variables. The phase (argument, else LP_PHASE, else 2) picks the defaults:
+    phase 2 starts from PHASE2, phase 1 from the LPConfig defaults."""
     c = LPConfig()
+    c.phase = int(phase or os.environ.get("LP_PHASE") or 2)
+    if c.phase == 2:
+        for k, v in PHASE2.items():
+            setattr(c, k, v)
     for f in dataclasses.fields(c):
         raw = os.environ.get("LP_" + f.name.upper())
-        if raw is not None:
+        if raw is not None and f.name != "phase":
             setattr(c, f.name, type(getattr(c, f.name))(raw))
+    return c
+
+
+def phase2_config(**kw) -> LPConfig:
+    """LPConfig with the phase 2 settings (no environment), for tests and research tools."""
+    c = LPConfig(phase=2)
+    for k, v in PHASE2.items():
+        setattr(c, k, v)
+    for k, v in kw.items():
+        setattr(c, k, v)
     return c
 
 
@@ -421,6 +470,319 @@ def select(cfg: LPConfig, now=None, log=print, sleep=time.sleep, clock=time.time
 
 
 # --------------------------------------------------------------------------------------------------
+# phase 2: rolling selection (research/PREREG_PHASE2.md). The same functions run in the bot and in the
+# simulator research/tools/lp_levers.py, so the prediction and the paper test are comparable.
+
+def evaluate(rw, book, k, mid_lo=0.15, mid_hi=0.85):
+    """(M1 $/day, competitor levels, quote capital $) of quoting k x rewards_min_size at the best prices of one
+    book snapshot, or None where we cannot quote (no reward, best prices outside the zone, mid outside
+    [mid_lo, mid_hi]). rw = [rate, v, min]; book = [tick, bids, asks] (YES book, best first)."""
+    rate, v, mn = rw
+    if v <= 0 or mn <= 0 or rate <= 0:
+        return None
+    tick, bids, asks = book
+    b, a = targets(bids, asks, tick, v, 0.0, 1.0)
+    if b is None or a is None:
+        return None
+    mid = (b + a) / 2
+    if not mid_lo <= mid <= mid_hi:
+        return None
+    size = k * mn
+    return rate * m1_fraction(bids, asks, b, a, size, v, mn), comp_levels(bids, asks, mid, v, mn), size * (b + 1 - a)
+
+
+def eligible(meta_c, now, exclude=(), topic=True, category="", min_age_days=0.0, min_hours_left=0.0):
+    """Permanent filters for one market's metadata (SnapStore / research/tools/lp_scan.py format): active, not a
+    game, not a news topic (classification A), fee category not excluded, old enough, far enough from its end."""
+    if not meta_c or not meta_c.get("active", True) or meta_c.get("game"):
+        return False
+    if topic and topic_news(meta_c.get("question") or ""):
+        return False
+    ft = meta_c.get("fee_type") or "none"
+    if (category and ft != category) or ft in exclude:
+        return False
+    try:
+        if now - _ts(meta_c["created"]) < min_age_days * 86400 or _ts(meta_c["end"]) - now < min_hours_left * 3600:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def snap_rows(rw, books_by_cond, conds, kmax, mid_lo=0.15, mid_hi=0.85):
+    """One snapshot -> {cond: [m1 at k = 1..kmax, capital at k = 1..kmax, competitor levels]} for the markets of
+    `conds` we can quote there; the others are absent (M1 0, 0 competitor levels)."""
+    out = {}
+    for c in conds:
+        r, bk = rw.get(c), books_by_cond.get(c)
+        if not r or not bk:
+            continue
+        ev = [evaluate(r, bk, k, mid_lo, mid_hi) for k in range(1, kmax + 1)]
+        if ev[0] is None:
+            continue
+        out[c] = [[round(e[0], 6) for e in ev], [round(e[2], 4) for e in ev], ev[0][1]]
+    return out
+
+
+def allocate(rows, budget, kmax, markets_max, max_share):
+    """Quote budget in steps of one rewards_min_size: each step goes to the option with the best marginal M1 per
+    dollar (a new market at k = 1, one market per event, or one more unit on a chosen market, up to kmax). No
+    market takes more than max_share of the budget; if one carries more than max_share of the predicted M1, its
+    size is cut by one unit (dropped at k = 1) and the budget is spread again.
+    rows: [{cond, event, m1_k, cap_k, ...}] -> the chosen rows with k, m1_usd_day and quote_cap at that k."""
+    banned, kcap = set(), {}
+    while True:
+        k, events, cap = {}, set(), 0.0
+        while True:
+            best = None
+            for x in rows:
+                c = x["cond"]
+                if c in banned:
+                    continue
+                cur = k.get(c, 0)
+                if cur >= min(kmax, kcap.get(c, kmax)) or (cur == 0 and (x["event"] in events or len(k) >= markets_max)):
+                    continue
+                if x["cap_k"][cur] > max(budget * max_share, x["cap_k"][0]):
+                    continue
+                gain = x["m1_k"][cur] - (x["m1_k"][cur - 1] if cur else 0.0)
+                cost = x["cap_k"][cur] - (x["cap_k"][cur - 1] if cur else 0.0)
+                if gain <= 0 or cost <= 0 or cap + cost > budget:
+                    continue
+                if best is None or gain / cost > best[0]:
+                    best = (gain / cost, c, cost, x["event"])
+            if best is None:
+                break
+            _, c, cost, e = best
+            k[c] = k.get(c, 0) + 1; cap += cost; events.add(e)
+        out = []
+        for x in rows:
+            if x["cond"] in k:
+                kk = k[x["cond"]]
+                out.append(dict(x, k=kk, m1_usd_day=x["m1_k"][kk - 1], quote_cap=x["cap_k"][kk - 1]))
+        tot = sum(x["m1_usd_day"] for x in out)
+        top = max(out, key=lambda x: x["m1_usd_day"], default=None)
+        if top is None or tot <= 0 or top["m1_usd_day"] / tot <= max_share or len(out) < 2:
+            return out
+        if top["k"] > 1:
+            kcap[top["cond"]] = top["k"] - 1
+        else:
+            banned.add(top["cond"])
+
+
+def rank(snaps, events, kmax, comp_min, budget, markets_max, max_share, cands=None):
+    """Portfolio from the snapshot rows of the selection window (snap_rows of each snapshot, oldest first).
+    Per market: M1 at each k = median over all snapshots (0 where we could not quote), capital at each k = median
+    over the snapshots where we could quote, competitor levels = median (0 where we could not quote).
+    Kept: median competitor levels >= comp_min and median M1 at k = 1 above 0; then allocate().
+    cands: the markets considered (default: every market quotable at least once in the window).
+    Returns (all kept rows, chosen rows)."""
+    cands = sorted({c for s in snaps for c in s}) if cands is None else cands
+    rows = []
+    for c in cands:
+        vals = [s.get(c) for s in snaps]
+        seen = [v for v in vals if v]
+        if not seen:
+            continue
+        comp = median([v[2] if v else 0 for v in vals])
+        m1_k = [median([v[0][i] if v else 0.0 for v in vals]) for i in range(kmax)]
+        cap_k = [median([v[1][i] for v in seen]) for i in range(kmax)]
+        if comp + 1e-9 < comp_min or m1_k[0] <= 0:
+            continue
+        rows.append({"cond": c, "event": events.get(c, c), "m1_usd_day": m1_k[0], "quote_cap": cap_k[0], "comp": comp,
+                     "m1_k": m1_k, "cap_k": cap_k, "k": 1, "quotable_share": len(seen) / len(vals)})
+    return rows, allocate(rows, budget, kmax, markets_max, max_share)
+
+
+def grid(entries, gap_s=1800.0, key=lambda e: e["ts"]):
+    """Snapshots on the selection grid: oldest first, each at least gap_s - 10 s after the previous kept one."""
+    out = []
+    for e in sorted(entries, key=key):
+        if not out or key(e) - key(out[-1]) >= gap_s - 10:
+            out.append(e)
+    return out
+
+
+def meta_of(gm):
+    """Metadata kept per market from a gamma market object (the lp_scan format plus the NO token)."""
+    ev = (gm.get("events") or [{}])[0]
+    fs = gm.get("feeSchedule") or {}
+    toks = json.loads(gm["clobTokenIds"]) if gm.get("clobTokenIds") else [None, None]
+    return {"question": gm.get("question"), "event": str(ev.get("id") or gm.get("conditionId")), "token": toks[0],
+            "no": toks[1] if len(toks) > 1 else None,
+            "fee_type": gm.get("feeType") if gm.get("feesEnabled") else None,
+            "fee_rate": float(fs.get("rate") or 0.0) if gm.get("feesEnabled") else 0.0,
+            "rebate_rate": float(fs.get("rebateRate") or 0.0) if gm.get("feesEnabled") else 0.0,
+            "created": gm.get("createdAt") or gm.get("startDate"), "end": gm.get("endDate"),
+            "neg_risk": bool(gm.get("negRisk")), "game": bool(gm.get("gameStartTime")),
+            "active": bool(gm.get("active")) and not gm.get("closed") and bool(gm.get("acceptingOrders"))}
+
+
+def _trim(levels, mid, v_c, side):
+    out = []
+    for p, s in levels:
+        if ((mid - p) if side == "bid" else (p - mid)) * 100 > 2 * v_c or len(out) >= 40:
+            break
+        out.append([p, round(s, 2)])
+    return out
+
+
+class SnapStore:
+    """Book snapshots of every rewarded market that passes the permanent filters, every snapshot_gap_s, kept on
+    disk for snapshots_keep_h (a restart loses nothing):
+      <lp_dir>/snaps/rows.jsonl              per snapshot {"ts", "n_rewarded", "n_eligible", "rows": snap_rows, "q":
+                                             {cond: [rate, v, min, tick, mid]}} of the quotable markets
+      <lp_dir>/snaps/books_<UTC>.json.gz     the books themselves (research/tools/lp_scan.py format), for audits
+      <lp_dir>/snaps/meta.json               market metadata, refreshed every 6 hours"""
+
+    META_EVERY_S = 6 * 3600
+
+    def __init__(self, cfg: LPConfig, log=print, clock=time.time, rewards_fn=None, books_fn=None, gamma_fn=None):
+        self.cfg, self.log, self.clock = cfg, log, clock
+        self.rewards_fn, self.books_fn, self.gamma_fn = rewards_fn or rewards_config, books_fn or books, gamma_fn or gamma_markets
+        self.dir = os.path.join(cfg.lp_dir, "snaps")
+        os.makedirs(self.dir, exist_ok=True)
+        self.rows_path, self.meta_path = os.path.join(self.dir, "rows.jsonl"), os.path.join(self.dir, "meta.json")
+        self.exclude = tuple(x.strip() for x in cfg.exclude_categories.split(",") if x.strip())
+        self.entries, self.meta, self.meta_ts = [], {}, 0.0
+        self.load()
+
+    def load(self):
+        if os.path.exists(self.rows_path):
+            with open(self.rows_path) as f:
+                for line in f:
+                    try:
+                        self.entries.append(json.loads(line))
+                    except ValueError:
+                        pass                               # a line cut by a crash
+        m = None
+        if os.path.exists(self.meta_path):
+            try:
+                with open(self.meta_path) as f:
+                    m = json.load(f)
+            except ValueError:
+                m = None
+        if m:
+            self.meta, self.meta_ts = m["meta"], m["ts"]
+        self.prune(self.clock())
+
+    def prune(self, now):
+        keep = now - self.cfg.snapshots_keep_h * 3600
+        if self.entries and self.entries[0]["ts"] < keep:
+            self.entries = [e for e in self.entries if e["ts"] >= keep]
+            with open(self.rows_path + ".tmp", "w") as f:
+                for e in self.entries:
+                    f.write(json.dumps(e, separators=(",", ":")) + "\n")
+            os.replace(self.rows_path + ".tmp", self.rows_path)
+        for name in os.listdir(self.dir):
+            if name.startswith("books_") and name.endswith(".json.gz"):
+                try:
+                    t = time.mktime(time.strptime(name[6:21], "%Y%m%dT%H%M%S")) - time.timezone
+                except ValueError:
+                    continue
+                if t < keep:
+                    os.remove(os.path.join(self.dir, name))
+
+    def last_ts(self):
+        return self.entries[-1]["ts"] if self.entries else None
+
+    def due(self, now):
+        return not self.entries or now - self.entries[-1]["ts"] >= self.cfg.snapshot_gap_s - 5
+
+    def window(self, now):
+        """Snapshots of the selection window (lookback_h before now) on the 30-minute grid."""
+        return grid([e for e in self.entries if now - self.cfg.lookback_h * 3600 <= e["ts"] <= now], self.cfg.snapshot_gap_s)
+
+    def warm(self, now):
+        """Enough history to select: the window spans lookback_h less one gap and holds at least 3/4 of its
+        snapshots (a long outage during the warm-up extends the warm-up)."""
+        w = self.window(now)
+        need = self.cfg.lookback_h * 3600 / self.cfg.snapshot_gap_s
+        return bool(w) and now - w[0]["ts"] >= self.cfg.lookback_h * 3600 - self.cfg.snapshot_gap_s - 60 and len(w) >= 0.75 * need
+
+    def take(self, now=None):
+        """One snapshot now. Returns its summary entry (without rows)."""
+        now = now or self.clock()
+        cfg = self.cfg
+        rw = {c: r for c, r in self.rewards_fn().items() if r["rate"] > 0 and r["v"] > 0 and r["min"] <= cfg.max_min_size}
+        missing = [c for c in rw if c not in self.meta]
+        if not self.meta or now - self.meta_ts > self.META_EVERY_S or len(missing) > 50:
+            gm = self.gamma_fn(list(rw))
+            self.meta, self.meta_ts = {c: meta_of(m) for c, m in gm.items()}, now
+            with open(self.meta_path + ".tmp", "w") as f:
+                json.dump({"ts": now, "meta": self.meta}, f)
+            os.replace(self.meta_path + ".tmp", self.meta_path)
+        ok = [c for c in rw if eligible(self.meta.get(c), now, self.exclude, min_age_days=cfg.min_age_days,
+                                        min_hours_left=cfg.min_days_left * 24)]
+        toks = {c: self.meta[c]["token"] for c in ok if self.meta[c].get("token")}
+        bk = self.books_fn(list(toks.values()))
+        books_c, q = {}, {}
+        for c, t in toks.items():
+            if t not in bk:
+                continue
+            bids, asks, tick = bk[t]
+            if not bids or not asks:
+                books_c[c] = [tick, [], []]
+                continue
+            mid = (bids[0][0] + asks[0][0]) / 2
+            books_c[c] = [tick, _trim(bids, mid, rw[c]["v"], "bid"), _trim(asks, mid, rw[c]["v"], "ask")]
+        rwl = {c: [rw[c]["rate"], rw[c]["v"], rw[c]["min"]] for c in rw}
+        rows = snap_rows(rwl, books_c, ok, cfg.kmax, cfg.mid_lo, cfg.mid_hi)
+        for c in rows:
+            tick, bids, asks = books_c[c]
+            q[c] = rwl[c] + [tick, round((bids[0][0] + asks[0][0]) / 2, 6)]
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now))
+        path = os.path.join(self.dir, f"books_{stamp}.json.gz")
+        with gzip.open(path + ".tmp", "wt") as f:
+            json.dump({"ts": now, "rw": rwl, "books": books_c}, f, separators=(",", ":"))
+        os.replace(path + ".tmp", path)
+        entry = {"ts": now, "n_rewarded": len(rw), "n_eligible": len(ok), "rows": rows, "q": q, "elig": sorted(ok)}
+        with open(self.rows_path, "a") as f:
+            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        self.entries.append(entry)
+        self.prune(now)
+        w = self.window(now)
+        summary = {"ts": now, "n_rewarded": len(rw), "n_eligible": len(ok), "n_quotable": len(rows)}
+        with open(os.path.join(self.dir, "state.json.tmp"), "w") as f:     # for status.md during the warm-up
+            json.dump(dict(summary, window=len(w), first=w[0]["ts"] if w else None, warm=self.warm(now),
+                           need=int(round(self.cfg.lookback_h * 3600 / self.cfg.snapshot_gap_s))), f)
+        os.replace(os.path.join(self.dir, "state.json.tmp"), os.path.join(self.dir, "state.json"))
+        return summary
+
+    def rank(self, now):
+        """Target portfolio now: rank() over the window, then the market dicts the test loop quotes (N = k x min,
+        reward parameters and tick of the latest snapshot where the market was quotable). Markets closer than
+        min_hours_left to their end are left out. Returns (target markets, summary)."""
+        cfg = self.cfg
+        w = self.window(now)
+        snaps = [e["rows"] for e in w]
+        # candidates: the markets rewarded and eligible at the window's first snapshot (as in the simulator runs of
+        # 20 Nov: markets new within the window, still without competitors, did worse), still eligible now
+        first = set(w[0].get("elig") or w[0]["rows"]) if w else set()
+        left = cfg.min_hours_left if cfg.exit_at_end else -1e6
+        cands = sorted(c for c in first if eligible(self.meta.get(c), now, self.exclude, min_hours_left=left))
+        events = {c: (self.meta.get(c) or {}).get("event", c) for c in cands}
+        rows, chosen = rank(snaps, events, cfg.kmax, cfg.min_comp_levels, cfg.quote_budget_usd, cfg.markets_max,
+                            cfg.max_share, cands=cands)
+        out = []
+        for x in chosen:
+            c, m = x["cond"], self.meta[x["cond"]]
+            last = next(e["q"][c] for e in reversed(w) if c in e["q"])
+            rate, v, mn, tick, mid = last
+            out.append({"cond": c, "q": m.get("question"), "yes": m["token"], "no": m["no"], "event": m.get("event", c),
+                        "k": x["k"], "N": x["k"] * mn, "v": v, "min": mn, "rate": rate, "tick": tick, "mid": mid,
+                        "quote_cap": round(x["quote_cap"], 4), "m1_usd_day": round(x["m1_usd_day"], 4),
+                        "comp_levels_median": x["comp"], "end": m.get("end"), "neg_risk": m.get("neg_risk", False),
+                        "fee_type": m.get("fee_type"), "fee_rate": m.get("fee_rate", 0.0), "rebate_rate": m.get("rebate_rate", 0.0)})
+        tot = sum(x["m1_usd_day"] for x in out)
+        summary = {"snapshots": len(w), "span_h": (w[-1]["ts"] - w[0]["ts"]) / 3600 if w else 0.0, "candidates": len(cands),
+                   "passed": len(rows), "markets": len(out), "quote_cap": sum(x["quote_cap"] for x in out), "m1_pred": tot,
+                   "largest_share": max((x["m1_usd_day"] / tot for x in out), default=0.0) if tot else 0.0}
+        return out, summary
+
+
+# --------------------------------------------------------------------------------------------------
 # executors: paper (simulated fills from the public tape) and live (SDK)
 
 class PaperExec:
@@ -455,11 +817,20 @@ class PaperExec:
         if time.time() - self.last_poll < self.every_s:
             return out
         self.last_poll = time.time()
-        for m in markets:
+        busy = [m for m in markets if any(o["mkt"] == m["cond"] for o in self.orders.values())]
+        sem = asyncio.Semaphore(8)                      # the tapes of many markets (phase 2: up to 40) in parallel
+
+        async def tape(cond):
+            async with sem:
+                return await asyncio.to_thread(self.trades_fn, cond)
+        tapes = await asyncio.gather(*(tape(m["cond"]) for m in busy), return_exceptions=True)
+        for m, tp in zip(busy, tapes):
+            if isinstance(tp, BaseException):
+                raise tp
             mine = [(oid, o) for oid, o in self.orders.items() if o["mkt"] == m["cond"]]
             if not mine:
                 continue
-            for ts, oi, side, px, sz, key in sorted(await asyncio.to_thread(self.trades_fn, m["cond"])):
+            for ts, oi, side, px, sz, key in sorted(tp):
                 if key in self.seen or ts < self.since:
                     continue
                 self.seen.add(key)
@@ -479,6 +850,23 @@ class PaperExec:
 
     async def merge(self, m, pairs):
         return pairs
+
+    async def take(self, m, side, size, bids, asks):
+        """Paper taker order of `size` against the other orders' YES book: side "ask" = BUY NO (closes a long YES)
+        walking the YES bids, side "bid" = BUY YES walking the YES asks. Taker fee fee_rate x p x (1 - p) per share
+        of the token bought. Returns {side, price (YES terms, size-weighted), size, fee} or None (empty book)."""
+        levels = bids if side == "ask" else asks
+        left, got, val = size, 0.0, 0.0
+        for p, z in levels:
+            q = min(left, z)
+            got += q; val += q * p; left -= q
+            if left <= 1e-9:
+                break
+        if got <= 1e-9:
+            return None
+        px = val / got
+        tp = 1 - px if side == "ask" else px
+        return {"side": side, "price": px, "size": got, "fee": got * float(m.get("fee_rate") or 0.0) * tp * (1 - tp)}
 
     async def reward_pct(self):
         return None
@@ -578,6 +966,43 @@ class LiveExec:
             out.append(b.balance / 1e6)
         return tuple(out)
 
+    async def take(self, m, side, size, bids, asks, slippage=0.02, wait_s=10.0):
+        """Taker order closing a position (phase 2 exit): a fill-and-kill BUY of the NO token (side "ask") or the
+        YES token (side "bid") for `size` shares, at most `slippage` worse than the best price of the other orders.
+        The filled size is read from the on-chain balance; reconcile() adopts any difference later.
+        Not exercised by the paper test; live use needs its own check with small size first."""
+        levels = bids if side == "ask" else asks
+        if not levels:
+            return None
+        best = levels[0][0]
+        token, limit = (m["no"], 1 - best + slippage) if side == "ask" else (m["yes"], best + slippage)
+        limit = min(0.99, round(limit, 2))
+        try:
+            before = await self.balances(m)
+            r = await self.c.place_market_order(token_id=token, side="BUY", shares=str(round(size, 2)),
+                                                max_price=str(limit), order_type="FAK")
+        except Exception as e:
+            self.log(f"closing order failed: {e!r}")
+            return None
+        if not getattr(r, "ok", False):
+            self.log(f"closing order rejected: {getattr(r, 'code', r)}")
+            return None
+        got, t0 = 0.0, time.time()
+        while time.time() - t0 < wait_s:
+            await asyncio.sleep(1.0)
+            try:
+                after = await self.balances(m)
+            except Exception:
+                continue
+            got = (after[1] - before[1]) if side == "ask" else (after[0] - before[0])
+            if got > 1e-9:
+                break
+        if got <= 1e-9:
+            return None
+        px = best                                     # YES-terms estimate: the best price at the time of the order
+        tp = 1 - px if side == "ask" else px
+        return {"side": side, "price": px, "size": got, "fee": got * float(m.get("fee_rate") or 0.0) * tp * (1 - tp)}
+
     async def merge(self, m, pairs):
         try:
             h = await self.c.merge_positions(condition_id=m["cond"], amount="max")
@@ -658,10 +1083,27 @@ class Journal:
 class MarketState:
     def __init__(self, m):
         self.m = m
-        self.orders = {"bid": None, "ask": None}       # side -> (order id, YES price, placed at)
+        self.orders = {"bid": None, "ask": None}       # side -> (order id, YES price, placed at, size)
         self.yes = self.no = self.cash = 0.0
         self.mid = None
         self.mids = []                                  # (ts, mid of the other orders) for markouts
+        self.exit_since = None                          # phase 2: left the portfolio (or lost its reward) at this time
+        self.pos_since = None                           # phase 2: since when |YES - NO| >= dust_shares
+        self.book = None                                # (bids, asks) of the other orders at the last step
+        try:
+            self.end_ts = _ts(m["end"]) if m.get("end") else None
+        except Exception:
+            self.end_ts = None
+
+    def set_market(self, m):
+        self.m = m
+        try:
+            self.end_ts = _ts(m["end"]) if m.get("end") else None
+        except Exception:
+            self.end_ts = None
+
+    def hours_left(self, now):
+        return (self.end_ts - now) / 3600 if self.end_ts is not None else float("inf")
 
     def pos(self):
         return self.yes - self.no
@@ -677,60 +1119,114 @@ class MarketState:
 
 
 class LPTest:
+    """The quoting loop. Phase 1 / 1B: a fixed set of markets. Phase 2 (cfg.phase == 2, with a SnapStore): the
+    portfolio is re-selected every rebalance_h hours inside run(); markets that leave it, lose their reward or come
+    within exit_reduce_h of their end quote only the side that reduces the position, and after exit_window_h (or
+    within exit_flatten_h of the end) the rest is closed by a taker order. A market is dropped once it is flat."""
+
     def __init__(self, cfg: LPConfig, ex, journal: Journal, markets, books_fn=books, rewards_fn=rewards_config,
-                 log=print, clock=time.time, control_fn=None):
+                 log=print, clock=time.time, control_fn=None, store=None):
         self.cfg, self.ex, self.j, self.log, self.clock = cfg, ex, journal, log, clock
         self.control_fn = control_fn                    # returns "run" or "stop"; "stop" pulls every quote
         self.paused = False
         self.end_reason = None
         self.books_fn, self.rewards_fn = books_fn, rewards_fn
+        self.store = store                              # phase 2: snapshots and rebalances run inside run()
         self.st = {m["cond"]: MarketState(m) for m in markets}
+        self.target = set(self.st)                      # the current portfolio; other markets in st are exiting
         self.pending = []                               # (due ts, horizon, cond, side, price, size)
         self.stopped = None
         self.last_sample = 0.0
         self.day = None
         self.win = None                                 # current 30-minute window index
         self.acc = self._new_acc()
+        self.win_cap = []                               # quote capital of the target portfolio at each sample
         self.errors = 0
+        self.closed_pnl = 0.0                           # mark-to-market of the markets that left the test
+        self.last_rebalance = None
+        self.pending_target = None                      # (markets, summary, ts) from the snapshot task, for step()
         self.status_path = os.path.join(os.path.dirname(getattr(journal.f, "name", "") or "."), "status.json")
 
+    @staticmethod
+    def _fresh():
+        return {"m1": [], "frac": [], "comp_levels": [], "comp_size": [], "places": 0, "cancels": 0,
+                "fills": 0, "contracts": 0.0, "markout60": [], "rebate": 0.0}
+
     def _new_acc(self):
-        return {c: {"m1": [], "frac": [], "comp_levels": [], "comp_size": [], "places": 0, "cancels": 0,
-                    "fills": 0, "contracts": 0.0, "markout60": []} for c in self.st}
+        return {c: self._fresh() for c in self.st}
+
+    def _a(self, c):
+        a = self.acc.get(c)
+        if a is None:
+            a = self.acc[c] = self._fresh()
+        return a
 
     def _close_window(self, now):
         w = self.win
         per = {}
+        mean = lambda xs: sum(xs) / len(xs) if xs else None
         for c, a in self.acc.items():
-            mean = lambda xs: sum(xs) / len(xs) if xs else None
             per[c] = {"m1_usd_day": mean(a["m1"]), "frac": mean(a["frac"]), "comp_levels": mean(a["comp_levels"]),
                       "comp_size": mean(a["comp_size"]), "samples": len(a["m1"]), "places": a["places"],
-                      "cancels": a["cancels"], "fills": a["fills"], "contracts": a["contracts"], "markout60": a["markout60"]}
+                      "cancels": a["cancels"], "fills": a["fills"], "contracts": a["contracts"], "markout60": a["markout60"],
+                      "rebate": a["rebate"]}
+            s = self.st.get(c)
+            if s is not None and self.cfg.phase == 2:
+                per[c].update(k=s.m.get("k"), exiting=s.exit_since is not None)
         tot = sum(v["m1_usd_day"] or 0.0 for v in per.values())
+        extra = {}
+        if self.cfg.phase == 2:
+            extra = {"cap_target": mean(self.win_cap), "target": len(self.target),
+                     "exiting": sum(1 for s in self.st.values() if s.exit_since is not None)}
         self.j.write("window", ts=now, start=w * self.cfg.window_s, end=(w + 1) * self.cfg.window_s,
-                     m1_usd_day=tot, markets=per, pnl=self.pnl(), errors=self.errors)
+                     m1_usd_day=tot, markets=per, pnl=self.pnl(), errors=self.errors, **extra)
         self.acc = self._new_acc()
+        self.win_cap = []
 
     def pnl(self):
-        return sum(s.mtm() for s in self.st.values())
+        return self.closed_pnl + sum(s.mtm() for s in self.st.values())
 
     def restore(self, events):
-        """Rebuild positions and cash of a resumed run from its own journal (fills and merges), so a restart
-        keeps the position limit and the mark-to-market stop. Returns the number of fills replayed."""
+        """Rebuild positions and cash of a resumed run from its own journal (fills, merges, closing orders), so a
+        restart keeps the position limit and the mark-to-market stop. Phase 2: the markets (portfolio and exiting
+        ones) come from the rebalance events. Returns the number of fills replayed."""
         n = 0
         for e in events:
+            ev = e["event"]
+            if ev == "rebalance":
+                exiting = e.get("exiting") or {}
+                for c, m in (e.get("markets") or {}).items():
+                    s = self.st.get(c)
+                    if s is None:
+                        s = self.st[c] = MarketState(m)
+                    else:
+                        s.set_market(m)
+                    s.exit_since = exiting.get(c)
+                self.target = set(e.get("target") or [])
+                self.last_rebalance = e["ts"]
+                continue
+            if ev == "exit":
+                s = self.st.get(e.get("mkt"))
+                if s is not None and s.exit_since is None:
+                    s.exit_since = e["ts"]
+                continue
+            if ev == "retired":
+                if self.st.pop(e["mkt"], None) is not None:
+                    self.closed_pnl += e.get("pnl", 0.0)
+                continue
             s = self.st.get(e.get("mkt"))
             if s is None:
                 continue
-            if e["event"] == "fill":
+            if ev in ("fill", "flatten"):
                 if e["side"] == "bid":
                     s.yes += e["size"]; s.cash -= e["size"] * e["price"]
                 else:
                     s.no += e["size"]; s.cash -= e["size"] * (1 - e["price"])
-                n += 1
-            elif e["event"] == "merge":
+                s.cash -= e.get("fee", 0.0)
+                n += ev == "fill"
+            elif ev == "merge":
                 s.yes -= e["pairs"]; s.no -= e["pairs"]; s.cash += e["pairs"]
-        if n:
+        if n or self.last_rebalance is not None:
             self.j.write("restored", fills=n, positions={c: [x.yes, x.no, round(x.cash, 6)] for c, x in self.st.items()})
         return n
 
@@ -751,8 +1247,9 @@ class LPTest:
 
     def apply_fill(self, f):
         s = self.st[f["mkt"]]
-        self.acc[f["mkt"]]["fills"] += 1
-        self.acc[f["mkt"]]["contracts"] += f["size"]
+        a = self._a(f["mkt"])
+        a["fills"] += 1
+        a["contracts"] += f["size"]
         if f["side"] == "bid":
             s.yes += f["size"]; s.cash -= f["size"] * f["price"]
         else:
@@ -762,12 +1259,20 @@ class LPTest:
             s.orders[f["side"]] = None
         for h in (60, 600):
             self.pending.append((f["ts"] + h, h, f["mkt"], f["side"], f["price"], f["size"]))
-        self.j.write("fill", mkt=f["mkt"], side=f["side"], price=f["price"], size=f["size"], fill_ts=f["ts"], order=f["order"])
+        # maker rebate: a share of the taker fee rate x p x (1 - p) per contract (estimate; feeSchedule of the market)
+        p = f["price"] if f["side"] == "bid" else 1 - f["price"]
+        rebate = f["size"] * float(s.m.get("fee_rate") or 0.0) * p * (1 - p) * float(s.m.get("rebate_rate") or 0.0)
+        a["rebate"] += rebate
+        extra = {"rebate": round(rebate, 6)} if self.cfg.phase == 2 else {}
+        self.j.write("fill", mkt=f["mkt"], side=f["side"], price=f["price"], size=f["size"], fill_ts=f["ts"],
+                     order=f["order"], **extra)
 
     def due_markouts(self, now):
         keep = []
         for due, h, cond, side, price, size in self.pending:
-            s = self.st[cond]
+            s = self.st.get(cond)
+            if s is None:
+                continue
             later = next((m for t, m in s.mids if t >= due), None)
             if later is None:
                 if now - due <= 600:
@@ -775,9 +1280,125 @@ class LPTest:
                 continue                                # otherwise no book sample after the horizon: dropped
             mk = (later - price) if side == "bid" else (price - later)
             self.j.write("markout", mkt=cond, horizon=h, side=side, price=price, size=size, mid=later, markout=mk)
-            if h == 60 and cond in self.acc:
-                self.acc[cond]["markout60"].append([round(100 * mk, 3), size])
+            if h == 60:
+                self._a(cond)["markout60"].append([round(100 * mk, 3), size])
         self.pending = keep
+
+    # ---- phase 2: portfolio changes and exits
+
+    def apply_rebalance(self, target, summary, now):
+        """New target portfolio: new markets start quoting at their size, markets whose size changed re-quote at
+        the new size, markets no longer in the target start their exit. Written to the journal with every market
+        dict, so a restart rebuilds the same state."""
+        want = {m["cond"]: m for m in target}
+        added, resized, retired, back = [], [], [], []
+        for c, m in want.items():
+            s = self.st.get(c)
+            if s is None:
+                self.st[c] = MarketState(m)
+                self._a(c)
+                added.append(c)
+                continue
+            if s.exit_since is not None:
+                s.exit_since = None
+                back.append(c)
+            if abs(s.m["N"] - m["N"]) > 1e-9:
+                resized.append(c)
+            s.set_market(m)
+        for c, s in self.st.items():
+            if c not in want and s.exit_since is None:
+                s.exit_since = now
+                retired.append(c)
+        self.target = set(want)
+        self.last_rebalance = now
+        cap = sum(float(m.get("quote_cap") or 0.0) for m in target)
+        self.j.write("rebalance", ts=now, target=sorted(want), added=added, resized=resized, retired=retired, back=back,
+                     quote_cap=cap, summary=summary, markets={c: s.m for c, s in self.st.items()},
+                     exiting={c: s.exit_since for c, s in self.st.items() if s.exit_since is not None})
+        self.log(f"rebalance: {len(want)} markets, quote capital ${cap:.0f}, predicted M1 "
+                 f"${sum(float(m.get('m1_usd_day') or 0.0) for m in target):.2f}/day; +{len(added)} new, "
+                 f"{len(resized)} resized, {len(retired)} exiting")
+
+    def _exit_quotes(self, s, ob, oa):
+        """Reduce-only quotes of an exiting market: join the best price on the side that shrinks |YES - NO|, for at
+        most the position (no flip); nothing below dust_shares."""
+        pos = s.pos()
+        none = ({"bid": None, "ask": None}, {"bid": 0.0, "ask": 0.0})
+        if abs(pos) < self.cfg.dust_shares:
+            return none
+        q = round(min(s.m["N"], abs(pos)), 2)
+        if pos > 0:
+            return ({"bid": None, "ask": oa[0][0]}, {"bid": 0.0, "ask": q}) if oa else none
+        return ({"bid": ob[0][0], "ask": None}, {"bid": q, "ask": 0.0}) if ob else none
+
+    async def _flatten(self, s, now, ob, oa, reason=""):
+        """Close the position of an exiting market with a taker order: BUY NO against the YES bids when long YES,
+        BUY YES against the YES asks when long NO; the pairs are merged afterwards."""
+        for side in ("bid", "ask"):
+            cur = s.orders[side]
+            if cur:
+                res = await self.ex.cancel(s.m, cur[0])
+                s.orders = {"bid": None, "ask": None} if res == "market" else dict(s.orders, **{side: None})
+                self.j.write("cancel", mkt=s.m["cond"], side=side, price=cur[1], scope=res)
+        pos = s.pos()
+        side = "ask" if pos > 0 else "bid"
+        r = await self.ex.take(s.m, side, round(abs(pos), 2), ob, oa)
+        if not r or r.get("size", 0.0) <= 1e-9:
+            return
+        if side == "bid":
+            s.yes += r["size"]; s.cash -= r["size"] * r["price"]
+        else:
+            s.no += r["size"]; s.cash -= r["size"] * (1 - r["price"])
+        s.cash -= r.get("fee", 0.0)
+        mid = s.mid if s.mid is not None else r["price"]
+        # cost against the mid: buying YES above it ("bid") or selling YES (buying NO) below it ("ask"), plus the fee
+        loss = r["size"] * ((r["price"] - mid) if side == "bid" else (mid - r["price"])) + r.get("fee", 0.0)
+        self.j.write("flatten", mkt=s.m["cond"], side=side, price=r["price"], size=r["size"], fee=r.get("fee", 0.0),
+                     mid=s.mid, cost=round(-loss, 6), hours_left=round(s.hours_left(now), 3),
+                     since_exit_h=round((now - s.exit_since) / 3600, 3) if s.exit_since else None, reason=reason,
+                     held_h=round((now - s.pos_since) / 3600, 3) if s.pos_since else None)
+        if abs(s.pos()) < self.cfg.dust_shares:
+            s.pos_since = None
+
+    def _drop_finished(self):
+        """Exiting markets with no position (below dust), no orders, no unmerged pairs and no pending markout
+        leave the test; their mark-to-market moves to closed_pnl."""
+        for cond, s in list(self.st.items()):
+            if s.exit_since is None or abs(s.pos()) >= self.cfg.dust_shares or s.orders["bid"] or s.orders["ask"]:
+                continue
+            if min(s.yes, s.no) >= self.cfg.dust_shares or any(p[2] == cond for p in self.pending):
+                continue
+            pnl = s.mtm()
+            self.closed_pnl += pnl
+            del self.st[cond]
+            self.j.write("retired", mkt=cond, pnl=pnl, yes=s.yes, no=s.no)
+
+    async def snapshot_tick(self, now):
+        """Phase 2, one pass of the snapshot task: a snapshot when one is due; then, if rebalance_h has passed since
+        the last rebalance (or there was none) and the store is warm, a new target for step() to apply."""
+        if self.store.due(now):
+            sm = await asyncio.to_thread(self.store.take, now)
+            self.j.write("snapshot", **sm)
+            now = self.clock()
+        if self.pending_target is None and self.store.warm(now) and (
+                self.last_rebalance is None or now - self.last_rebalance >= self.cfg.rebalance_h * 3600 - 60):
+            target, summary = await asyncio.to_thread(self.store.rank, now)
+            self.pending_target = (target, summary, now)
+
+    async def _snapshots(self):
+        while True:
+            try:
+                await self.snapshot_tick(self.clock())
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:                       # the public API failed even after retries
+                self.errors += 1
+                self.j.write("error", error=("snapshot: " + repr(e))[:300])
+                await asyncio.sleep(300)
+                continue
+            await asyncio.sleep(5)
+
+    # ---- the loop
 
     async def step(self, now, cfgs):
         w = int(now // self.cfg.window_s)               # close the window before anything of this step is counted
@@ -786,11 +1407,16 @@ class LPTest:
         elif w != self.win:
             self._close_window(now)
             self.win = w
+        if self.pending_target is not None:
+            target, summary, t = self.pending_target
+            self.pending_target = None
+            self.apply_rebalance(target, summary, t)
+        p2 = self.cfg.phase == 2
         bk = await asyncio.to_thread(self.books_fn, [s.m["yes"] for s in self.st.values()])
         reserve = self.cfg.capital_usd - self.cfg.quote_budget_usd
         over = sum(s.exposure() for s in self.st.values()) >= reserve
         sample = now - self.last_sample >= self.cfg.sample_s
-        for cond, s in self.st.items():
+        for cond, s in list(self.st.items()):
             b = bk.get(s.m["yes"])
             if not b:
                 continue
@@ -801,58 +1427,99 @@ class LPTest:
                 o = s.orders[side]
                 if not o or not getattr(self.ex, "in_book", False) or now - o[2] < self.cfg.poll_s:
                     return {}
-                return {round(o[1], 4): s.m["N"]}
+                return {round(o[1], 4): o[3]}
             ob, oa = without_mine(bids, mine("bid")), without_mine(asks, mine("ask"))
+            s.book = (ob, oa)
             if ob and oa:
                 s.mid = (ob[0][0] + oa[0][0]) / 2
                 s.mids = (s.mids + [(now, s.mid)])[-400:]
-            c = cfgs.get(cond) or {"v": s.m["v"], "min": s.m["min"], "rate": 0.0}
+            if cond in cfgs:
+                c = cfgs[cond] or {"v": s.m["v"], "min": s.m["min"], "rate": 0.0}
+            else:                                       # phase 2: a market added since the last reward refresh
+                c = {"v": s.m["v"], "min": s.m["min"], "rate": float(s.m.get("rate") or 0.0) if p2 else 0.0}
             cap = self.cfg.pos_limit_mult * s.m["N"]
+            if s.mid is not None and self.cfg.pos_limit_usd < 1e8:
+                cap = min(cap, self.cfg.pos_limit_usd / max(s.mid, 1 - s.mid))
             if over:
                 cap = min(cap, abs(s.pos()))           # capital guard: no side may grow the position
-            want = dict(zip(("bid", "ask"), targets(ob, oa, tick, c["v"], s.pos(), cap)))
-            if self.stopped or self.paused or c["rate"] <= 0:
+            exiting = aged = False
+            if p2:
+                why = ("reward removed" if c["rate"] <= 0 else
+                       "end near" if self.cfg.exit_at_end and s.hours_left(now) < self.cfg.exit_reduce_h else
+                       "mid out of range" if s.mid is not None and not self.cfg.exit_mid_lo <= s.mid <= self.cfg.exit_mid_hi else None)
+                if s.exit_since is None and why:
+                    s.exit_since = now
+                    self.j.write("exit", mkt=cond, reason=why, hours_left=round(s.hours_left(now), 3), mid=s.mid)
+                exiting = s.exit_since is not None
+                if abs(s.pos()) < self.cfg.dust_shares:
+                    s.pos_since = None
+                elif s.pos_since is None:
+                    s.pos_since = now
+                aged = (self.cfg.inv_reduce_h > 0 and s.pos_since is not None
+                        and now - s.pos_since >= self.cfg.inv_reduce_h * 3600)
+            if exiting or aged:
+                want, size = self._exit_quotes(s, ob, oa)
+            else:
+                want = dict(zip(("bid", "ask"), targets(ob, oa, tick, c["v"], s.pos(), cap)))
+                size = {"bid": s.m["N"], "ask": s.m["N"]}
+            if self.stopped or self.paused or (c["rate"] <= 0 and not exiting):
                 want = {"bid": None, "ask": None}
             for side in ("bid", "ask"):
                 cur = s.orders[side]
-                if cur and (want[side] is None or abs(cur[1] - want[side]) > 1e-9):
+                if cur and (want[side] is None or abs(cur[1] - want[side]) > 1e-9 or abs(cur[3] - size[side]) > 1e-9):
                     res = await self.ex.cancel(s.m, cur[0])
                     if res == "market":
                         s.orders = {"bid": None, "ask": None}
                     else:
                         s.orders[side] = None
                     self.j.write("cancel", mkt=cond, side=side, price=cur[1], scope=res)
-                    self.acc[cond]["cancels"] += 1
+                    self._a(cond)["cancels"] += 1
             for side in ("bid", "ask"):
-                if s.orders[side] is None and want[side] is not None:
-                    oid = await self.ex.place(s.m, side, want[side], s.m["N"])
+                if s.orders[side] is None and want[side] is not None and size[side] > 0:
+                    oid = await self.ex.place(s.m, side, want[side], size[side])
                     if oid:
-                        s.orders[side] = (oid, want[side], now)
-                        self.j.write("place", mkt=cond, side=side, price=want[side], size=s.m["N"])
-                        self.acc[cond]["places"] += 1
+                        s.orders[side] = (oid, want[side], now, size[side])
+                        self.j.write("place", mkt=cond, side=side, price=want[side], size=size[side])
+                        self._a(cond)["places"] += 1
+            if p2 and not (self.stopped or self.paused) and abs(s.pos()) >= self.cfg.dust_shares:
+                due = None
+                if exiting and now - s.exit_since >= self.cfg.exit_window_h * 3600:
+                    due = "exit window"
+                elif exiting and self.cfg.exit_at_end and s.hours_left(now) < self.cfg.exit_flatten_h:
+                    due = "end near"
+                elif self.cfg.inv_flatten_h > 0 and s.pos_since is not None and now - s.pos_since >= self.cfg.inv_flatten_h * 3600:
+                    due = "position held 1 h" if abs(self.cfg.inv_flatten_h - 1.0) < 1e-9 else "position held"
+                if due:
+                    await self._flatten(s, now, ob, oa, due)
             if sample:
                 my_b = s.orders["bid"][1] if s.orders["bid"] else None
                 my_a = s.orders["ask"][1] if s.orders["ask"] else None
-                frac = m1_fraction(ob, oa, my_b, my_a, s.m["N"], c["v"], c["min"])
+                sz = s.m["N"] if not (exiting or aged) else max((o[3] for o in s.orders.values() if o), default=0.0)
+                frac = m1_fraction(ob, oa, my_b, my_a, sz, c["v"], c["min"])
                 # competitors seen in the book: price levels and resting size of other orders inside the zone
                 lv = [(p, z) for p, z in ob if s.mid is not None and 0 <= (s.mid - p) * 100 < c["v"] and z + 1e-9 >= c["min"]]
                 lv += [(p, z) for p, z in oa if s.mid is not None and 0 <= (p - s.mid) * 100 < c["v"] and z + 1e-9 >= c["min"]]
                 self.j.write("m1", ts=now, mkt=cond, frac=frac, usd=c["rate"] * frac * self.cfg.sample_s / 86400,
                              bid=my_b, ask=my_a, mid=s.mid, comp_levels=len(lv), comp_size=sum(z for _, z in lv))
-                a = self.acc[cond]
+                a = self._a(cond)
                 a["m1"].append(c["rate"] * frac); a["frac"].append(frac)
                 a["comp_levels"].append(len(lv)); a["comp_size"].append(sum(z for _, z in lv))
+        if sample and p2:
+            self.win_cap.append(sum(float(self.st[c].m.get("quote_cap") or 0.0) for c in self.target if c in self.st))
         for f in await self.ex.fills([s.m for s in self.st.values()]):
             if f["mkt"] in self.st:
                 self.apply_fill(f)
         self.due_markouts(now)
         for cond, s in self.st.items():
             pairs = min(s.yes, s.no)
-            if pairs >= s.m["N"]:
+            need = min(s.m["N"], self.cfg.dust_shares) if p2 and s.exit_since is not None else s.m["N"]
+            if pairs >= need:
                 done = await self.ex.merge(s.m, pairs)
                 if done:
                     s.yes -= done; s.no -= done; s.cash += done
                     self.j.write("merge", mkt=cond, pairs=done)
+        if p2:
+            self._drop_finished()
         if sample:
             self.last_sample = now
             pct = await self.ex.reward_pct()
@@ -866,10 +1533,16 @@ class LPTest:
             self.j.write("pnl", ts=now, pnl=pnl, exposure=sum(x.exposure() for x in self.st.values()),
                          positions={c: [x.yes, x.no] for c, x in self.st.items()})
             try:
+                st = {"ts": now, "pnl": pnl, "errors": self.errors, "stopped": self.stopped,
+                      "orders": sum(1 for x in self.st.values() for o in x.orders.values() if o),
+                      "m1_usd_day_now": sum(a["m1"][-1] for a in self.acc.values() if a["m1"])}
+                if p2:
+                    st.update(target=len(self.target), exiting=sum(1 for x in self.st.values() if x.exit_since is not None),
+                              quote_cap=self.win_cap[-1] if self.win_cap else 0.0, last_rebalance=self.last_rebalance,
+                              next_rebalance=(self.last_rebalance + self.cfg.rebalance_h * 3600) if self.last_rebalance else None,
+                              exposure=sum(x.exposure() for x in self.st.values()))
                 with open(self.status_path + ".tmp", "w") as f:
-                    json.dump({"ts": now, "pnl": pnl, "errors": self.errors, "stopped": self.stopped,
-                               "orders": sum(1 for x in self.st.values() for o in x.orders.values() if o),
-                               "m1_usd_day_now": sum(a["m1"][-1] for a in self.acc.values() if a["m1"])}, f)
+                    json.dump(st, f)
                 os.replace(self.status_path + ".tmp", self.status_path)
             except OSError:
                 pass
@@ -893,6 +1566,7 @@ class LPTest:
         self.j.write("start", markets=[s.m["cond"] for s in self.st.values()], config=dataclasses.asdict(self.cfg),
                      quote_cap=sum(float(s.m.get("quote_cap") or 0.0) for s in self.st.values()))
         await self.reconcile()
+        snaps = asyncio.create_task(self._snapshots()) if self.store is not None else None
         try:
             while self.clock() < t_end and not self.stopped:
                 now = self.clock()
@@ -902,7 +1576,7 @@ class LPTest:
                         self.paused = paused
                         self.j.write("pause" if paused else "resume")
                 try:
-                    if now - cfg_t > 3600:
+                    if now - cfg_t > 3600 or not set(self.st) <= set(cfgs):
                         allr = await asyncio.to_thread(self.rewards_fn)
                         cfgs, cfg_t = {c: allr.get(c) for c in self.st}, now
                         gone = [c for c, v in cfgs.items() if not v or v["rate"] <= 0]
@@ -921,6 +1595,9 @@ class LPTest:
             self.end_reason = "cancelled"
             raise
         finally:
+            if snaps is not None:
+                snaps.cancel()
+                await asyncio.gather(snaps, return_exceptions=True)
             await self.ex.cancel_all()
             if self.win is not None:
                 self._close_window(self.clock())
@@ -1058,6 +1735,86 @@ def phase1(events, cv_max=0.5, share_max=0.4, exclude=(), m1_per_100_min=None, q
     return out
 
 
+def phase2(events, net_per100_min=20.0, cv_max=0.5, share_max=0.4, ratio_min=0.6, hours=48.0):
+    """Phase 2 paper report (research/PREREG_PHASE2.md) over the first `hours` hours of quoting (from the first
+    start event). Per $100 of quote capital (the target portfolio's capital, averaged over the 30-minute windows):
+      M1 (reward model of the quotes that rested), maker rebates, mark-to-market change (fills, markouts, closing
+      orders and their fees, valued at mid), and their sum, the net. Plus CV of the window M1, the largest market
+      share of M1 over the last 24 hours, fact / prediction of rank(), fills, markouts, exits, turnover."""
+    starts = [e["ts"] for e in events if e["event"] == "start"]
+    if not starts:
+        return {"verdict": "no data"}
+    t0 = min(starts)
+    t1 = t0 + hours * 3600
+    wins = sorted((e for e in events if e["event"] == "window" and t0 <= e["start"] < t1), key=lambda e: e["start"])
+    if not wins:
+        return {"verdict": "no data", "t0": t0}
+    t_last = wins[-1]["end"]
+    port = [w["m1_usd_day"] for w in wins]
+    m1 = sum(port) / len(port)
+    caps = [w["cap_target"] for w in wins if w.get("cap_target")]
+    cap = sum(caps) / len(caps) if caps else None
+    cv = (sum((x - m1) ** 2 for x in port) / len(port)) ** 0.5 / m1 if m1 > 0 else None
+    days = (t_last - wins[0]["start"]) / 86400
+    per100 = (lambda x: x * 100 / cap / days) if cap and days > 0 else (lambda x: None)
+    inside = [e for e in events if t0 <= e["ts"] <= t_last]
+    rebates = sum(m.get("rebate", 0.0) or 0.0 for w in wins for m in w["markets"].values())
+    pnls = [e["pnl"] for e in inside if e["event"] in ("pnl", "end")]
+    mtm = (pnls[-1] - pnls[0]) if len(pnls) > 1 else 0.0
+    flat = [e for e in inside if e["event"] == "flatten"]
+    reb = [e for e in inside if e["event"] == "rebalance"]
+    # prediction of rank() for the time each target was in force, against the window M1 of the same time
+    pred = []
+    for w in wins:
+        r = next((e for e in reversed(reb) if e["ts"] <= w["start"] + 1), None)
+        if r is not None:
+            pred.append(float((r.get("summary") or {}).get("m1_pred") or 0.0))
+    pred_m1 = sum(pred) / len(pred) if pred else None
+    last24 = [w for w in wins if w["start"] >= t_last - 86400]
+    tot24 = sum(w["m1_usd_day"] for w in last24)
+    share = {}
+    for w in last24:
+        for c, m in w["markets"].items():
+            share[c] = share.get(c, 0.0) + (m["m1_usd_day"] or 0.0)
+    mk = [x for w in wins for m in w["markets"].values() for x in m.get("markout60", [])]
+    q = sum(z for _, z in mk)
+    mk600 = [e for e in inside if e["event"] == "markout" and e["horizon"] == 600]
+    contracts = sum(m["contracts"] for w in wins for m in w["markets"].values())
+    market_hours = sum(1 for w in wins for m in w["markets"].values() if m.get("samples")) * 0.5
+    turnover = [len(e.get("added") or []) / max(1, len(e.get("target") or [])) for e in reb[1:]]
+    ticks = sorted({round(e["ts"]) for e in inside if e["event"] in ("m1", "pnl")})
+    out = {"hours": round((t_last - t0) / 3600, 1), "windows": len(wins), "quote_cap_usd": cap,
+           "m1_usd_day": m1, "m1_per100": m1 * 100 / cap if cap else None,
+           "rebates_usd": rebates, "rebates_per100": per100(rebates),
+           "mtm_usd": mtm, "mtm_per100": per100(mtm),
+           "net_usd_day": m1 + (rebates + mtm) / days if days > 0 else None,
+           "net_per100": (m1 * 100 / cap + per100(rebates) + per100(mtm)) if cap and days > 0 else None,
+           "cv": cv, "max_share_last24": max(share.values()) / tot24 if share and tot24 > 0 else None,
+           "pred_m1_usd_day": pred_m1, "fact_over_pred": m1 / pred_m1 if pred_m1 else None,
+           "fills": sum(m["fills"] for w in wins for m in w["markets"].values()), "contracts": contracts,
+           "contracts_per_market_day": contracts / (market_hours / 24) if market_hours else None,
+           "markout60_c": sum(v * z for v, z in mk) / q if q else None, "markout60_p5_c": _wq(mk, 0.05) if mk else None,
+           "markout600_c": (100 * sum(e["markout"] * e["size"] for e in mk600) / sum(e["size"] for e in mk600)) if mk600 else None,
+           "rebalances": len(reb), "markets_per_rebalance": sum(len(e.get("target") or []) for e in reb) / len(reb) if reb else None,
+           "turnover": sum(turnover) / len(turnover) if turnover else None,
+           "exits": sum(1 for e in inside if e["event"] == "exit") + sum(len(e.get("retired") or []) for e in reb),
+           "flattens": len(flat), "flatten_contracts": sum(e["size"] for e in flat),
+           "flatten_cost_usd": sum(e.get("cost", 0.0) for e in flat),
+           "retired": sum(1 for e in inside if e["event"] == "retired"),
+           "downtime_h": round(sum(b - a for a, b in zip(ticks, ticks[1:]) if b - a > 300) / 3600, 2),
+           "process_starts": len(starts), "errors": sum(1 for e in inside if e["event"] == "error")}
+    full = out["hours"] >= hours - 0.6
+    checks = {
+        f"net >= ${net_per100_min:g}/day per $100 of quotes": full and out["net_per100"] is not None and out["net_per100"] >= net_per100_min,
+        f"M1 CV <= {cv_max:.0%}": full and cv is not None and cv <= cv_max,
+        f"no market > {share_max:.0%} of M1 (last 24 h)": out["max_share_last24"] is not None and out["max_share_last24"] <= share_max,
+        f"M1 fact / prediction >= {ratio_min:g}": out["fact_over_pred"] is not None and out["fact_over_pred"] >= ratio_min,
+    }
+    out["checks"] = checks
+    out["verdict"] = "PASS" if all(checks.values()) else "FAIL: " + ", ".join(k for k, v in checks.items() if not v)
+    return out
+
+
 def load_events(lp_dir, mode):
     path = os.path.join(lp_dir, f"{mode}.jsonl")
     if not os.path.exists(path):
@@ -1110,6 +1867,13 @@ def cli(cmd, args):
                 print(f"{k}: {v}")
         for c, v in (r.get("markets") or {}).items():
             print(" ", (qs.get(c) or c)[:50], {k: (round(x, 3) if isinstance(x, float) else x) for k, x in v.items()})
+        return
+    if cmd == "lp-phase2":
+        # lp-phase2 [paper|live]: phase 2 report (research/PREREG_PHASE2.md) from LP_DIR/<mode>.jsonl
+        mode = args[0] if args else "paper"
+        r = phase2(load_events(cfg.lp_dir, mode))
+        for k, v in r.items():
+            print(f"{k}: {round(v, 4) if isinstance(v, float) else v}")
         return
     if cmd == "lp-earnings":
         # fetch actual earnings for every UTC day of the live test and append them to the journal
