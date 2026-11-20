@@ -89,7 +89,10 @@ def quote(bids, asks, tick, v, place):
 
 
 def evaluate(rw, book, place, k, mid_lo=0.15, mid_hi=0.85):
-    """(M1 $/day, competitor levels, quote capital) for one market, or None if we cannot quote."""
+    """(M1 $/day, competitor levels, quote capital) for one market, or None if we cannot quote. "join" is the
+    bot's own rule (polybot.lp.evaluate)."""
+    if place == "join":
+        return lp.evaluate(rw, book, k, mid_lo, mid_hi)
     rate, v, mn = rw
     if v <= 0 or mn <= 0 or rate <= 0:
         return None
@@ -126,73 +129,42 @@ class Conf:
     min_days_left: float = 14.0            # are excluded by them
     alloc: str = "fixed"                   # fixed: every market at size k; marginal: budget in steps of one
     kmax: int = 5                          # rewards_min_size, each step to the best marginal M1 per dollar
+    cands: str = "first"                   # first: markets rewarded in the window's first snapshot (runs of 20 Nov);
+                                           # union: quotable at least once in the window (the phase 2 bot)
+    min_hours_left: float = 0.0            # bot: never select a market this close to its end
+    exit_h: float = 0.0                    # bot: no M1 in the last exit_h hours before a market's end (exit quotes)
 
 
 def eligible(meta_c, now, conf):
-    if not meta_c or not meta_c.get("active", True) or meta_c.get("game"):
-        return False
-    if conf.topic and lp.topic_news(meta_c.get("question") or ""):
-        return False
-    if conf.category and (meta_c.get("fee_type") or "none") != conf.category:
-        return False
-    if (meta_c.get("fee_type") or "none") in conf.exclude:
-        return False
-    try:
-        if now - lp._ts(meta_c["created"]) < conf.min_age_days * 86400 or lp._ts(meta_c["end"]) - now < conf.min_days_left * 86400:
-            return False
-    except Exception:
-        return False
-    return True
+    return lp.eligible(meta_c, now, conf.exclude, conf.topic, conf.category, conf.min_age_days,
+                       max(conf.min_days_left * 24, conf.min_hours_left))
 
 
 def marginal(rows, conf):
-    """Budget in steps of one rewards_min_size: each step goes to the option with the best marginal M1 per dollar
-    (a new market at k=1 or one more unit on a chosen market). No market takes more than max_share of the budget;
-    if one carries more than max_share of the predicted M1, its size is cut by one unit (dropped at k=1) and the
-    budget is spread again."""
-    banned, kcap = set(), {}
-    while True:
-        k, events, cap = {}, set(), 0.0
-        while True:
-            best = None
-            for x in rows:
-                c = x["cond"]
-                if c in banned:
-                    continue
-                cur = k.get(c, 0)
-                if cur >= min(conf.kmax, kcap.get(c, conf.kmax)) or (cur == 0 and (x["event"] in events or len(k) >= conf.markets_max)):
-                    continue
-                if x["cap_k"][cur] > max(conf.budget * conf.max_share, x["cap_k"][0]):
-                    continue
-                gain = x["m1_k"][cur] - (x["m1_k"][cur - 1] if cur else 0.0)
-                cost = x["cap_k"][cur] - (x["cap_k"][cur - 1] if cur else 0.0)
-                if gain <= 0 or cost <= 0 or cap + cost > conf.budget:
-                    continue
-                if best is None or gain / cost > best[0]:
-                    best = (gain / cost, c, cost, x["event"])
-            if best is None:
-                break
-            _, c, cost, e = best
-            k[c] = k.get(c, 0) + 1; cap += cost; events.add(e)
-        out = []
-        for x in rows:
-            if x["cond"] in k:
-                kk = k[x["cond"]]
-                out.append(dict(x, k=kk, m1_usd_day=x["m1_k"][kk - 1], quote_cap=x["cap_k"][kk - 1]))
-        tot = sum(x["m1_usd_day"] for x in out)
-        top = max(out, key=lambda x: x["m1_usd_day"], default=None)
-        if top is None or tot <= 0 or top["m1_usd_day"] / tot <= conf.max_share or len(out) < 2:
-            return out
-        if top["k"] > 1:
-            kcap[top["cond"]] = top["k"] - 1
-        else:
-            banned.add(top["cond"])
+    """polybot.lp.allocate: budget in steps of one rewards_min_size to the best marginal M1 per dollar, k <= kmax,
+    no market above max_share of the budget or of the predicted M1."""
+    return lp.allocate(rows, conf.budget, conf.kmax, conf.markets_max, conf.max_share)
+
+
+def exiting(meta, c, ts, conf):
+    """The bot quotes only to reduce its position in the last exit_h hours before a market's end: no M1 counted."""
+    if conf.exit_h <= 0:
+        return False
+    try:
+        return lp._ts((meta.get(c) or {})["end"]) - ts < conf.exit_h * 3600
+    except Exception:
+        return False
 
 
 def run(conf, meta, sel, ev):
     """Select on snapshots `sel`, evaluate on `ev`. Returns a result dict."""
     now = sel[0]["ts"]
-    cands = [c for c, r in sel[0]["rw"].items() if r[2] <= conf.max_min and eligible(meta.get(c), now, conf)]
+    if conf.cands == "union":                         # the bot: every market rewarded in the window, eligible now
+        now = sel[-1]["ts"] + 1
+        pool = {c for s_ in sel for c, r in s_["rw"].items() if r[2] <= conf.max_min}
+    else:
+        pool = {c for c, r in sel[0]["rw"].items() if r[2] <= conf.max_min}
+    cands = sorted(c for c in pool if eligible(meta.get(c), now, conf))
     ks = range(1, conf.kmax + 1) if conf.alloc == "marginal" else [conf.k]
     rows = []
     for c in cands:
@@ -227,7 +199,7 @@ def run(conf, meta, sel, ev):
         tot = 0.0
         for x in out:
             r, bk = s["rw"].get(x["cond"]), s["books"].get(x["cond"])
-            e = evaluate(r, bk, conf.place, x["k"]) if r and bk else None
+            e = evaluate(r, bk, conf.place, x["k"]) if r and bk and not exiting(meta, x["cond"], s["ts"], conf) else None
             m = e[0] if e else 0.0
             per[x["cond"]].append(m); tot += m
         port.append(tot)
@@ -288,6 +260,9 @@ def phase2_grid(meta):
     out = [Conf("phase 1B rule ($100, 5 markets, k=1, min<=20, >=7d old, >=14d left)")]
     for b in (100, 300, 500):
         out.append(Conf(f"PHASE 2 rules, budget ${b}", budget=b, **p2))
+    for b in (300, 500):                              # what the phase 2 bot does (polybot/lp.py, SnapStore.rank)
+        out.append(Conf(f"PHASE 2 bot, budget ${b} (union, >=1 h left, exit last 1 h)", budget=b,
+                        **dict(p2, cands="union", min_hours_left=1.0, exit_h=1.0)))
     for b in (300, 500):
         out += [Conf(f"  sens ${b}: no size scaling (k=1)", budget=b, **dict(p2, kmax=1)),
                 Conf(f"  sens ${b}: long-dated only (>=7d old, >=14d left)", budget=b, **dict(p2, min_age_days=7, min_days_left=14)),
@@ -341,7 +316,7 @@ def run_rolling(conf, meta, snaps, lookback_h, step_h, start_h):
             tot = 0.0
             for c, k in chosen:
                 rr, bk = s_["rw"].get(c), s_["books"].get(c)
-                e = evaluate(rr, bk, conf.place, k) if rr and bk else None
+                e = evaluate(rr, bk, conf.place, k) if rr and bk and not exiting(meta, c, s_["ts"], conf) else None
                 m = e[0] if e else 0.0
                 per[c] = per.get(c, 0.0) + m; tot += m
             port_by_win.setdefault(int((s_["ts"] - t0) // 1800), []).append(tot)
