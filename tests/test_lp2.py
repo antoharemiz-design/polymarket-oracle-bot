@@ -403,6 +403,7 @@ class Phase2LoopTest(unittest.TestCase):
         self.assertAlmostEqual(t.pnl(), 20.0 * (0.48 - 0.48) - fee, places=9)
 
     def test_end_near_reduces_then_flattens(self):
+        self.cfg.exit_at_end, self.cfg.inv_reduce_h, self.cfg.inv_flatten_h = 1, 0.0, 0.0
         t = self.make([mk("C1", end_h=2.0)])
         self.step(t)
         oid = t.st["C1"].orders["ask"][0]
@@ -417,6 +418,44 @@ class Phase2LoopTest(unittest.TestCase):
         self.assertEqual(next(e for e in journal_events(self.j) if e["event"] == "exit")["reason"], "end near")
         self.step(t, 0.3 * 3600)                           # 0.2 h left < exit_flatten_h: taker
         self.assertEqual([e["side"] for e in journal_events(self.j) if e["event"] == "flatten"], ["bid"])
+
+    def test_no_end_exit_by_default(self):
+        t = self.make([mk("C1", end_h=0.5)])
+        self.step(t)
+        self.assertIsNone(t.st["C1"].exit_since)           # weather trades its measured day after endDate
+        self.assertIsNotNone(t.st["C1"].orders["bid"])
+
+    def test_position_held_reduce_then_flatten(self):
+        t = self.make([mk("C1")])
+        self.step(t)
+        oid = t.st["C1"].orders["bid"][0]
+        self.ex.inject = [{"order": oid, "mkt": "C1", "side": "bid", "price": 0.48, "size": 20.0, "ts": self.clock.t, "done": True}]
+        self.step(t, 1)
+        s = t.st["C1"]
+        self.step(t, 1)                                    # the next pass sees the position
+        self.assertIsNotNone(s.pos_since)
+        self.step(t, 600)
+        self.assertIsNotNone(s.orders["bid"])              # 10 min: still two-sided
+        self.step(t, 1200)
+        self.assertIsNone(s.orders["bid"])                 # 30 min: only the reducing side
+        self.assertEqual(s.orders["ask"][3], 20.0)
+        self.assertIsNone(s.exit_since)                    # still in the portfolio
+        self.step(t, 1800)
+        fl = [e for e in journal_events(self.j) if e["event"] == "flatten"]
+        self.assertEqual([(e["side"], e["reason"]) for e in fl], [("ask", "position held 1 h")])
+        self.assertAlmostEqual(s.pos(), 0.0)
+        self.assertIsNone(s.pos_since)
+        self.step(t, 5)
+        self.assertIsNotNone(s.orders["bid"])              # flat again: two-sided quotes come back
+        self.assertIn("C1", t.st)
+
+    def test_mid_out_of_range_starts_exit(self):
+        t = self.make([mk("C1")])
+        self.step(t)
+        self.books["YC1"] = ([(0.93, 100.0)], [(0.95, 100.0)], 0.01)
+        self.step(t, 5)
+        e = next(e for e in journal_events(self.j) if e["event"] == "exit")
+        self.assertEqual(e["reason"], "mid out of range")
 
     def test_reward_removed_starts_exit(self):
         t = self.make([mk("C1")])

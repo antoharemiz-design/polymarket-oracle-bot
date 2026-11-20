@@ -136,8 +136,7 @@ class Conf:
 
 
 def eligible(meta_c, now, conf):
-    return lp.eligible(meta_c, now, conf.exclude, conf.topic, conf.category, conf.min_age_days,
-                       max(conf.min_days_left * 24, conf.min_hours_left))
+    return lp.eligible(meta_c, now, conf.exclude, conf.topic, conf.category, conf.min_age_days, conf.min_days_left * 24)
 
 
 def marginal(rows, conf):
@@ -159,12 +158,14 @@ def exiting(meta, c, ts, conf):
 def run(conf, meta, sel, ev):
     """Select on snapshots `sel`, evaluate on `ev`. Returns a result dict."""
     now = sel[0]["ts"]
-    if conf.cands == "union":                         # the bot: every market rewarded in the window, eligible now
+    if conf.cands == "union":                         # every market rewarded in the window, eligible at its end
         now = sel[-1]["ts"] + 1
         pool = {c for s_ in sel for c, r in s_["rw"].items() if r[2] <= conf.max_min}
-    else:
+    else:                                             # rewarded and eligible at the window's first snapshot
         pool = {c for c, r in sel[0]["rw"].items() if r[2] <= conf.max_min}
     cands = sorted(c for c in pool if eligible(meta.get(c), now, conf))
+    if conf.min_hours_left > 0:                       # the bot ranks at its newest snapshot: >= min_hours_left to go
+        cands = [c for c in cands if lp.eligible(meta.get(c), sel[-1]["ts"], (), False, "", 0.0, conf.min_hours_left)]
     ks = range(1, conf.kmax + 1) if conf.alloc == "marginal" else [conf.k]
     rows = []
     for c in cands:
@@ -261,8 +262,8 @@ def phase2_grid(meta):
     for b in (100, 300, 500):
         out.append(Conf(f"PHASE 2 rules, budget ${b}", budget=b, **p2))
     for b in (300, 500):                              # what the phase 2 bot does (polybot/lp.py, SnapStore.rank)
-        out.append(Conf(f"PHASE 2 bot, budget ${b} (union, >=1 h left, exit last 1 h)", budget=b,
-                        **dict(p2, cands="union", min_hours_left=1.0, exit_h=1.0)))
+        out.append(Conf(f"  variant ${b}: exit by endDate (>=1 h left, no M1 in the last 1 h and after)", budget=b,
+                        **dict(p2, min_hours_left=1.0, exit_h=1.0)))
     for b in (300, 500):
         out += [Conf(f"  sens ${b}: no size scaling (k=1)", budget=b, **dict(p2, kmax=1)),
                 Conf(f"  sens ${b}: long-dated only (>=7d old, >=14d left)", budget=b, **dict(p2, min_age_days=7, min_days_left=14)),

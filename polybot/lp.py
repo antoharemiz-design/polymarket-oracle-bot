@@ -73,10 +73,16 @@ class LPConfig:
     kmax: int = 1                      # quote size up to kmax x rewards_min_size, allocated step by step
     exclude_categories: str = ""       # fee categories never quoted (comma-separated feeType values)
     min_hours_left: float = 0.0        # never select a market this close to its endDate
+    exit_at_end: int = 0               # 1: exit by endDate (reduce from exit_reduce_h, close by exit_flatten_h before it);
+                                       # 0: no endDate exit (weather trades its measured day after endDate)
     exit_reduce_h: float = 1.0         # last hour before endDate: only the side that reduces the position is quoted
     exit_window_h: float = 1.0         # a market leaving the portfolio has this long to exit through quotes
     exit_flatten_h: float = 0.25       # then (or this close to endDate) the rest is closed by a taker order
     dust_shares: float = 5.0           # positions below this are left alone (the exchange's minimum order)
+    inv_reduce_h: float = 0.0          # a position held this long: only the reducing side is quoted (0 = off)
+    inv_flatten_h: float = 0.0         # a position held this long is closed by a taker order (0 = off)
+    exit_mid_lo: float = 0.10          # phase 2: the mid leaving [exit_mid_lo, exit_mid_hi] (the outcome becoming
+    exit_mid_hi: float = 0.90          # clear before resolution) starts the market's exit
     pos_limit_usd: float = 1e9         # per market: the position may not grow beyond this many dollars
     snapshots_keep_h: float = 30.0     # snapshot files older than this are deleted
 
@@ -85,7 +91,11 @@ class LPConfig:
 PHASE2 = {"quote_budget_usd": 300.0, "capital_usd": 500.0, "stop_loss_usd": 100.0, "markets_min": 1, "markets_max": 40,
           "max_min_size": 200.0, "min_age_days": 0.0, "min_days_left": 0.0, "kmax": 5, "min_hours_left": 1.0,
           "exclude_categories": "economics_fees,finance_prices_fees,mentions_fees,culture_fees",
-          "pos_limit_usd": 50.0, "fills_every_s": 30.0, "test_days": 2.0}
+          "pos_limit_usd": 50.0, "fills_every_s": 30.0, "test_days": 2.0,
+          # exit rule (user, 20 Nov: no position into resolution, out within an hour): a position is never held
+          # longer than 1 h (reduce-only quotes after 30 min, a taker order at 1 h); markets leave on rebalance,
+          # reward removal or the mid leaving [0.10, 0.90]
+          "exit_at_end": 0, "inv_reduce_h": 0.5, "inv_flatten_h": 1.0}
 
 
 def from_env(phase=None) -> LPConfig:
@@ -725,7 +735,7 @@ class SnapStore:
         with gzip.open(path + ".tmp", "wt") as f:
             json.dump({"ts": now, "rw": rwl, "books": books_c}, f, separators=(",", ":"))
         os.replace(path + ".tmp", path)
-        entry = {"ts": now, "n_rewarded": len(rw), "n_eligible": len(ok), "rows": rows, "q": q}
+        entry = {"ts": now, "n_rewarded": len(rw), "n_eligible": len(ok), "rows": rows, "q": q, "elig": sorted(ok)}
         with open(self.rows_path, "a") as f:
             f.write(json.dumps(entry, separators=(",", ":")) + "\n")
             f.flush()
@@ -747,8 +757,11 @@ class SnapStore:
         cfg = self.cfg
         w = self.window(now)
         snaps = [e["rows"] for e in w]
-        cands = sorted(c for c in {c for s in snaps for c in s}
-                       if eligible(self.meta.get(c), now, self.exclude, min_hours_left=cfg.min_hours_left))
+        # candidates: the markets rewarded and eligible at the window's first snapshot (as in the simulator runs of
+        # 20 Nov: markets new within the window, still without competitors, did worse), still eligible now
+        first = set(w[0].get("elig") or w[0]["rows"]) if w else set()
+        left = cfg.min_hours_left if cfg.exit_at_end else -1e6
+        cands = sorted(c for c in first if eligible(self.meta.get(c), now, self.exclude, min_hours_left=left))
         events = {c: (self.meta.get(c) or {}).get("event", c) for c in cands}
         rows, chosen = rank(snaps, events, cfg.kmax, cfg.min_comp_levels, cfg.quote_budget_usd, cfg.markets_max,
                             cfg.max_share, cands=cands)
@@ -804,11 +817,20 @@ class PaperExec:
         if time.time() - self.last_poll < self.every_s:
             return out
         self.last_poll = time.time()
-        for m in markets:
+        busy = [m for m in markets if any(o["mkt"] == m["cond"] for o in self.orders.values())]
+        sem = asyncio.Semaphore(8)                      # the tapes of many markets (phase 2: up to 40) in parallel
+
+        async def tape(cond):
+            async with sem:
+                return await asyncio.to_thread(self.trades_fn, cond)
+        tapes = await asyncio.gather(*(tape(m["cond"]) for m in busy), return_exceptions=True)
+        for m, tp in zip(busy, tapes):
+            if isinstance(tp, BaseException):
+                raise tp
             mine = [(oid, o) for oid, o in self.orders.items() if o["mkt"] == m["cond"]]
             if not mine:
                 continue
-            for ts, oi, side, px, sz, key in sorted(await asyncio.to_thread(self.trades_fn, m["cond"])):
+            for ts, oi, side, px, sz, key in sorted(tp):
                 if key in self.seen or ts < self.since:
                     continue
                 self.seen.add(key)
@@ -1066,6 +1088,7 @@ class MarketState:
         self.mid = None
         self.mids = []                                  # (ts, mid of the other orders) for markouts
         self.exit_since = None                          # phase 2: left the portfolio (or lost its reward) at this time
+        self.pos_since = None                           # phase 2: since when |YES - NO| >= dust_shares
         self.book = None                                # (bids, asks) of the other orders at the last step
         try:
             self.end_ts = _ts(m["end"]) if m.get("end") else None
@@ -1308,7 +1331,7 @@ class LPTest:
             return ({"bid": None, "ask": oa[0][0]}, {"bid": 0.0, "ask": q}) if oa else none
         return ({"bid": ob[0][0], "ask": None}, {"bid": q, "ask": 0.0}) if ob else none
 
-    async def _flatten(self, s, now, ob, oa):
+    async def _flatten(self, s, now, ob, oa, reason=""):
         """Close the position of an exiting market with a taker order: BUY NO against the YES bids when long YES,
         BUY YES against the YES asks when long NO; the pairs are merged afterwards."""
         for side in ("bid", "ask"):
@@ -1332,7 +1355,10 @@ class LPTest:
         loss = r["size"] * ((r["price"] - mid) if side == "bid" else (mid - r["price"])) + r.get("fee", 0.0)
         self.j.write("flatten", mkt=s.m["cond"], side=side, price=r["price"], size=r["size"], fee=r.get("fee", 0.0),
                      mid=s.mid, cost=round(-loss, 6), hours_left=round(s.hours_left(now), 3),
-                     since_exit_h=round((now - s.exit_since) / 3600, 3) if s.exit_since else None)
+                     since_exit_h=round((now - s.exit_since) / 3600, 3) if s.exit_since else None, reason=reason,
+                     held_h=round((now - s.pos_since) / 3600, 3) if s.pos_since else None)
+        if abs(s.pos()) < self.cfg.dust_shares:
+            s.pos_since = None
 
     def _drop_finished(self):
         """Exiting markets with no position (below dust), no orders, no unmerged pairs and no pending markout
@@ -1416,14 +1442,22 @@ class LPTest:
                 cap = min(cap, self.cfg.pos_limit_usd / max(s.mid, 1 - s.mid))
             if over:
                 cap = min(cap, abs(s.pos()))           # capital guard: no side may grow the position
-            exiting = False
+            exiting = aged = False
             if p2:
-                if s.exit_since is None and (c["rate"] <= 0 or s.hours_left(now) < self.cfg.exit_reduce_h):
+                why = ("reward removed" if c["rate"] <= 0 else
+                       "end near" if self.cfg.exit_at_end and s.hours_left(now) < self.cfg.exit_reduce_h else
+                       "mid out of range" if s.mid is not None and not self.cfg.exit_mid_lo <= s.mid <= self.cfg.exit_mid_hi else None)
+                if s.exit_since is None and why:
                     s.exit_since = now
-                    self.j.write("exit", mkt=cond, reason="reward removed" if c["rate"] <= 0 else "end near",
-                                 hours_left=round(s.hours_left(now), 3))
+                    self.j.write("exit", mkt=cond, reason=why, hours_left=round(s.hours_left(now), 3), mid=s.mid)
                 exiting = s.exit_since is not None
-            if exiting:
+                if abs(s.pos()) < self.cfg.dust_shares:
+                    s.pos_since = None
+                elif s.pos_since is None:
+                    s.pos_since = now
+                aged = (self.cfg.inv_reduce_h > 0 and s.pos_since is not None
+                        and now - s.pos_since >= self.cfg.inv_reduce_h * 3600)
+            if exiting or aged:
                 want, size = self._exit_quotes(s, ob, oa)
             else:
                 want = dict(zip(("bid", "ask"), targets(ob, oa, tick, c["v"], s.pos(), cap)))
@@ -1447,13 +1481,20 @@ class LPTest:
                         s.orders[side] = (oid, want[side], now, size[side])
                         self.j.write("place", mkt=cond, side=side, price=want[side], size=size[side])
                         self._a(cond)["places"] += 1
-            if exiting and not (self.stopped or self.paused) and abs(s.pos()) >= self.cfg.dust_shares and (
-                    now - s.exit_since >= self.cfg.exit_window_h * 3600 or s.hours_left(now) < self.cfg.exit_flatten_h):
-                await self._flatten(s, now, ob, oa)
+            if p2 and not (self.stopped or self.paused) and abs(s.pos()) >= self.cfg.dust_shares:
+                due = None
+                if exiting and now - s.exit_since >= self.cfg.exit_window_h * 3600:
+                    due = "exit window"
+                elif exiting and self.cfg.exit_at_end and s.hours_left(now) < self.cfg.exit_flatten_h:
+                    due = "end near"
+                elif self.cfg.inv_flatten_h > 0 and s.pos_since is not None and now - s.pos_since >= self.cfg.inv_flatten_h * 3600:
+                    due = "position held 1 h" if abs(self.cfg.inv_flatten_h - 1.0) < 1e-9 else "position held"
+                if due:
+                    await self._flatten(s, now, ob, oa, due)
             if sample:
                 my_b = s.orders["bid"][1] if s.orders["bid"] else None
                 my_a = s.orders["ask"][1] if s.orders["ask"] else None
-                sz = s.m["N"] if not exiting else max((o[3] for o in s.orders.values() if o), default=0.0)
+                sz = s.m["N"] if not (exiting or aged) else max((o[3] for o in s.orders.values() if o), default=0.0)
                 frac = m1_fraction(ob, oa, my_b, my_a, sz, c["v"], c["min"])
                 # competitors seen in the book: price levels and resting size of other orders inside the zone
                 lv = [(p, z) for p, z in ob if s.mid is not None and 0 <= (s.mid - p) * 100 < c["v"] and z + 1e-9 >= c["min"]]
