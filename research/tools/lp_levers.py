@@ -275,12 +275,13 @@ def category_grid(meta):
     return [Conf(f"category {c}, budget $300", budget=300, category=c, markets_max=30, markets_min=1) for c in cats]
 
 
-TOXIC = ("economics_fees", "finance_prices_fees")
+TOXIC = ("economics_fees", "finance_prices_fees", "mentions_fees", "culture_fees")   # user's decision, 20 Nov
 
 
 def phase2_grid(meta):
-    """User's phase 2 rules (20 Nov): no age / days-left filters, min_size up to 200, economics and finance prices
-    excluded, size scaled per market (marginal, k <= 5), no market above 40% of predicted M1, $300 / $500.
+    """User's phase 2 rules (20 Nov): no age / days-left filters, min_size up to 200, economics, finance prices,
+    mentions and culture excluded, size scaled per market (marginal, k <= 5), no market above 40% of predicted M1,
+    $300 / $500.
     Kept from phase 1B: topic filter (classification A), >= 3 competitor levels. Sensitivity rows change one rule."""
     p2 = dict(alloc="marginal", kmax=5, max_min=200, min_age_days=0, min_days_left=0, exclude=TOXIC,
               markets_max=40, max_share=0.4)
@@ -291,7 +292,7 @@ def phase2_grid(meta):
         out += [Conf(f"  sens ${b}: no size scaling (k=1)", budget=b, **dict(p2, kmax=1)),
                 Conf(f"  sens ${b}: long-dated only (>=7d old, >=14d left)", budget=b, **dict(p2, min_age_days=7, min_days_left=14)),
                 Conf(f"  sens ${b}: min_size <= 20 only", budget=b, **dict(p2, max_min=20)),
-                Conf(f"  sens ${b}: economics + finance allowed", budget=b, **dict(p2, exclude=())),
+                Conf(f"  sens ${b}: culture + mentions allowed", budget=b, **dict(p2, exclude=TOXIC[:2])),
                 Conf(f"  sens ${b}: no competitor filter", budget=b, **dict(p2, comp_min=0)),
                 Conf(f"  sens ${b}: no topic filter", budget=b, **dict(p2, topic=False)),
                 Conf(f"  sens ${b}: improve price by 1 tick", budget=b, **dict(p2, place="improve")),
