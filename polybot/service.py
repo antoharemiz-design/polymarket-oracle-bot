@@ -74,14 +74,14 @@ def _write_json(path, obj):
 
 class Service:
     def __init__(self, data=None, mode=None, clock=time.time, books_fn=None, rewards_fn=None, trades_fn=None,
-                 geoblock_fn=geoblock):
+                 geoblock_fn=geoblock, gamma_fn=None):
         self.data = data or env("POLYBOT_DATA", "/var/lib/polybot")
         self.mode = (mode or env("POLYBOT_MODE", "paper")).lower()
         self.clock = clock
         self.run_dir = os.path.join(self.data, self.mode)
         os.makedirs(self.run_dir, exist_ok=True)
         os.makedirs(os.path.join(self.data, "logs"), exist_ok=True)
-        self.books_fn, self.rewards_fn, self.trades_fn = books_fn, rewards_fn, trades_fn
+        self.books_fn, self.rewards_fn, self.trades_fn, self.gamma_fn = books_fn, rewards_fn, trades_fn, gamma_fn
         self.geoblock_fn = geoblock_fn
         self.log = self._logger()
         self.test = None
@@ -181,16 +181,47 @@ class Service:
             self.log.info(f"markets from {path}: {len(ms)}")
             return ms
 
-        def sleep(sec):                         # wakes every few seconds: status stays fresh, a stop is seen at once
-            end = time.time() + sec
-            while time.time() < end:
-                if self._sel_stop.is_set():
-                    raise lp.SelectionStopped()
-                self.write_status()
-                time.sleep(min(2.0, max(0.0, end - time.time())))
+        return lp.select(cfg, log=self.log.info, sleep=lambda sec: self._sleep(sec))
+
+    def _sleep(self, sec):
+        """Sleep in a worker thread; wakes every few seconds so status stays fresh and a stop is seen at once."""
+        end = time.time() + sec
+        while time.time() < end:
             if self._sel_stop.is_set():
                 raise lp.SelectionStopped()
-        return lp.select(cfg, log=self.log.info, sleep=sleep)
+            self.write_status()
+            time.sleep(min(2.0, max(0.0, end - time.time())))
+        if self._sel_stop.is_set():
+            raise lp.SelectionStopped()
+
+    def snap_store(self, cfg):
+        return lp.SnapStore(cfg, log=self.log.info, clock=self.clock, rewards_fn=self.rewards_fn,
+                            books_fn=self.books_fn, gamma_fn=self.gamma_fn)
+
+    def warm_up(self, store):
+        """Phase 2 warm-up (research/PREREG_PHASE2.md): a snapshot of every rewarded market's book every
+        snapshot_gap_s until the store holds lookback_h of history; no quotes meanwhile. Runs in a thread; the
+        snapshots are on disk, so a restart continues the warm-up. A stop raises lp.SelectionStopped."""
+        cfg = store.cfg
+        while True:
+            now = self.clock()
+            if store.warm(now):
+                w = store.window(now)
+                self.log.info(f"warm-up done: {len(w)} snapshots over {(w[-1]['ts'] - w[0]['ts']) / 3600:.1f} h")
+                return
+            if store.due(now):
+                try:
+                    sm = store.take(now)
+                except lp.SelectionStopped:
+                    raise
+                except Exception as e:                  # the public API failed even after retries
+                    self.log.warning(f"warm-up snapshot failed ({e!r:.200}); next try in 5 minutes")
+                    self._sleep(min(300.0, cfg.snapshot_gap_s))
+                    continue
+                self.log.info(f"warm-up snapshot {len(store.window(now))}: {sm['n_quotable']} markets quotable, "
+                              f"{sm['n_eligible']} eligible, {sm['n_rewarded']} rewarded")
+                continue
+            self._sleep(max(1.0, store.last_ts() + cfg.snapshot_gap_s - self.clock()))
 
     async def _status_loop(self):
         while True:
@@ -218,6 +249,20 @@ class Service:
             status.cancel()
             self.write_status()
 
+    async def _in_thread(self, fn, stop, *args):
+        """Run fn in a worker thread until it returns or `stop` is set (then it is told to stop and None is returned;
+        what it wrote to disk is kept)."""
+        self._sel_stop.clear()
+        job = asyncio.create_task(asyncio.to_thread(fn, *args))
+        waiter = asyncio.create_task(stop.wait())
+        done, _ = await asyncio.wait({job, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if job not in done:
+            self._sel_stop.set()
+            await asyncio.gather(job, return_exceptions=True)
+            return None, False
+        waiter.cancel()
+        return job.result(), True
+
     async def _main(self, stop):
         cfg = lp.from_env()
         cfg.lp_dir = self.run_dir
@@ -234,27 +279,40 @@ class Service:
                 run["completed"] = run["started"] + run["test_days"] * 86400
                 self.save_run(run)
             return await self._idle(stop, "complete", "run finished; start a new one with: sudo polybot new-run")
+        if run and int(run.get("phase", 1)) != cfg.phase:     # a run keeps the phase (and defaults) it started with
+            cfg = lp.from_env(phase=int(run.get("phase", 1)))
+            cfg.lp_dir = self.run_dir
         mpath = os.path.join(self.run_dir, "markets.json")
         resumed = bool(run)
-        if not run:
+        store = None
+        if cfg.phase == 2:
+            store = self.snap_store(cfg)
+            markets = []
+            if not run:
+                self.phase = "warming"
+                self.write_status()
+                _, finished = await self._in_thread(self.warm_up, stop, store)
+                if not finished:
+                    self.log.info("stop requested during the warm-up; the snapshots taken so far are kept")
+                    return
+                now = self.clock()                      # the run's clock starts when quoting starts, after the warm-up
+                run = {"started": now, "test_days": cfg.test_days, "mode": self.mode, "phase": 2}
+                self.save_run(run)
+                self.log.info(f"new phase 2 run for {cfg.test_days} days: rolling selection every {cfg.rebalance_h:g} h")
+            else:
+                self.log.info(f"resuming phase 2 run started {time.strftime('%Y-%m-%d %H:%M', time.gmtime(run['started']))} UTC")
+        elif not run:
             self.phase = "selecting"
             self.write_status()
-            self._sel_stop.clear()
-            sel = asyncio.create_task(asyncio.to_thread(self.select_markets, cfg))
-            waiter = asyncio.create_task(stop.wait())
-            done, _ = await asyncio.wait({sel, waiter}, return_when=asyncio.FIRST_COMPLETED)
-            if sel not in done:
-                self._sel_stop.set()
+            markets, finished = await self._in_thread(self.select_markets, stop, cfg)
+            if not finished:
                 self.log.info("stop requested during selection; the snapshots taken so far are kept")
-                await asyncio.gather(sel, return_exceptions=True)
                 return
-            waiter.cancel()
-            markets = sel.result()
             if len(markets) < cfg.markets_min:
                 return await self._idle(stop, "error", f"only {len(markets)} markets pass the filters, need {cfg.markets_min}")
             now = self.clock()                          # the run's clock starts when quoting starts, after selection
             _write_json(mpath, {"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "markets": markets})
-            run = {"started": now, "test_days": cfg.test_days, "mode": self.mode}
+            run = {"started": now, "test_days": cfg.test_days, "mode": self.mode, "phase": 1}
             self.save_run(run)
             self.log.info(f"new run: {len(markets)} markets for {cfg.test_days} days")
         else:
@@ -275,7 +333,7 @@ class Service:
             kw["rewards_fn"] = self.rewards_fn
         prior = lp.load_events(self.run_dir, self.mode) if resumed else []
         self.test = lp.LPTest(cfg, ex, journal, markets, log=self.log.info, clock=self.clock,
-                              control_fn=self.control_for_test, **kw)
+                              control_fn=self.control_for_test, store=store, **kw)
         if prior:
             self.log.info(f"positions restored from the journal: {self.test.restore(prior)} fills")
         self.phase = "running"
@@ -313,6 +371,62 @@ def _ago(sec):
     return f"{sec} с" if sec < 120 else f"{sec // 60} мин" if sec < 7200 else f"{sec / 3600:.1f} ч"
 
 
+def _phase2_lines(events, now):
+    """status.md sections of a phase 2 run: the report so far (lp.phase2), the portfolio, exits, last errors."""
+    r = lp.phase2(events)
+    fmt = lambda x, f="{:.2f}": "—" if x is None else f.format(x)
+    reb = [e for e in events if e["event"] == "rebalance"]
+    last = reb[-1] if reb else None
+    wins = [e for e in events if e["event"] == "window"]
+    lastw = wins[-1]["markets"] if wins else {}
+    pos = {}
+    for e in events:
+        if e["event"] == "pnl":
+            pos = e.get("positions") or pos
+    out = ["## Ход прогона (фаза 2)", ""]
+    if last:
+        nxt = last["ts"] + lp.from_env(phase=2).rebalance_h * 3600
+        out.append(f"- переотбор: последний {time.strftime('%m-%d %H:%M UTC', time.gmtime(last['ts']))}, следующий ~"
+                   f"{time.strftime('%H:%M UTC', time.gmtime(nxt))}; рынков {len(last.get('target') or [])}, котировки на "
+                   f"${last.get('quote_cap', 0):.0f}, прогноз M1 ${(last.get('summary') or {}).get('m1_pred', 0):.2f}/день; "
+                   f"переотборов {len(reb)}, обновление портфеля {fmt(r.get('turnover'), '{:.0%}')}")
+    else:
+        out.append("- переотбора ещё не было")
+    out += [f"- 30-минутных окон: {r.get('windows', 0)}; M1 портфеля ${fmt(r.get('m1_usd_day'))}/день, на $100 котировок "
+            f"${fmt(r.get('m1_per100'))}/день; CV {fmt(r.get('cv'), '{:.0%}')}; крупнейшая доля за 24 ч "
+            f"{fmt(r.get('max_share_last24'), '{:.0%}')} (порог 40%); факт / прогноз {fmt(r.get('fact_over_pred'))}",
+            f"- на $100 котировок в день: M1 ${fmt(r.get('m1_per100'))} + рибейты ${fmt(r.get('rebates_per100'))} + "
+            f"переоценка позиций ${fmt(r.get('mtm_per100'))} = **${fmt(r.get('net_per100'))}** (критерий: не меньше $20)",
+            f"- исполнений {r.get('fills', 0)}, контрактов {r.get('contracts', 0):.0f} "
+            f"({fmt(r.get('contracts_per_market_day'), '{:.0f}')} на рынок в сутки); markout 60 с {fmt(r.get('markout60_c'))} ц, "
+            f"p5 {fmt(r.get('markout60_p5_c'))} ц; 600 с {fmt(r.get('markout600_c'))} ц",
+            f"- выходы из рынков {r.get('exits', 0)}, закрытий тейкером {r.get('flattens', 0)} "
+            f"({r.get('flatten_contracts', 0):.0f} контрактов, ${r.get('flatten_cost_usd', 0.0):.2f}), рынков завершено {r.get('retired', 0)}",
+            f"- простой {fmt(r.get('downtime_h'))} ч; запусков процесса {r.get('process_starts', 0)}; ошибок {r.get('errors', 0)}", ""]
+    if last:
+        ms = last.get("markets") or {}
+        target = set(last.get("target") or [])
+        rows = sorted(ms, key=lambda c: -float(ms[c].get("m1_usd_day") or 0.0))
+        out += ["## Портфель", "", "| Рынок | k | прогноз M1, $/день | M1 последнего окна | котировки, $ | до конца, ч | YES / NO |",
+                "|---|---|---|---|---|---|---|"]
+        for c in rows[:25]:
+            m = ms[c]
+            try:
+                hl = (lp._ts(m["end"]) - now) / 3600 if m.get("end") else None
+            except Exception:
+                hl = None
+            yn = pos.get(c) or [0, 0]
+            name = (m.get("q") or c)[:60] + ("" if c in target else " (выход)")
+            out.append(f"| {name} | {m.get('k', 1)} | {fmt(m.get('m1_usd_day'))} | {fmt((lastw.get(c) or {}).get('m1_usd_day'))} | "
+                       f"{fmt(m.get('quote_cap'), '{:.0f}')} | {fmt(hl, '{:.1f}')} | {yn[0]:.0f} / {yn[1]:.0f} |")
+        if len(rows) > 25:
+            out.append(f"| … ещё {len(rows) - 25} | | | | | | |")
+        out.append("")
+    errs = [e for e in events if e["event"] == "error"][-5:]
+    out += ["## Последние ошибки", ""] + ([f"- {time.strftime('%m-%d %H:%M', time.gmtime(e['ts']))} {e['error'][:160]}" for e in errs] or ["- нет"]) + [""]
+    return out
+
+
 def render_status(data, now=None, log_lines=50):
     now = now or time.time()
     st = _read_json(os.path.join(data, "service_status.json"), {}) or {}
@@ -334,7 +448,16 @@ def render_status(data, now=None, log_lines=50):
         tot = (st["run_ends"] - st["run_started"]) / 3600
         run_line = (f"начат {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(st['run_started']))}, "
                     f"прошло {min(el, tot):.1f} ч из {tot:.0f}" + (", завершён" if st.get("run_completed") else f", осталось {max(0, tot - el):.1f} ч"))
-    cfg = lp.from_env()
+    run = _read_json(os.path.join(run_dir, "run.json"), {}) or {}
+    cfg = lp.from_env(phase=run.get("phase"))
+    warm_line = "warming — прогрев: снимки книг всех рынков с наградой, без котировок"
+    ws = _read_json(os.path.join(run_dir, "snaps", "state.json"), {}) or {}
+    if ws:
+        left = max(0.0, cfg.lookback_h - (now - ws["first"]) / 3600) if ws.get("first") else cfg.lookback_h
+        warm_line = (f"warming — прогрев без котировок: снимок {ws.get('window', 0)} из {ws.get('need', 48)} "
+                     f"(каждые {cfg.snapshot_gap_s / 60:.0f} мин), "
+                      f"до старта котирования ~{left:.1f} ч; последний снимок {_ago(now - ws['ts'])} назад, "
+                      f"рынков котируемо {ws.get('n_quotable', 0)} из {ws.get('n_eligible', 0)}")
     sel_line = "selecting — отбор рынков"
     spath = os.path.join(run_dir, "selection", "snapshots.jsonl")
     if os.path.exists(spath):
@@ -345,7 +468,7 @@ def render_status(data, now=None, log_lines=50):
     else:
         sel_line += f": {cfg.select_snapshots} снимков книги каждые {cfg.select_gap_s / 60:.0f} мин"
     rows = [("Бот", f"✅ работает ({mode})" if alive else f"❌ не отвечает {_ago(age)}"),
-            ("Фаза", {"selecting": sel_line, "running": "running — котирует",
+            ("Фаза", {"selecting": sel_line, "warming": warm_line, "running": "running — котирует",
                       "complete": "complete — прогон завершён"}.get(st.get("phase"), st.get("phase", "—"))
              + (f" — {st['detail']}" if st.get("detail") else "")),
             ("Прогон", run_line),
@@ -360,7 +483,9 @@ def render_status(data, now=None, log_lines=50):
         rows.append(("Геоблок", "заблокирован" if st.get("geoblocked") else f"не заблокирован ({st.get('country') or '—'})"))
     out += ["| | |", "|---|---|"] + [f"| {a} | {b} |" for a, b in rows] + [""]
     events = lp.load_events(run_dir, mode)
-    if events:
+    if events and cfg.phase == 2:
+        out += _phase2_lines(events, now)
+    elif events:
         qcap = sum(float(m.get("quote_cap") or 0.0) for m in markets.values()) or None
         r = lp.phase1(events, m1_per_100_min=cfg.m1_per_100_min, quote_cap_usd=qcap)
         wins = [e for e in events if e["event"] == "window"]

@@ -7,7 +7,7 @@
   python -m polybot outcomes REC_DIR               fetch resolutions for recorded markets
   python -m polybot service                        long-running server service (systemd unit polybot), see polybot/service.py
   python -m polybot status-md                      status.md of the server service
-  python -m polybot lp-select | lp-paper | lp-live --i-understand-live | lp-earnings | lp-report
+  python -m polybot lp-select | lp-paper | lp-live --i-understand-live | lp-earnings | lp-report | lp-phase1 | lp-phase2
                                                    liquidity-rewards test (H10), see polybot/lp.py
 """
 import asyncio

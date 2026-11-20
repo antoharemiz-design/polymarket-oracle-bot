@@ -36,7 +36,7 @@ def make(tmp, mode="paper", **kw):
     with open(mfile, "w") as f:
         json.dump({"markets": [dict(m) for m in MARKETS]}, f)
     base = {"POLYBOT_MARKETS": mfile, "LP_POLL_S": "0.01", "LP_MARKETS_MIN": "1", "LP_SAMPLE_S": "0.05",
-            "LP_WINDOW_S": "1800"}
+            "LP_WINDOW_S": "1800", "LP_PHASE": "1"}
     base.update(kw)
     return Env(**base), dict(data=tmp, mode=mode, books_fn=lambda toks: BOOK,
                              rewards_fn=lambda: {"C1": {"v": 4.5, "min": 20.0, "rate": 10.0}}, trades_fn=lambda c: [],
@@ -162,7 +162,7 @@ class ServiceTest(unittest.TestCase):
                        "acceptingOrders": True, "clobTokenIds": json.dumps(["YB", "NB"]), "createdAt": "2026-01-01T00:00:00Z",
                        "endDate": "2027-06-01T00:00:00Z", "events": [{"id": "EB"}]}}
         busy = {"YB": ([(0.48, 100.0), (0.47, 100.0)], [(0.52, 100.0), (0.53, 100.0)], 0.01)}
-        base = {"POLYBOT_MARKETS": "", "LP_SELECT_SNAPSHOTS": "2", "LP_SELECT_GAP_S": "3600", "LP_MARKETS_MIN": "1",
+        base = {"POLYBOT_MARKETS": "", "LP_PHASE": "1", "LP_SELECT_SNAPSHOTS": "2", "LP_SELECT_GAP_S": "3600", "LP_MARKETS_MIN": "1",
                 "LP_TEST_DAYS": str(30 / 86400), "LP_POLL_S": "0.01", "LP_SAMPLE_S": "0.05"}
         kw = dict(data=tmp, mode="paper", books_fn=lambda toks: busy, rewards_fn=lambda: rew, trades_fn=lambda c: [],
                   geoblock_fn=lambda: {"blocked": False, "country": "FI"})
@@ -186,6 +186,83 @@ class ServiceTest(unittest.TestCase):
         ev = events(tmp)
         self.assertIn("place", [x["event"] for x in ev])
         self.assertGreater(next(x for x in ev if x["event"] == "start")["quote_cap"], 0)
+
+
+class Phase2ServiceTest(unittest.TestCase):
+    """Phase 2: warm-up (snapshots, no quotes), then quoting with rebalances; stop and resume keep everything."""
+
+    def setup(self):
+        tmp = tempfile.mkdtemp()
+        end = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 5 * 86400))
+        rew = {"CB": {"rate": 10.0, "v": 4.5, "min": 20.0}, "CX": {"rate": 10.0, "v": 4.5, "min": 20.0}}
+        gm = {"CB": {"conditionId": "CB", "question": "Will the high in Paris be 15C?", "events": [{"id": "EB"}],
+                     "clobTokenIds": json.dumps(["YB", "NB"]), "feesEnabled": True, "feeType": "weather_fees",
+                     "feeSchedule": {"rate": 0.05, "rebateRate": 0.25}, "createdAt": "2026-01-01T00:00:00Z",
+                     "endDate": end, "active": True, "closed": False, "acceptingOrders": True},
+              "CX": {"conditionId": "CX", "question": "Will US GDP growth be above 2%?", "events": [{"id": "EX"}],
+                     "clobTokenIds": json.dumps(["YX", "NX"]), "feesEnabled": True, "feeType": "economics_fees",
+                     "feeSchedule": {"rate": 0.05, "rebateRate": 0.25}, "createdAt": "2026-01-01T00:00:00Z",
+                     "endDate": end, "active": True, "closed": False, "acceptingOrders": True}}
+        busy = {t: ([(0.48, 100.0), (0.47, 100.0)], [(0.52, 100.0), (0.53, 100.0)], 0.01) for t in ("YB", "YX")}
+        base = {"POLYBOT_MARKETS": "", "LP_PHASE": "2", "LP_LOOKBACK_H": str(1800 * 2 / 3600), "LP_SNAPSHOT_GAP_S": "1800",
+                "LP_TEST_DAYS": str(30 / 86400), "LP_POLL_S": "0.01", "LP_SAMPLE_S": "0.05"}
+        kw = dict(data=tmp, mode="paper", books_fn=lambda toks: {t: busy[t] for t in toks if t in busy}, rewards_fn=lambda: rew,
+                  trades_fn=lambda c: [], geoblock_fn=lambda: {"blocked": False, "country": "FI"}, gamma_fn=lambda conds: gm)
+        return tmp, base, kw
+
+    def test_warm_up_stops_resumes_then_quotes(self):
+        tmp, base, kw = self.setup()
+        rows = os.path.join(tmp, "paper", "snaps", "rows.jsonl")
+        with Env(**base):
+            t0 = time.time()
+            asyncio.run(run_for(service.Service(**kw), 0.5))   # stop while waiting 30 min for snapshot 2
+            self.assertLess(time.time() - t0, 10)
+            with open(rows) as f:
+                self.assertEqual(len(f.readlines()), 1)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "paper", "run.json")))
+            st = service.render_status(tmp)
+            self.assertIn("прогрев без котировок: снимок 1 из 2", st)
+        with Env(**dict(base, LP_SNAPSHOT_GAP_S="0.2", LP_LOOKBACK_H=str(0.4 / 3600))):
+            asyncio.run(run_for(service.Service(**kw), 2.0))   # continues: one more snapshot, then quoting
+        run = rj(os.path.join(tmp, "paper", "run.json"))
+        self.assertEqual(run["phase"], 2)
+        ev = events(tmp)
+        reb = [x for x in ev if x["event"] == "rebalance"]
+        self.assertTrue(reb)
+        self.assertEqual(reb[0]["target"], ["CB"])         # economics excluded
+        self.assertEqual(reb[0]["markets"]["CB"]["no"], "NB")
+        self.assertIn("place", [x["event"] for x in ev])
+        self.assertIn("snapshot", [x["event"] for x in ev])
+        with Env(**dict(base, LP_SNAPSHOT_GAP_S="0.2", LP_LOOKBACK_H=str(0.4 / 3600))):
+            st = service.render_status(tmp)
+        self.assertIn("Ход прогона (фаза 2)", st)
+        self.assertIn("Will the high in Paris", st)
+        self.assertIn("на $100 котировок в день", st)
+
+    def test_resume_phase2_rebuilds_portfolio(self):
+        tmp, base, kw = self.setup()
+        fast = dict(base, LP_SNAPSHOT_GAP_S="0.2", LP_LOOKBACK_H=str(0.4 / 3600), LP_TEST_DAYS=str(60 / 86400))
+        with Env(**fast):
+            asyncio.run(run_for(service.Service(**kw), 1.5))
+            asyncio.run(run_for(service.Service(**kw), 0.5))
+        ev = events(tmp)
+        self.assertEqual(sum(1 for x in ev if x["event"] == "start"), 2)
+        self.assertIn("restored", [x["event"] for x in ev])
+        self.assertEqual(rj(os.path.join(tmp, "paper", "run.json"))["phase"], 2)
+
+    def test_phase1_run_keeps_phase1_settings(self):
+        tmp = tempfile.mkdtemp()
+        env, kw = make(tmp)
+        with env:
+            asyncio.run(run_for(service.Service(**kw), 0.3))  # a phase 1 run (LP_PHASE=1)
+        run = rj(os.path.join(tmp, "paper", "run.json"))
+        self.assertEqual(run["phase"], 1)
+        env2, _ = make(tmp, LP_PHASE="2")
+        with env2:
+            asyncio.run(run_for(service.Service(**kw), 0.3))  # the server now defaults to phase 2: the run stays phase 1
+        starts = [x for x in events(tmp) if x["event"] == "start"]
+        self.assertEqual(starts[-1]["config"]["phase"], 1)
+        self.assertEqual(starts[-1]["config"]["quote_budget_usd"], 100.0)
 
 
 if __name__ == "__main__":
