@@ -2,7 +2,7 @@
 public trade tape, to compare exit rules on the same history (user's request, 22 Nov).
 
     python research/tools/lp_replay.py SCAN_DIR MARKETS.json OUT.json --from EPOCH --to EPOCH [--step 10]
-                                       [--variants base,fifo,...]
+                                       [--variants base,fifo,...] [--guard]
 
 MARKETS.json: [{"cond": ..., "k": 1..5}, ...] — each market is replayed alone at N = k x rewards_min_size.
 Books: the latest lp_scan snapshot at or before the replay time (30 min apart), shifted by the change of the 1-minute
@@ -10,6 +10,9 @@ mid from the public price history since that snapshot, so the quoted prices foll
 Fills: PaperExec's rule (a public taker trade through our price fills us first), with the replay clock.
 Per variant and market: contracts filled, closed by taker (contracts, cost), share closed by taker, M1 earned,
 rebates, mark-to-market at the end. Variants are LPConfig overrides on top of the phase 2 settings.
+--guard: the replayed book lags in fast moves (1-minute mid), so our quote can sit through the real market and catch
+trades a live bot, re-pricing to the real book, would not; with --guard a fill is skipped when our bid is above (ask
+below) the real 1-minute mid at the trade time.
 """
 import asyncio
 import bisect
@@ -46,10 +49,11 @@ class Clock:
 class ReplayExec(lp.PaperExec):
     """PaperExec on the replay clock: orders carry the replay time, the tape is cut at the replay time."""
 
-    def __init__(self, tape, clock, every_s):
+    def __init__(self, tape, clock, every_s, guard=None):
         super().__init__(trades_fn=lambda c: [r for r in tape.get(c, []) if r[0] <= clock()], every_s=every_s)
         self.clock = clock
         self.since = clock()
+        self.guard = guard            # (ts, side, price) -> False: skip the fill (our quote was stale through the mid)
 
     async def place(self, m, side, price, size):
         self.n += 1
@@ -77,6 +81,9 @@ class ReplayExec(lp.PaperExec):
                 if not hit:
                     continue
                 oid, o = next((oid, o) for oid, o in live if o["side"] == hit)
+                if self.guard is not None and not self.guard(ts, hit, o["price"]):
+                    self.skipped += 1
+                    continue
                 q = min(o["rem"], sz); o["rem"] -= q
                 done = o["rem"] <= 1e-9
                 if done:
@@ -112,7 +119,7 @@ def fetch_mids(token, t0, t1):
     return [t for t, _ in h], [p for _, p in h]
 
 
-def replay_market(m, snaps, tape, mids, t0, t1, overrides, step_s):
+def replay_market(m, snaps, tape, mids, t0, t1, overrides, step_s, guard=False):
     cond = m["cond"]
     tmp = tempfile.mkdtemp()
     cfg = lp.phase2_config(lp_dir=tmp, poll_s=step_s, sample_s=60.0, **overrides)
@@ -145,7 +152,12 @@ def replay_market(m, snaps, tape, mids, t0, t1, overrides, step_s):
         r = s["rw"].get(cond) if s else None
         return {cond: {"rate": r[0], "v": r[1], "min": r[2]} if r else None}
 
-    ex = ReplayExec({cond: tape}, clock, every_s=cfg.fills_every_s)
+    def fresh(ts, side, price):      # a live bot re-prices to the real book: its bid is not above the mid, its ask not below
+        mid = mid_at(ts)
+        return mid is None or (price <= mid + 1e-9 if side == "bid" else price >= mid - 1e-9)
+
+    ex = ReplayExec({cond: tape}, clock, every_s=cfg.fills_every_s, guard=fresh if guard else None)
+    ex.skipped = 0
     j = lp.Journal(os.path.join(tmp, "paper.jsonl"))
     test = lp.LPTest(cfg, ex, j, [m], books_fn=books_fn, log=lambda *a: None, clock=clock)
 
@@ -166,7 +178,8 @@ def replay_market(m, snaps, tape, mids, t0, t1, overrides, step_s):
     return {"filled": filled, "fills": len(fills), "taker_contracts": taker, "taker_n": len(flat),
             "taker_cost": -sum(e.get("cost", 0.0) for e in flat), "m1_usd": sum(e.get("usd", 0.0) for e in ev if e["event"] == "m1"),
             "rebate": sum(e.get("rebate", 0.0) for e in fills), "pnl": test.pnl(),
-            "open": abs(s.pos()) if s else 0.0, "taker_share": taker / filled if filled else None}
+            "open": abs(s.pos()) if s else 0.0, "taker_share": taker / filled if filled else None,
+            "stale_skipped": ex.skipped}
 
 
 def main():
@@ -174,6 +187,7 @@ def main():
     arg = lambda k, d: type(d)(sys.argv[sys.argv.index(k) + 1]) if k in sys.argv else d
     t0, t1, step = arg("--from", 0.0), arg("--to", 0.0), arg("--step", 10.0)
     names = arg("--variants", ",".join(VARIANTS)).split(",")
+    guard = "--guard" in sys.argv          # skip fills where our quote is through the real 1-min mid (replay staleness)
     snaps = load_snaps(scan, t0, t1)
     meta = {}
     for f in sorted(x for x in os.listdir(scan) if x.startswith("meta_")):
@@ -193,7 +207,7 @@ def main():
              "rebate_rate": mm.get("rebate_rate") or 0.0, "quote_cap": k * mn}
         tape, mids = fetch_tape(c, t0, t1), fetch_mids(mm["token"], t0 - 3600, t1)
         for vname in names:
-            r = replay_market(m, snaps, tape, mids, t0, t1, VARIANTS[vname], step)
+            r = replay_market(m, snaps, tape, mids, t0, t1, VARIANTS[vname], step, guard)
             r.update(q=(mm.get("question") or "")[:60], k=k, N=k * mn, trades=len(tape))
             res[vname][c] = r
             print(f"{vname:24s} {r['q'][:44]:44s} k={k} trades {len(tape):4d} filled {r['filled']:6.0f} taker {r['taker_contracts']:5.0f} "

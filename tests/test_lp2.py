@@ -752,3 +752,118 @@ class Phase3ExitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _filler_titles(n=600):
+    """Distinct weather-like event titles: the common words (temperature, november) are not rare, the town is."""
+    out = {}
+    for i in range(n):
+        town = "".join(chr(97 + (i // 26 ** j) % 26) for j in range(3)) + "ville"
+        out[f"EF{i}"] = f"Highest temperature in {town} on November 22?"
+    return out
+
+
+class Phase3SelectionTest(unittest.TestCase):
+    """Phase 3 selection filters (research/PHASE3_PLAN.md): related events, one-sided flow, flow-sized k."""
+
+    def test_related_groups(self):
+        titles = dict(_filler_titles(), R="Which math problems will AI solve in 2026?",
+                      M="How many more Millennium Prize Problems will AI solve in 2026?",
+                      B1="Highest temperature in Busan on November 22?", B2="Highest temperature in Busan on November 23?")
+        g = lp.related_groups(titles)
+        self.assertEqual(g["R"], g["M"])                   # problems + solve
+        self.assertNotEqual(g["B1"], g["B2"])              # one rare word (busan) only
+        self.assertEqual(len(set(g.values())), len(titles) - 1)
+
+    def test_flow_stats(self):
+        tr = [(100, 0, "B", 0.5, 30.0, "a"),               # buys YES (capped at n = 20)
+              (400, 0, "S", 0.5, 10.0, "b"),               # sells YES
+              (5000, 1, "B", 0.5, 5.0, "c"),               # buys NO = sells YES; less than 60 min before t1
+              (7000, 0, "B", 0.5, 5.0, "d"),
+              (9000, 0, "B", 0.5, 5.0, "e")]               # after t1
+        f = lp.flow_stats(tr, 0, 7200, 20)
+        self.assertEqual(f["trades"], 4)
+        self.assertAlmostEqual(f["buy_yes_share"], 25 / 40)
+        self.assertAlmostEqual(f["opp60"], 20 / 30)        # the buy at 100 s meets the sell at 400 s; the sell at 400 s
+        self.assertAlmostEqual(f["side_per_30m"], 15 / 4)  # waits 6600 s; trades of the last hour do not count
+        self.assertEqual(lp.flow_stats([], 0, 7200, 20)["trades"], 0)
+
+    def test_flow_keep(self):
+        cfg = lp.phase2_config()
+        f = {"trades": 50, "buy_yes_share": 0.5, "opp60": 0.9, "side_per_30m": 45.0}
+        self.assertEqual(lp.flow_keep(f, 20, cfg), 2)      # N = k x 20 <= 45 contracts per 30 min
+        self.assertEqual(lp.flow_keep(dict(f, side_per_30m=1000.0), 20, cfg), cfg.kmax)
+        self.assertEqual(lp.flow_keep(dict(f, side_per_30m=10.0), 20, cfg), 0)
+        self.assertEqual(lp.flow_keep(dict(f, buy_yes_share=0.85), 20, cfg), 0)
+        self.assertEqual(lp.flow_keep(dict(f, buy_yes_share=0.15), 20, cfg), 0)
+        self.assertEqual(lp.flow_keep(dict(f, opp60=0.7), 20, cfg), 0)
+        self.assertEqual(lp.flow_keep({"trades": 0}, 20, cfg), 0)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        self.metas = {c: meta(c) for c in ("X", "Y", "Z")}
+        self.rw = {c: {"rate": 10.0, "v": 4.5, "min": 20.0} for c in self.metas}
+        self.books = {f"Y{c}": ([(0.48, 100.0), (0.47, 100.0)], [(0.52, 100.0), (0.53, 100.0)], 0.01) for c in self.metas}
+        self.fetched = []
+
+    def gamma(self, conds):
+        return {c: {"conditionId": c, "question": self.metas[c]["question"],
+                    "events": [{"id": self.metas[c]["event"], "title": self.metas[c].get("title")}],
+                    "clobTokenIds": json.dumps([f"Y{c}", f"N{c}"]), "feesEnabled": True, "feeType": "weather_fees",
+                    "feeSchedule": {"rate": 0.05, "rebateRate": 0.25}, "createdAt": self.metas[c]["created"],
+                    "endDate": self.metas[c]["end"], "active": True, "closed": False, "acceptingOrders": True}
+                for c in conds if c in self.metas}
+
+    def trades(self, c):
+        self.fetched.append(c)
+        now = NOW + 4 * 1800
+        out = []
+        for i in range(120):                               # one trade a minute over the 2 h lookback
+            t = now - 7200 + 30 + i * 60
+            buy = True if c == "Y" else i % 2 == 0         # Y: every taker buys YES
+            out.append((t, 0, "B" if buy else "S", 0.5, 20.0 if c == "X" else 2.7, f"{c}{i}"))
+        return out
+
+    def store(self, **kw):
+        cfg = lp.phase2_config(lp_dir=self.tmp, lookback_h=2.0, max_share=1.0, **kw)
+        return lp.SnapStore(cfg, log=lambda *a: None, clock=self.clock, rewards_fn=lambda: self.rw,
+                            books_fn=lambda toks: {t: self.books[t] for t in toks if t in self.books}, gamma_fn=self.gamma,
+                            trades_fn=self.trades)
+
+    def ranked(self, **kw):
+        st = self.store(**kw)
+        for i in range(5):
+            st.take(NOW + i * 1800)
+        return st, st.rank(NOW + 4 * 1800)
+
+    def test_flow_filter_in_rank(self):
+        st, (target, summary) = self.ranked(flow_filter=1)
+        k = {m["cond"]: m["k"] for m in target}
+        self.assertNotIn("Y", k)                           # one-sided
+        self.assertEqual(k["Z"], 2)                        # 60 sells x 2.7 over 2 h = 40.5 a side per 30 min
+        self.assertEqual(k["X"], 5)                        # dense flow: kmax
+        self.assertEqual((summary["flow_checked"], summary["flow_dropped"]), (3, 1))
+        self.assertEqual(st.flow["Y"]["k_max"], 0)
+
+    def test_flow_filter_off_by_default(self):
+        st, (target, summary) = self.ranked()
+        self.assertEqual(self.fetched, [])
+        self.assertIn("Y", {m["cond"] for m in target})
+        self.assertNotIn("flow_checked", summary)
+
+    def test_related_filter_in_rank(self):
+        self.metas["X"]["title"] = "Which math problems will AI solve in 2026?"
+        self.metas["Y"]["title"] = "How many more Millennium Prize Problems will AI solve in 2026?"
+        st = self.store(related_filter=1)
+        st.take(NOW)
+        for e, t in _filler_titles().items():              # the rest of the rewarded events (word frequencies)
+            st.meta[e] = {"event": e, "event_title": t}
+        for i in range(1, 5):
+            st.take(NOW + i * 1800)
+        target, summary = st.rank(NOW + 4 * 1800)
+        conds = {m["cond"] for m in target}
+        self.assertEqual(len(conds & {"X", "Y"}), 1)
+        self.assertIn("Z", conds)
+        self.assertEqual(summary["groups_merged"], 1)
+        self.assertEqual(st.meta["X"]["event_title"], "Which math problems will AI solve in 2026?")

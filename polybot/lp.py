@@ -20,8 +20,11 @@ needed to quote. Net position YES - NO is capped at 3N; balanced YES+NO pairs ar
 NOT run against the exchange in the development environment (no trading keys there).
 """
 import asyncio
+import bisect
+import collections
 import dataclasses
 import gzip
+import itertools
 import json
 import os
 import re
@@ -91,6 +94,13 @@ class LPConfig:
     exit_mid_hi: float = 0.90          # clear before resolution) starts the market's exit
     pos_limit_usd: float = 1e9         # per market: the position may not grow beyond this many dollars
     snapshots_keep_h: float = 30.0     # snapshot files older than this are deleted
+    related_filter: int = 0            # phase 3: events whose titles share >= 2 rare words (related_groups) count as
+                                       # one event, so the portfolio holds one market of them
+    flow_filter: int = 0               # phase 3: selection uses the public taker flow of the lookback (flow_stats)
+    flow_one_sided: float = 0.80       #   share of contracts bought YES above this or below 1 - this: left out
+    flow_min_opp60: float = 0.75       #   share of contracts followed by an opposite trade within 60 min below: left out
+    flow_size_mult: float = 1.0        #   N <= this x the smaller side's contracts per 30 min (k is cut to fit)
+    flow_top: int = 60                 #   the tape is fetched for this many best candidates (M1 per dollar at k = 1)
 
 
 # phase 2 settings (research/PREREG_PHASE2.md, user's decisions of 20 November); LP_* variables still override them
@@ -575,12 +585,13 @@ def allocate(rows, budget, kmax, markets_max, max_share):
             banned.add(top["cond"])
 
 
-def rank(snaps, events, kmax, comp_min, budget, markets_max, max_share, cands=None):
+def rank(snaps, events, kmax, comp_min, budget, markets_max, max_share, cands=None, adjust=None):
     """Portfolio from the snapshot rows of the selection window (snap_rows of each snapshot, oldest first).
     Per market: M1 at each k = median over all snapshots (0 where we could not quote), capital at each k = median
     over the snapshots where we could quote, competitor levels = median (0 where we could not quote).
     Kept: median competitor levels >= comp_min and median M1 at k = 1 above 0; then allocate().
     cands: the markets considered (default: every market quotable at least once in the window).
+    adjust: phase 3, rows -> rows before allocate() (the flow filter drops markets and cuts k).
     Returns (all kept rows, chosen rows)."""
     cands = sorted({c for s in snaps for c in s}) if cands is None else cands
     rows = []
@@ -596,7 +607,81 @@ def rank(snaps, events, kmax, comp_min, budget, markets_max, max_share, cands=No
             continue
         rows.append({"cond": c, "event": events.get(c, c), "m1_usd_day": m1_k[0], "quote_cap": cap_k[0], "comp": comp,
                      "m1_k": m1_k, "cap_k": cap_k, "k": 1, "quotable_share": len(seen) / len(vals)})
+    if adjust is not None:
+        rows = adjust(rows)
     return rows, allocate(rows, budget, kmax, markets_max, max_share)
+
+
+WORD = re.compile(r"[a-z]{4,}")
+
+
+def _words(title):
+    return {w[:-1] if w.endswith("s") and len(w) > 4 else w for w in WORD.findall((title or "").lower())}
+
+
+def related_groups(titles, max_df=0.002, min_shared=2):
+    """Phase 3: events that are one bet in substance (\"Which math problems will AI solve in 2026?\" and \"How many
+    more Millennium Prize Problems will AI solve in 2026?\"). Words of 4+ letters (plural s dropped) that appear in
+    at most max(2, max_df x events) titles are rare; events sharing >= min_shared rare words are linked, and linked
+    events form one group. titles: {event id: title} over all rewarded events -> {event id: group id}."""
+    words = {e: _words(t) for e, t in titles.items()}
+    df = collections.Counter(w for ws in words.values() for w in ws)
+    lim = max(2.0, max_df * len(words))
+    by_word = collections.defaultdict(list)
+    for e, ws in words.items():
+        for w in ws:
+            if df[w] <= lim:
+                by_word[w].append(e)
+    shared = collections.Counter()
+    for es in by_word.values():
+        for a, b in itertools.combinations(sorted(es), 2):
+            shared[(a, b)] += 1
+    parent = {e: e for e in titles}
+
+    def find(e):
+        while parent[e] != e:
+            parent[e] = parent[parent[e]]
+            e = parent[e]
+        return e
+    for (a, b), n in sorted(shared.items()):
+        if n >= min_shared:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+    return {e: find(e) for e in titles}
+
+
+def flow_stats(trades, t0, t1, n):
+    """Phase 3: the public taker flow of a market over [t0, t1). trades: taker_trades() rows. Each trade counts as
+    min(size, n) contracts (what it could fill of a quote of n). Returns {trades, buy_yes_share (contracts where the
+    taker bought YES or sold NO), opp60 (share of contracts followed by an opposite-direction trade within 60 min;
+    only trades at least 60 min before t1 count), side_per_30m (the smaller direction's contracts per 30 min)}."""
+    rows = sorted((ts, (sd == "B") == (oi == 0), float(sz)) for ts, oi, sd, px, sz, *_ in trades if t0 <= ts < t1)
+    if not rows:
+        return {"trades": 0, "buy_yes_share": None, "opp60": None, "side_per_30m": 0.0}
+    tot = sum(min(z, n) for _, _, z in rows)
+    buy = sum(min(z, n) for _, b, z in rows if b)
+    ts_b = [t for t, b, _ in rows if b]
+    ts_s = [t for t, b, _ in rows if not b]
+    den = ok = 0.0
+    for t, b, z in rows:
+        if t > t1 - 3600:
+            continue
+        opp = ts_s if b else ts_b
+        j = bisect.bisect_right(opp, t)
+        den += min(z, n)
+        ok += min(z, n) if j < len(opp) and opp[j] - t <= 3600 else 0.0
+    return {"trades": len(rows), "buy_yes_share": buy / tot if tot else None, "opp60": ok / den if den else None,
+            "side_per_30m": min(buy, tot - buy) / ((t1 - t0) / 1800)}
+
+
+def flow_keep(f, n_unit, cfg):
+    """Phase 3 flow filter for one market: the largest k allowed (0 = left out). n_unit: rewards_min_size."""
+    if not f or not f["trades"] or f["buy_yes_share"] is None or f["opp60"] is None:
+        return 0
+    if not (1 - cfg.flow_one_sided <= f["buy_yes_share"] <= cfg.flow_one_sided) or f["opp60"] < cfg.flow_min_opp60:
+        return 0
+    return min(cfg.kmax, int(cfg.flow_size_mult * f["side_per_30m"] / n_unit + 1e-9))
 
 
 def grid(entries, gap_s=1800.0, key=lambda e: e["ts"]):
@@ -614,6 +699,7 @@ def meta_of(gm):
     fs = gm.get("feeSchedule") or {}
     toks = json.loads(gm["clobTokenIds"]) if gm.get("clobTokenIds") else [None, None]
     return {"question": gm.get("question"), "event": str(ev.get("id") or gm.get("conditionId")), "token": toks[0],
+            "event_title": ev.get("title"),
             "no": toks[1] if len(toks) > 1 else None,
             "fee_type": gm.get("feeType") if gm.get("feesEnabled") else None,
             "fee_rate": float(fs.get("rate") or 0.0) if gm.get("feesEnabled") else 0.0,
@@ -642,9 +728,12 @@ class SnapStore:
 
     META_EVERY_S = 6 * 3600
 
-    def __init__(self, cfg: LPConfig, log=print, clock=time.time, rewards_fn=None, books_fn=None, gamma_fn=None):
+    def __init__(self, cfg: LPConfig, log=print, clock=time.time, rewards_fn=None, books_fn=None, gamma_fn=None,
+                 trades_fn=None):
         self.cfg, self.log, self.clock = cfg, log, clock
         self.rewards_fn, self.books_fn, self.gamma_fn = rewards_fn or rewards_config, books_fn or books, gamma_fn or gamma_markets
+        self.trades_fn = trades_fn or (lambda c: taker_trades(c, 1000))
+        self.flow = {}                                     # phase 3: flow_stats of the last rank, for the journal
         self.dir = os.path.join(cfg.lp_dir, "snaps")
         os.makedirs(self.dir, exist_ok=True)
         self.rows_path, self.meta_path = os.path.join(self.dir, "rows.jsonl"), os.path.join(self.dir, "meta.json")
@@ -769,8 +858,48 @@ class SnapStore:
         left = cfg.min_hours_left if cfg.exit_at_end else -1e6
         cands = sorted(c for c in first if eligible(self.meta.get(c), now, self.exclude, min_hours_left=left))
         events = {c: (self.meta.get(c) or {}).get("event", c) for c in cands}
+        groups_merged = 0
+        if cfg.related_filter:
+            titles = {}
+            for c, m in self.meta.items():
+                titles.setdefault(m.get("event", c), m.get("event_title") or m.get("question") or "")
+            g = related_groups(titles)
+            events = {c: g.get(e, e) for c, e in events.items()}
+            groups_merged = len({(self.meta.get(c) or {}).get("event", c) for c in cands}) - len(set(events.values()))
+        adjust = None
+        if cfg.flow_filter:
+            last_q = {}
+            for e in w:
+                last_q.update(e["q"])
+
+            def adjust(rows):
+                self.flow = {}
+                best = sorted(rows, key=lambda x: -x["m1_k"][0] / max(x["cap_k"][0], 1e-9))[:cfg.flow_top]
+                out = []
+                for x in best:
+                    c = x["cond"]
+                    unit = last_q[c][2] if c in last_q else None
+                    if not unit:
+                        continue
+                    try:
+                        tr = self.trades_fn(c)
+                    except Exception as e:                 # no tape: the market is left out this time
+                        self.log(f"flow {c[:10]}: {e!r:.100}")
+                        continue
+                    t0 = now - cfg.lookback_h * 3600
+                    if len(tr) >= 1000:                    # newest 1000 trades only: the window is what they cover
+                        t0 = max(t0, min(r[0] for r in tr))
+                    f = flow_stats(tr, t0, now, unit)
+                    kc = flow_keep(f, unit, cfg)
+                    self.flow[c] = dict(f, k_max=kc)
+                    if kc < 1:
+                        continue
+                    if kc < cfg.kmax:                      # no gain beyond kc: allocate() stops there
+                        x = dict(x, m1_k=x["m1_k"][:kc] + [x["m1_k"][kc - 1]] * (cfg.kmax - kc))
+                    out.append(x)
+                return out
         rows, chosen = rank(snaps, events, cfg.kmax, cfg.min_comp_levels, cfg.quote_budget_usd, cfg.markets_max,
-                            cfg.max_share, cands=cands)
+                            cfg.max_share, cands=cands, adjust=adjust)
         out = []
         for x in chosen:
             c, m = x["cond"], self.meta[x["cond"]]
@@ -785,6 +914,11 @@ class SnapStore:
         summary = {"snapshots": len(w), "span_h": (w[-1]["ts"] - w[0]["ts"]) / 3600 if w else 0.0, "candidates": len(cands),
                    "passed": len(rows), "markets": len(out), "quote_cap": sum(x["quote_cap"] for x in out), "m1_pred": tot,
                    "largest_share": max((x["m1_usd_day"] / tot for x in out), default=0.0) if tot else 0.0}
+        if cfg.related_filter:
+            summary["groups_merged"] = groups_merged
+        if cfg.flow_filter:
+            summary["flow_checked"] = len(self.flow)
+            summary["flow_dropped"] = sum(1 for f in self.flow.values() if f["k_max"] < 1)
         return out, summary
 
 
