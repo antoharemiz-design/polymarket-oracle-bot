@@ -217,21 +217,33 @@
 - **Итог** — предрегистрация фазы 3 с прогнозом и новый paper на VPS. Решения пользователя: какие правила
   берём и когда запускаем.
 
-## Что нужно от пользователя в конце теста
+## Решения пользователя (22 ноября)
 
-Вывод двух команд на VPS — только чтение журнала, бот не меняется:
+- **Ядро фазы 3:** выход на тик лучше + возраст по партиям (FIFO) — берём.
+- **Фильтр по встречному потоку** — пока не берём: половина M1 (6 рынков из 20) — слишком дорого. Вернуться
+  после сверки с журналом VPS.
+- **Исправленная модель paper** (исполнение за всё время жизни ордера) — обязательна до любых сравнений фазы 3.
+- Тест фазы 2 — до 48 ч, ничего не останавливать. По аудиту показать настоящую долю закрытий тейкером на VPS.
 
+## Что нужно от пользователя в конце теста (после 23 ноября 19:21 UTC, 22:21 МСК)
+
+Один блок. Команды только читают журнал и публичные данные, бот не меняется. Результаты и сжатый журнал
+кладутся в папку `phase2_end` рабочей копии репозитория отчётов. Сервер сам публикует её в приватный
+polybot-reports в течение 15 минут, так что вывод можно не копировать.
+
+```bash
+B=origin/claude/laughing-maxwell-wrv6tz; J=/var/lib/polybot/paper/paper.jsonl; OUT=/var/lib/polybot/reports/phase2_end
+sudo git -C /opt/polybot/src fetch -q origin claude/laughing-maxwell-wrv6tz
+sudo git -C /opt/polybot/src show $B:research/tools/lp_phase2_breakdown.py > /tmp/lp_breakdown.py
+sudo git -C /opt/polybot/src show $B:research/tools/lp_paper_audit.py > /tmp/lp_audit.py
+sudo install -d -o polybot -g polybot $OUT
+sudo python3 /tmp/lp_breakdown.py $J | sudo tee $OUT/breakdown.txt
+sudo python3 /tmp/lp_audit.py $J | sudo tee $OUT/audit.txt
+sudo gzip -c $J | sudo tee $OUT/paper.jsonl.gz > /dev/null
+sudo chown -R polybot:polybot $OUT && ls -la $OUT
 ```
-sudo git -C /opt/polybot/src show origin/claude/laughing-maxwell-wrv6tz:research/tools/lp_phase2_breakdown.py > /tmp/lp_breakdown.py
-sudo python3 /tmp/lp_breakdown.py /var/lib/polybot/paper/paper.jsonl
-```
 
-Третья команда — аудит модели исполнений paper. Она тоже только читает журнал и публичные данные, около минуты:
-
-```
-sudo git -C /opt/polybot/src show origin/claude/laughing-maxwell-wrv6tz:research/tools/lp_paper_audit.py > /tmp/lp_audit.py
-sudo python3 /tmp/lp_audit.py /var/lib/polybot/paper/paper.jsonl
-```
-
-Для сверки воспроизведения нужен и сам журнал (`/var/lib/polybot/paper/paper.jsonl`). Как его передать —
-скажу в итоговом отчёте.
+- `breakdown.txt` — по рынкам: исполнено, закрыто бесплатно, закрыто тейкером, стоимость.
+- `audit.txt` — сколько сделок прошло через наши ордера, сколько paper засчитал, markout пропущенных и оценка доли
+  закрытий тейкером с пропущенными исполнениями.
+- `paper.jsonl.gz` — журнал для сверки воспроизведения с VPS и полного пересчёта с исправленной моделью.
