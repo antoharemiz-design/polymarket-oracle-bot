@@ -320,7 +320,8 @@ class Service:
             self.log.info(f"resuming run started {time.strftime('%Y-%m-%d %H:%M', time.gmtime(run['started']))} UTC")
         cfg.test_days = (run["started"] + run["test_days"] * 86400 - now) / 86400
         if self.mode == "paper":
-            ex = lp.PaperExec(**({"trades_fn": self.trades_fn} if self.trades_fn else {}), every_s=cfg.fills_every_s)
+            ex = lp.PaperExec(**({"trades_fn": self.trades_fn} if self.trades_fn else {}), every_s=cfg.fills_every_s,
+                              lifetime=cfg.paper_lifetime)
         else:
             ex = await lp.LiveExec.create(env("POLYMARKET_PRIVATE_KEY"), env("FUNDER_ADDRESS"),
                                           env("POLYMARKET_RELAYER_KEY"), env("POLYMARKET_RELAYER_ADDRESS"), log=self.log.info)

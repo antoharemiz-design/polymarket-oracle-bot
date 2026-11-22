@@ -94,6 +94,7 @@ class LPConfig:
     exit_mid_hi: float = 0.90          # clear before resolution) starts the market's exit
     pos_limit_usd: float = 1e9         # per market: the position may not grow beyond this many dollars
     snapshots_keep_h: float = 30.0     # snapshot files older than this are deleted
+    paper_lifetime: int = 0            # phase 3: paper fills an order by the trades of its whole lifetime (PaperExec)
     related_filter: int = 0            # phase 3: events whose titles share >= 2 rare words (related_groups) count as
                                        # one event, so the portfolio holds one market of them
     flow_filter: int = 0               # phase 3: selection uses the public taker flow of the lookback (flow_stats)
@@ -931,33 +932,50 @@ class PaperExec:
       place(m, side, price, size) -> order id or None      side "bid" = BUY YES, "ask" = BUY NO at 1 - price
       cancel(m, oid) -> "one" | "market"                   "market": every order of ours in m is gone
       fills(markets) -> [{order, mkt, side, price, size, ts, done}]
+    The tape is read every every_s. Phase 2 (lifetime=0): only the orders standing at that moment are filled, so an
+    order cancelled in between never gets the trades that went through it while it stood. Phase 3 (lifetime=1): a
+    cancelled order is kept for GONE_KEEP_S and filled by the trades of its lifetime, as on the exchange.
+    guard (research replays): (ts, side, price) -> False skips a fill.
     """
 
     in_book = False                       # virtual orders never appear in the public book
+    GONE_KEEP_S = 600.0                   # the public tape can lag; cancelled orders wait this long for their trades
 
-    def __init__(self, trades_fn=taker_trades, every_s=0.0):
-        self.n, self.orders, self.seen, self.since = 0, {}, set(), time.time()
+    def __init__(self, trades_fn=taker_trades, every_s=0.0, lifetime=0, clock=time.time, guard=None):
+        self.clock, self.lifetime, self.guard = clock, lifetime, guard
+        self.n, self.orders, self.seen, self.since = 0, {}, set(), clock()
+        self.gone = {}                                  # lifetime=1: cancelled order id -> order with its end time
         self.trades_fn, self.every_s, self.last_poll = trades_fn, every_s, 0.0
+        self.skipped = 0
 
     async def place(self, m, side, price, size):
         self.n += 1
         oid = f"paper-{self.n}"
-        self.orders[oid] = {"mkt": m["cond"], "side": side, "price": price, "rem": size, "t": time.time()}
+        self.orders[oid] = {"mkt": m["cond"], "side": side, "price": price, "rem": size, "t": self.clock()}
         return oid
 
+    def _gone(self, oid, o):
+        if o is not None and self.lifetime:
+            o["end"] = self.clock()
+            self.gone[oid] = o
+
     async def cancel(self, m, oid):
-        self.orders.pop(oid, None)
+        self._gone(oid, self.orders.pop(oid, None))
         return "one"
 
     async def cancel_all(self):
-        self.orders.clear()
+        for oid in list(self.orders):
+            self._gone(oid, self.orders.pop(oid))
 
     async def fills(self, markets):
         out = []
-        if time.time() - self.last_poll < self.every_s:
+        now = self.clock()
+        if now - self.last_poll < self.every_s:
             return out
-        self.last_poll = time.time()
-        busy = [m for m in markets if any(o["mkt"] == m["cond"] for o in self.orders.values())]
+        self.last_poll = now
+        self.gone = {oid: o for oid, o in self.gone.items() if now - o["end"] <= self.GONE_KEEP_S}
+        books = dict(self.orders, **self.gone)
+        busy = [m for m in markets if any(o["mkt"] == m["cond"] for o in books.values())]
         sem = asyncio.Semaphore(8)                      # the tapes of many markets (phase 2: up to 40) in parallel
 
         async def tape(cond):
@@ -967,24 +985,29 @@ class PaperExec:
         for m, tp in zip(busy, tapes):
             if isinstance(tp, BaseException):
                 raise tp
-            mine = [(oid, o) for oid, o in self.orders.items() if o["mkt"] == m["cond"]]
+            mine = [(oid, o) for oid, o in books.items() if o["mkt"] == m["cond"]]
             if not mine:
                 continue
             for ts, oi, side, px, sz, key in sorted(tp):
                 if key in self.seen or ts < self.since:
                     continue
                 self.seen.add(key)
-                live = [(oid, o) for oid, o in mine if o["t"] <= ts + 1 and o["rem"] > 1e-9]
+                live = [(oid, o) for oid, o in mine if o["t"] <= ts + 1 and ts <= o.get("end", ts) and o["rem"] > 1e-9]
+                live.sort(key=lambda x: "end" not in x[1])  # an order that stood at the trade before one placed after it
                 bid = next((o["price"] for _, o in live if o["side"] == "bid"), None)
                 ask = next((o["price"] for _, o in live if o["side"] == "ask"), None)
                 hit = crosses((oi, side, px), bid, ask)
                 if not hit:
                     continue
                 oid, o = next((oid, o) for oid, o in live if o["side"] == hit)
+                if self.guard is not None and not self.guard(ts, hit, o["price"]):
+                    self.skipped += 1
+                    continue
                 q = min(o["rem"], sz); o["rem"] -= q
                 done = o["rem"] <= 1e-9
                 if done:
                     self.orders.pop(oid, None)
+                    self.gone.pop(oid, None)
                 out.append({"order": oid, "mkt": m["cond"], "side": hit, "price": o["price"], "size": q, "ts": ts, "done": done})
         return out
 
@@ -2089,7 +2112,7 @@ def cli(cmd, args):
         raise SystemExit(f"only {len(sel)} markets selected; need {cfg.markets_min}")
     if cmd == "lp-paper":
         prior = load_events(cfg.lp_dir, "paper") if os.environ.get("LP_RESUME") == "1" else []
-        t = LPTest(cfg, PaperExec(every_s=cfg.fills_every_s), Journal(os.path.join(cfg.lp_dir, "paper.jsonl")), sel)
+        t = LPTest(cfg, PaperExec(every_s=cfg.fills_every_s, lifetime=cfg.paper_lifetime), Journal(os.path.join(cfg.lp_dir, "paper.jsonl")), sel)
         t.restore(prior)                                  # LP_RESUME=1: continue the same run after a restart
         asyncio.run(t.run())
         return

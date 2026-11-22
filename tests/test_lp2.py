@@ -867,3 +867,48 @@ class Phase3SelectionTest(unittest.TestCase):
         self.assertIn("Z", conds)
         self.assertEqual(summary["groups_merged"], 1)
         self.assertEqual(st.meta["X"]["event_title"], "Which math problems will AI solve in 2026?")
+
+
+class PaperLifetimeTest(unittest.TestCase):
+    """Phase 3 paper fill model: an order cancelled before the tape is read still gets the trades of its lifetime."""
+
+    def run_case(self, lifetime, poll_at=30.0):
+        clock = Clock()
+        tape = [(NOW + 5, 0, "S", 0.47, 10.0, "k1"),        # sells YES through our 0.48 bid while it stands
+                (NOW + 15, 0, "S", 0.45, 10.0, "k2")]       # after the re-price, through neither bid
+        ex = lp.PaperExec(trades_fn=lambda c: [r for r in tape if r[0] <= clock()], lifetime=lifetime, clock=clock)
+        m = {"cond": "C1"}
+
+        async def go():
+            oid = await ex.place(m, "bid", 0.48, 20.0)
+            clock.t = NOW + 10
+            await ex.cancel(m, oid)                         # re-priced before the poll
+            await ex.place(m, "bid", 0.44, 20.0)
+            clock.t = NOW + poll_at
+            return oid, await ex.fills([m])
+        return asyncio.run(go())
+
+    def test_phase2_misses_the_cancelled_order(self):
+        _, f = self.run_case(0)
+        self.assertEqual(f, [])
+
+    def test_lifetime_fills_the_cancelled_order(self):
+        oid, f = self.run_case(1)
+        self.assertEqual([(x["order"], x["side"], x["price"], x["size"], x["ts"]) for x in f], [(oid, "bid", 0.48, 10.0, NOW + 5)])
+
+    def test_cancelled_orders_expire(self):
+        _, f = self.run_case(1, poll_at=10 + lp.PaperExec.GONE_KEEP_S + 1)
+        self.assertEqual(f, [])
+
+    def test_late_fill_of_a_cancelled_order_keeps_the_new_one(self):
+        clock = Clock()
+        cfg = lp.phase2_config(lp_dir=tempfile.mkdtemp())
+        j = lp.Journal(os.path.join(cfg.lp_dir, "paper.jsonl"))
+        t = lp.LPTest(cfg, lp.PaperExec(trades_fn=lambda c: []), j, [mk("C1")], books_fn=lambda toks: {}, log=lambda *a: None,
+                      clock=clock)
+        s = t.st["C1"]
+        s.orders["bid"] = ("paper-2", 0.44, NOW, 20.0)
+        t.apply_fill({"order": "paper-1", "mkt": "C1", "side": "bid", "price": 0.48, "size": 10.0, "ts": NOW, "done": True})
+        self.assertEqual(s.yes, 10.0)
+        self.assertEqual(s.orders["bid"][0], "paper-2")
+        j.close()

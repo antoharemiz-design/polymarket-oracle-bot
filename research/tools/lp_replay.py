@@ -33,6 +33,8 @@ VARIANTS = {
     "tick_always": {"exit_improve_ticks": 1, "reduce_improve_always": 1},
     "tick_always_fifo": {"exit_improve_ticks": 1, "reduce_improve_always": 1, "inv_fifo": 1},
     "hold30": {"inv_reduce_h": 0.25, "inv_flatten_h": 0.5},
+    "life": {"paper_lifetime": 1},                                       # paper fill model: whole order lifetime
+    "life_tick_always_fifo": {"paper_lifetime": 1, "exit_improve_ticks": 1, "reduce_improve_always": 1, "inv_fifo": 1},
     "tick_always_fifo_hold30": {"exit_improve_ticks": 1, "reduce_improve_always": 1, "inv_fifo": 1,
                                 "inv_reduce_h": 0.25, "inv_flatten_h": 0.5},
 }
@@ -46,50 +48,11 @@ class Clock:
         return self.t
 
 
-class ReplayExec(lp.PaperExec):
-    """PaperExec on the replay clock: orders carry the replay time, the tape is cut at the replay time."""
-
-    def __init__(self, tape, clock, every_s, guard=None):
-        super().__init__(trades_fn=lambda c: [r for r in tape.get(c, []) if r[0] <= clock()], every_s=every_s)
-        self.clock = clock
-        self.since = clock()
-        self.guard = guard            # (ts, side, price) -> False: skip the fill (our quote was stale through the mid)
-
-    async def place(self, m, side, price, size):
-        self.n += 1
-        oid = f"replay-{self.n}"
-        self.orders[oid] = {"mkt": m["cond"], "side": side, "price": price, "rem": size, "t": self.clock()}
-        return oid
-
-    async def fills(self, markets):
-        if self.clock() - self.last_poll < self.every_s:
-            return []
-        out = []
-        self.last_poll = self.clock()
-        for m in markets:
-            mine = [(oid, o) for oid, o in self.orders.items() if o["mkt"] == m["cond"]]
-            if not mine:
-                continue
-            for ts, oi, side, px, sz, key in sorted(self.trades_fn(m["cond"])):
-                if key in self.seen or ts < self.since:
-                    continue
-                self.seen.add(key)
-                live = [(oid, o) for oid, o in mine if o["t"] <= ts + 1 and o["rem"] > 1e-9]
-                bid = next((o["price"] for _, o in live if o["side"] == "bid"), None)
-                ask = next((o["price"] for _, o in live if o["side"] == "ask"), None)
-                hit = lp.crosses((oi, side, px), bid, ask)
-                if not hit:
-                    continue
-                oid, o = next((oid, o) for oid, o in live if o["side"] == hit)
-                if self.guard is not None and not self.guard(ts, hit, o["price"]):
-                    self.skipped += 1
-                    continue
-                q = min(o["rem"], sz); o["rem"] -= q
-                done = o["rem"] <= 1e-9
-                if done:
-                    self.orders.pop(oid, None)
-                out.append({"order": oid, "mkt": m["cond"], "side": hit, "price": o["price"], "size": q, "ts": ts, "done": done})
-        return out
+def ReplayExec(tape, clock, every_s, guard=None, lifetime=0):
+    """PaperExec on the replay clock: orders carry the replay time, the tape is cut at the replay time.
+    guard: (ts, side, price) -> False skips the fill (our quote was stale through the mid)."""
+    return lp.PaperExec(trades_fn=lambda c: [r for r in tape.get(c, []) if r[0] <= clock()], every_s=every_s,
+                        lifetime=lifetime, clock=clock, guard=guard)
 
 
 def load_snaps(scan, t0, t1):
@@ -156,8 +119,8 @@ def replay_market(m, snaps, tape, mids, t0, t1, overrides, step_s, guard=False):
         mid = mid_at(ts)
         return mid is None or (price <= mid + 1e-9 if side == "bid" else price >= mid - 1e-9)
 
-    ex = ReplayExec({cond: tape}, clock, every_s=cfg.fills_every_s, guard=fresh if guard else None)
-    ex.skipped = 0
+    ex = ReplayExec({cond: tape}, clock, every_s=cfg.fills_every_s, guard=fresh if guard else None,
+                    lifetime=cfg.paper_lifetime)
     j = lp.Journal(os.path.join(tmp, "paper.jsonl"))
     test = lp.LPTest(cfg, ex, j, [m], books_fn=books_fn, log=lambda *a: None, clock=clock)
 
