@@ -267,3 +267,27 @@ class Phase2ServiceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StatusWriteTest(unittest.TestCase):
+    def test_parallel_writes_do_not_collide(self):
+        import threading
+        from polybot import service
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "s.json")
+        errors = []
+
+        def w(i):
+            try:
+                for k in range(200):
+                    service._write_json(path, {"i": i, "k": k, "pad": "x" * 2000})
+            except Exception as e:                       # noqa: BLE001
+                errors.append(e)
+        ts = [threading.Thread(target=w, args=(i,)) for i in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertIn("k", json.load(open(path)))
+        self.assertEqual([f for f in os.listdir(d) if f.endswith(".tmp")], [])

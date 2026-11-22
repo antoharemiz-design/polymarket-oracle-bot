@@ -66,7 +66,9 @@ def _read_json(path, default=None):
 
 
 def _write_json(path, obj):
-    tmp = path + ".tmp"
+    # a temporary name per thread and process: the status is written from the service and the selection threads,
+    # and a shared name let one os.replace() move the other's half-written file (WARNING of 21 Nov)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     with open(tmp, "w") as f:
         json.dump(obj, f)
     os.replace(tmp, path)
