@@ -646,5 +646,109 @@ class Phase2ReportTest(unittest.TestCase):
         self.assertEqual(lp.phase2([{"event": "start", "ts": NOW}])["verdict"], "no data")
 
 
+class Phase3ExitTest(unittest.TestCase):
+    """Phase 3 exit logic (research/PHASE3_PLAN.md): tick-better reducing quotes, FIFO position age."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        self.cfg = lp.phase2_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0)
+        self.books = {"YC1": ([(0.47, 100.0)], [(0.52, 100.0)], 0.01)}
+        self.ex = FakeEx()
+        self.j = lp.Journal(os.path.join(self.tmp, "paper.jsonl"))
+
+    def make(self, markets):
+        return lp.LPTest(self.cfg, self.ex, self.j, list(markets), books_fn=lambda toks: {t: self.books[t] for t in toks},
+                         log=lambda *a: None, clock=self.clock)
+
+    def step(self, t, dt=0.0):
+        self.clock.t += dt
+        asyncio.run(t.step(self.clock.t, {c: {"v": 4.5, "min": s.m["min"], "rate": 10.0} for c, s in t.st.items()}))
+
+    def fill(self, t, side, size, price=None):
+        oid = t.st["C1"].orders[side][0]
+        price = price if price is not None else t.st["C1"].orders[side][1]
+        self.ex.inject = [{"order": oid, "mkt": "C1", "side": side, "price": price, "size": size, "ts": self.clock.t, "done": True}]
+        self.step(t, 1)
+
+    def test_lot_update_fifo(self):
+        s = lp.MarketState(mk("C1"))
+        s.lot_update(0, 20); s.lot_update(10, 10); s.lot_update(20, -25)
+        self.assertEqual(s.lots, [[10, 5]])                 # the oldest lot is consumed first
+        s.lot_update(30, -15)
+        self.assertEqual(s.lots, [[30, -10]])               # over-reduction opens a lot the other way
+        self.assertEqual(s.aged_qty(40, 5), 10)
+        self.assertEqual(s.aged_qty(32, 5), 0)
+
+    def test_reduce_price_one_tick_inside(self):
+        self.cfg.exit_improve_ticks = 1
+        t = self.make([mk("C1")])
+        self.assertEqual(t._reduce_price("ask", [(0.47, 1)], [(0.52, 1)], 0.01), 0.51)
+        self.assertEqual(t._reduce_price("bid", [(0.47, 1)], [(0.52, 1)], 0.01), 0.48)
+        self.assertEqual(t._reduce_price("ask", [(0.50, 1)], [(0.51, 1)], 0.01), 0.51)   # one-tick spread: join
+        self.cfg.exit_improve_ticks = 3
+        self.assertEqual(t._reduce_price("ask", [(0.49, 1)], [(0.52, 1)], 0.01), 0.50)   # never at the bid
+        self.cfg.exit_improve_ticks = 0
+        self.assertEqual(t._reduce_price("ask", [(0.47, 1)], [(0.52, 1)], 0.01), 0.52)
+
+    def test_aged_exit_quote_improved(self):
+        self.cfg.exit_improve_ticks = 1
+        t = self.make([mk("C1")])
+        self.step(t)
+        self.fill(t, "bid", 20.0)
+        self.step(t, 1)
+        self.step(t, 1800)                                 # 30 min: reduce only, one tick inside
+        s = t.st["C1"]
+        self.assertIsNone(s.orders["bid"])
+        self.assertEqual(s.orders["ask"][1], 0.51)
+
+    def test_reduce_improve_always(self):
+        self.cfg.exit_improve_ticks, self.cfg.reduce_improve_always = 1, 1
+        t = self.make([mk("C1")])
+        self.step(t)
+        self.fill(t, "bid", 20.0)
+        self.step(t, 1)
+        s = t.st["C1"]
+        self.assertEqual(s.orders["ask"][1], 0.51)          # reducing side improved at once
+        self.assertEqual(s.orders["bid"][1], 0.47)          # the other side still joins
+        self.books["YC1"] = ([(0.40, 100.0)], [(0.52, 100.0)], 0.01)   # outside the zone: only the reducing side
+        self.step(t, 1)
+        self.assertIsNone(s.orders["bid"])
+        self.assertEqual(s.orders["ask"][1], 0.51)
+
+    def test_fifo_flattens_only_old_lots(self):
+        self.cfg.inv_fifo = 1
+        t = self.make([mk("C1")])
+        self.step(t)
+        self.fill(t, "bid", 20.0)                          # lot 1 at t0
+        self.step(t, 1)
+        self.clock.t += 1800
+        self.books["YC1"] = ([(0.47, 100.0)], [(0.52, 100.0)], 0.01)
+        s = t.st["C1"]
+        s.lot_update(self.clock.t, 30); s.yes += 30          # a younger lot of 30 at t0 + 30 min
+        self.step(t, 1801)                                 # lot 1 is 1 h old, the young lot 30 min
+        fl = [e for e in journal_events(self.j) if e["event"] == "flatten"]
+        self.assertEqual(len(fl), 1)
+        self.assertAlmostEqual(fl[0]["size"], 20.0)        # only the old lot
+        self.assertAlmostEqual(s.pos(), 30.0)
+
+    def churn(self, fifo):
+        self.cfg.inv_fifo = fifo
+        self.j = lp.Journal(os.path.join(tempfile.mkdtemp(), "paper.jsonl"))
+        self.clock = Clock()
+        t = self.make([mk("C1")])
+        self.step(t)
+        for i in range(6):                                 # every lot is consumed within 15 min; |pos| stays >= dust
+            side = "bid" if i % 2 == 0 else "ask"
+            if t.st["C1"].orders[side]:                    # (the phase 2 rule withdraws the growing side after 30 min)
+                self.fill(t, side, 20.0 if i == 0 else 25.0)
+            self.step(t, 900)
+        return [e for e in journal_events(self.j) if e["event"] == "flatten"]
+
+    def test_fifo_churning_position_not_flattened(self):
+        self.assertEqual(self.churn(1), [])
+        self.assertTrue(self.churn(0))                     # the phase 2 rule closes the same churning position
+
+
 if __name__ == "__main__":
     unittest.main()

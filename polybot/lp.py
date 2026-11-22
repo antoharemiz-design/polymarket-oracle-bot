@@ -81,6 +81,12 @@ class LPConfig:
     dust_shares: float = 5.0           # positions below this are left alone (the exchange's minimum order)
     inv_reduce_h: float = 0.0          # a position held this long: only the reducing side is quoted (0 = off)
     inv_flatten_h: float = 0.0         # a position held this long is closed by a taker order (0 = off)
+    exit_improve_ticks: int = 0        # phase 3: quotes that reduce a position sit this many ticks inside the spread
+                                       # (first in the queue), never crossing; 0 = join the best price
+    reduce_improve_always: int = 0     # 1: also while not exiting / aged, the reducing side is improved (when |pos| >=
+                                       # dust) and quoted even outside the reward zone
+    inv_fifo: int = 0                  # 1: position age by lots (oldest contract first); only lots older than
+                                       # inv_flatten_h are closed by a taker; 0: age since |pos| last was below dust
     exit_mid_lo: float = 0.10          # phase 2: the mid leaving [exit_mid_lo, exit_mid_hi] (the outcome becoming
     exit_mid_hi: float = 0.90          # clear before resolution) starts the market's exit
     pos_limit_usd: float = 1e9         # per market: the position may not grow beyond this many dollars
@@ -1089,6 +1095,7 @@ class MarketState:
         self.mids = []                                  # (ts, mid of the other orders) for markouts
         self.exit_since = None                          # phase 2: left the portfolio (or lost its reward) at this time
         self.pos_since = None                           # phase 2: since when |YES - NO| >= dust_shares
+        self.lots = []                                  # phase 3 (inv_fifo): [ts, signed YES - NO quantity], oldest first
         self.book = None                                # (bids, asks) of the other orders at the last step
         try:
             self.end_ts = _ts(m["end"]) if m.get("end") else None
@@ -1101,6 +1108,22 @@ class MarketState:
             self.end_ts = _ts(m["end"]) if m.get("end") else None
         except Exception:
             self.end_ts = None
+
+    def lot_update(self, ts, dq):
+        """Position change dq (YES - NO) at ts: the same direction as the lots adds a lot; the opposite direction
+        consumes the oldest lots first, and what is left over opens a lot the other way."""
+        while abs(dq) > 1e-9 and self.lots and self.lots[0][1] * dq < 0:
+            take = min(abs(dq), abs(self.lots[0][1]))
+            self.lots[0][1] += take if self.lots[0][1] < 0 else -take
+            dq += -take if dq > 0 else take
+            if abs(self.lots[0][1]) < 1e-9:
+                self.lots.pop(0)
+        if abs(dq) > 1e-9:
+            self.lots.append([ts, dq])
+
+    def aged_qty(self, now, age_s):
+        """Contracts of the position held at least age_s (FIFO lots)."""
+        return sum(abs(q) for t, q in self.lots if now - t >= age_s)
 
     def hours_left(self, now):
         return (self.end_ts - now) / 3600 if self.end_ts is not None else float("inf")
@@ -1223,6 +1246,7 @@ class LPTest:
                 else:
                     s.no += e["size"]; s.cash -= e["size"] * (1 - e["price"])
                 s.cash -= e.get("fee", 0.0)
+                s.lot_update(e.get("fill_ts", e.get("ts", 0.0)), e["size"] if e["side"] == "bid" else -e["size"])
                 n += ev == "fill"
             elif ev == "merge":
                 s.yes -= e["pairs"]; s.no -= e["pairs"]; s.cash += e["pairs"]
@@ -1254,6 +1278,7 @@ class LPTest:
             s.yes += f["size"]; s.cash -= f["size"] * f["price"]
         else:
             s.no += f["size"]; s.cash -= f["size"] * (1 - f["price"])
+        s.lot_update(f["ts"], f["size"] if f["side"] == "bid" else -f["size"])
         o = s.orders[f["side"]]
         if f.get("done") and o and o[0] == f["order"]:
             s.orders[f["side"]] = None
@@ -1328,10 +1353,24 @@ class LPTest:
             return none
         q = round(min(s.m["N"], abs(pos)), 2)
         if pos > 0:
-            return ({"bid": None, "ask": oa[0][0]}, {"bid": 0.0, "ask": q}) if oa else none
-        return ({"bid": ob[0][0], "ask": None}, {"bid": q, "ask": 0.0}) if ob else none
+            return ({"bid": None, "ask": self._reduce_price("ask", ob, oa, s.m.get("tick") or 0.01)}, {"bid": 0.0, "ask": q}) if oa else none
+        return ({"bid": self._reduce_price("bid", ob, oa, s.m.get("tick") or 0.01), "ask": None}, {"bid": q, "ask": 0.0}) if ob else none
 
-    async def _flatten(self, s, now, ob, oa, reason=""):
+    def _reduce_price(self, side, ob, oa, tick):
+        """Price of a quote that reduces the position: exit_improve_ticks inside the spread, never at or through the
+        other side; the best price when the spread is one tick (or there is no other side)."""
+        n = self.cfg.exit_improve_ticks
+        if side == "ask":
+            best = oa[0][0]
+            if n <= 0 or not ob:
+                return best
+            return round(max(best - n * tick, ob[0][0] + tick), 6) if best - ob[0][0] > tick + 1e-9 else best
+        best = ob[0][0]
+        if n <= 0 or not oa:
+            return best
+        return round(min(best + n * tick, oa[0][0] - tick), 6) if oa[0][0] - best > tick + 1e-9 else best
+
+    async def _flatten(self, s, now, ob, oa, reason="", qty=None):
         """Close the position of an exiting market with a taker order: BUY NO against the YES bids when long YES,
         BUY YES against the YES asks when long NO; the pairs are merged afterwards."""
         for side in ("bid", "ask"):
@@ -1342,13 +1381,14 @@ class LPTest:
                 self.j.write("cancel", mkt=s.m["cond"], side=side, price=cur[1], scope=res)
         pos = s.pos()
         side = "ask" if pos > 0 else "bid"
-        r = await self.ex.take(s.m, side, round(abs(pos), 2), ob, oa)
+        r = await self.ex.take(s.m, side, round(min(abs(pos), qty) if qty else abs(pos), 2), ob, oa)
         if not r or r.get("size", 0.0) <= 1e-9:
             return
         if side == "bid":
             s.yes += r["size"]; s.cash -= r["size"] * r["price"]
         else:
             s.no += r["size"]; s.cash -= r["size"] * (1 - r["price"])
+        s.lot_update(now, r["size"] if side == "bid" else -r["size"])
         s.cash -= r.get("fee", 0.0)
         mid = s.mid if s.mid is not None else r["price"]
         # cost against the mid: buying YES above it ("bid") or selling YES (buying NO) below it ("ask"), plus the fee
@@ -1453,6 +1493,10 @@ class LPTest:
                 exiting = s.exit_since is not None
                 if abs(s.pos()) < self.cfg.dust_shares:
                     s.pos_since = None
+                    if self.cfg.inv_fifo:
+                        s.lots = []
+                elif self.cfg.inv_fifo:
+                    s.pos_since = s.lots[0][0] if s.lots else now
                 elif s.pos_since is None:
                     s.pos_since = now
                 aged = (self.cfg.inv_reduce_h > 0 and s.pos_since is not None
@@ -1462,6 +1506,10 @@ class LPTest:
             else:
                 want = dict(zip(("bid", "ask"), targets(ob, oa, tick, c["v"], s.pos(), cap)))
                 size = {"bid": s.m["N"], "ask": s.m["N"]}
+                if p2 and self.cfg.reduce_improve_always and abs(s.pos()) >= self.cfg.dust_shares:
+                    red = "ask" if s.pos() > 0 else "bid"
+                    if (oa if red == "ask" else ob):       # quoted even outside the zone, at full size N
+                        want[red] = self._reduce_price(red, ob, oa, tick)
             if self.stopped or self.paused or (c["rate"] <= 0 and not exiting):
                 want = {"bid": None, "ask": None}
             for side in ("bid", "ask"):
@@ -1489,8 +1537,13 @@ class LPTest:
                     due = "end near"
                 elif self.cfg.inv_flatten_h > 0 and s.pos_since is not None and now - s.pos_since >= self.cfg.inv_flatten_h * 3600:
                     due = "position held 1 h" if abs(self.cfg.inv_flatten_h - 1.0) < 1e-9 else "position held"
+                qty = None
+                if due and due.startswith("position held") and self.cfg.inv_fifo:
+                    qty = s.aged_qty(now, self.cfg.inv_flatten_h * 3600)   # only the lots older than the limit
+                    if qty < self.cfg.dust_shares:
+                        due = None
                 if due:
-                    await self._flatten(s, now, ob, oa, due)
+                    await self._flatten(s, now, ob, oa, due, qty)
             if sample:
                 my_b = s.orders["bid"][1] if s.orders["bid"] else None
                 my_a = s.orders["ask"][1] if s.orders["ask"] else None
