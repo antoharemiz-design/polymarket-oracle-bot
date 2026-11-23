@@ -265,6 +265,61 @@ class Phase2ServiceTest(unittest.TestCase):
         self.assertEqual(starts[-1]["config"]["quote_budget_usd"], 100.0)
 
 
+class Phase3ServiceTest(Phase2ServiceTest):
+    """Phase 3: the phase 2 loop with the phase 3 settings; the run keeps phase 3 across restarts; a new live run
+    is refused when the wallet holds less than 90% of the planned capital."""
+
+    def test_warm_up_stops_resumes_then_quotes(self):     # (the phase 2 test runs in the parent class)
+        pass
+
+    def test_resume_phase2_rebuilds_portfolio(self):
+        pass
+
+    def test_phase1_run_keeps_phase1_settings(self):
+        pass
+
+    def test_phase3_run_keeps_phase3_settings(self):
+        tmp, base, kw = self.setup()
+        fast = dict(base, LP_PHASE="3", LP_SNAPSHOT_GAP_S="0.2", LP_LOOKBACK_H=str(0.4 / 3600), LP_TEST_DAYS=str(60 / 86400))
+        with Env(**fast):
+            asyncio.run(run_for(service.Service(**kw), 1.5))
+        self.assertEqual(rj(os.path.join(tmp, "paper", "run.json"))["phase"], 3)
+        with Env(**dict(fast, LP_PHASE="2")):               # a restart with another default keeps the run's phase
+            asyncio.run(run_for(service.Service(**kw), 0.5))
+            st = service.render_status(tmp)
+        starts = [x for x in events(tmp) if x["event"] == "start"]
+        self.assertEqual(len(starts), 2)
+        for x in starts:
+            c = x["config"]
+            self.assertEqual((c["phase"], c["inv_fifo"], c["exit_improve_ticks"], c["paper_lifetime"]), (3, 1, 1, 1))
+            self.assertEqual((c["capital_usd"], c["quote_budget_usd"]), (300.0, 200.0))
+        self.assertIn("Ход прогона (фаза 3)", st)
+
+    def test_live_refused_when_wallet_short(self):
+        tmp, base, kw = self.setup()
+        kw = dict(kw, mode="live")
+
+        class FakeClient:
+            async def close(self):
+                pass
+
+        class FakeLive:
+            c = FakeClient()
+
+            async def collateral(self):
+                return 150.0
+
+        async def create(*a, **k):
+            return FakeLive()
+        live = dict(base, LP_PHASE="3", POLYBOT_ALLOW_LIVE="yes", POLYMARKET_PRIVATE_KEY="0xkey", POLYBOT_BRANCH="main")
+        with Env(**live), mock.patch.object(lp.LiveExec, "create", create):
+            svc = service.Service(**kw)
+            asyncio.run(run_for(svc, 0.5))
+        self.assertEqual(svc.phase, "refused")
+        self.assertIn("below 90%", svc.detail)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "live", "run.json")))
+
+
 if __name__ == "__main__":
     unittest.main()
 

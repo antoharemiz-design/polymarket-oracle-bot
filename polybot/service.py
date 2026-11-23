@@ -140,6 +140,25 @@ class Service:
 
     # ---- live safety
 
+    async def live_wallet_short(self, cfg):
+        """A new live run starts only with the planned capital in the wallet: the reason to refuse, or None."""
+        try:
+            ex = await lp.LiveExec.create(env("POLYMARKET_PRIVATE_KEY"), env("FUNDER_ADDRESS"),
+                                          env("POLYMARKET_RELAYER_KEY"), env("POLYMARKET_RELAYER_ADDRESS"), log=self.log.info)
+        except Exception as e:
+            return f"live client failed to start: {e!r:.200}"
+        try:
+            cash = await ex.collateral()
+        except Exception as e:
+            return f"wallet balance read failed: {e!r:.200}"
+        finally:
+            await ex.c.close()
+        self.log.info(f"live: wallet USDC ${cash:.2f}, planned capital ${cfg.capital_usd:.0f}")
+        if cash < 0.9 * cfg.capital_usd:
+            return (f"wallet holds ${cash:.2f} USDC, below 90% of the planned capital ${cfg.capital_usd:.0f}; "
+                    f"fund it (or set LP_CAPITAL_USD) and start again")
+        return None
+
     def live_blockers(self):
         reasons = []
         if env("POLYBOT_ALLOW_LIVE") != "yes":
@@ -287,22 +306,30 @@ class Service:
         mpath = os.path.join(self.run_dir, "markets.json")
         resumed = bool(run)
         store = None
-        if cfg.phase == 2:
+        if cfg.phase >= 2:
             store = self.snap_store(cfg)
             markets = []
             if not run:
+                why = await self.live_wallet_short(cfg) if self.mode == "live" else None
+                if why:                                 # checked before the warm-up and again before quoting starts
+                    return await self._idle(stop, "refused", why)
                 self.phase = "warming"
                 self.write_status()
                 _, finished = await self._in_thread(self.warm_up, stop, store)
                 if not finished:
                     self.log.info("stop requested during the warm-up; the snapshots taken so far are kept")
                     return
+                why = await self.live_wallet_short(cfg) if self.mode == "live" else None
+                if why:
+                    return await self._idle(stop, "refused", why)
                 now = self.clock()                      # the run's clock starts when quoting starts, after the warm-up
-                run = {"started": now, "test_days": cfg.test_days, "mode": self.mode, "phase": 2}
+                run = {"started": now, "test_days": cfg.test_days, "mode": self.mode, "phase": cfg.phase}
                 self.save_run(run)
-                self.log.info(f"new phase 2 run for {cfg.test_days} days: rolling selection every {cfg.rebalance_h:g} h")
+                self.log.info(f"new phase {cfg.phase} run for {cfg.test_days} days: rolling selection every "
+                              f"{cfg.rebalance_h:g} h")
             else:
-                self.log.info(f"resuming phase 2 run started {time.strftime('%Y-%m-%d %H:%M', time.gmtime(run['started']))} UTC")
+                self.log.info(f"resuming phase {cfg.phase} run started "
+                              f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(run['started']))} UTC")
         elif not run:
             self.phase = "selecting"
             self.write_status()
@@ -374,7 +401,7 @@ def _ago(sec):
     return f"{sec} с" if sec < 120 else f"{sec // 60} мин" if sec < 7200 else f"{sec / 3600:.1f} ч"
 
 
-def _phase2_lines(events, now):
+def _phase2_lines(events, now, phase=2):
     """status.md sections of a phase 2 run: the report so far (lp.phase2), the portfolio, exits, last errors."""
     r = lp.phase2(events)
     fmt = lambda x, f="{:.2f}": "—" if x is None else f.format(x)
@@ -386,7 +413,7 @@ def _phase2_lines(events, now):
     for e in events:
         if e["event"] == "pnl":
             pos = e.get("positions") or pos
-    out = ["## Ход прогона (фаза 2)", ""]
+    out = [f"## Ход прогона (фаза {phase})", ""]
     if last:
         nxt = last["ts"] + lp.from_env(phase=2).rebalance_h * 3600
         out.append(f"- переотбор: последний {time.strftime('%m-%d %H:%M UTC', time.gmtime(last['ts']))}, следующий ~"
@@ -486,8 +513,8 @@ def render_status(data, now=None, log_lines=50):
         rows.append(("Геоблок", "заблокирован" if st.get("geoblocked") else f"не заблокирован ({st.get('country') or '—'})"))
     out += ["| | |", "|---|---|"] + [f"| {a} | {b} |" for a, b in rows] + [""]
     events = lp.load_events(run_dir, mode)
-    if events and cfg.phase == 2:
-        out += _phase2_lines(events, now)
+    if events and cfg.phase >= 2:
+        out += _phase2_lines(events, now, phase=cfg.phase)
     elif events:
         qcap = sum(float(m.get("quote_cap") or 0.0) for m in markets.values()) or None
         r = lp.phase1(events, m1_per_100_min=cfg.m1_per_100_min, quote_cap_usd=qcap)

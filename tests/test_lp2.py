@@ -8,6 +8,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from polybot import lp
 
@@ -187,12 +188,14 @@ class ConfigTest(unittest.TestCase):
     def test_phase2_defaults_and_overrides(self):
         old = {k: os.environ.pop(k, None) for k in ("LP_PHASE", "LP_QUOTE_BUDGET_USD", "LP_KMAX")}
         try:
-            c = lp.from_env()
+            c = lp.from_env(phase=2)
             self.assertEqual(c.phase, 2)
             self.assertEqual(c.quote_budget_usd, 300.0)
             self.assertEqual(c.capital_usd, 500.0)
             self.assertEqual(c.kmax, 5)
+            self.assertEqual((c.exit_improve_ticks, c.inv_fifo, c.paper_lifetime), (0, 0, 0))
             self.assertIn("economics_fees", c.exclude_categories)
+            os.environ["LP_PHASE"] = "2"
             os.environ["LP_QUOTE_BUDGET_USD"] = "250"
             self.assertEqual(lp.from_env().quote_budget_usd, 250.0)
             os.environ["LP_PHASE"] = "1"
@@ -210,6 +213,26 @@ class ConfigTest(unittest.TestCase):
     def test_phase2_config(self):
         c = lp.phase2_config(kmax=3)
         self.assertEqual((c.phase, c.kmax, c.max_min_size), (2, 3, 200.0))
+
+    def test_phase3_is_the_default(self):
+        old = {k: os.environ.pop(k, None) for k in ("LP_PHASE", "LP_CAPITAL_USD")}
+        try:
+            c = lp.from_env()
+            self.assertEqual(c.phase, 3)
+            # the phase 2 rules stay (rolling selection, exclusions, kmax, the 1 h position rule)
+            self.assertEqual((c.kmax, c.max_min_size, c.inv_flatten_h, c.rebalance_h), (5, 200.0, 1.0, 3.0))
+            self.assertIn("economics_fees", c.exclude_categories)
+            # phase 3: tick-better reducing quotes, FIFO lots, lifetime paper fills, live capital $300
+            self.assertEqual((c.exit_improve_ticks, c.reduce_improve_always, c.inv_fifo, c.paper_lifetime), (1, 1, 1, 1))
+            self.assertEqual((c.capital_usd, c.quote_budget_usd, c.stop_loss_usd), (300.0, 200.0, 60.0))
+            os.environ["LP_CAPITAL_USD"] = "320"
+            self.assertEqual(lp.from_env().capital_usd, 320.0)
+            self.assertEqual(lp.phase3_config(kmax=2).phase, 3)
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
 
 
 class FakeEx(lp.PaperExec):
@@ -912,3 +935,117 @@ class PaperLifetimeTest(unittest.TestCase):
         self.assertEqual(s.yes, 10.0)
         self.assertEqual(s.orders["bid"][0], "paper-2")
         j.close()
+
+
+class LiveAccountingTest(unittest.TestCase):
+    """Live: wallet equity every 10 minutes, rewards of every market of the day, both in the phase 2/3 report."""
+
+    def test_equity_and_earnings(self):
+        clock = Clock()
+        cfg = lp.phase3_config(lp_dir=tempfile.mkdtemp())
+        j = lp.Journal(os.path.join(cfg.lp_dir, "live.jsonl"), clock=clock)
+
+        class Ex(FakeEx):
+            cash = 300.0
+
+            async def collateral(self):
+                return self.cash
+
+            async def earnings(self, day):
+                return {"C1": 1.5, "GONE": 2.0}            # GONE left the test during the day
+
+        ex = Ex()
+        t = lp.LPTest(cfg, ex, j, [mk("C1")], books_fn=lambda toks: {"YC1": ([(0.48, 100.0)], [(0.52, 100.0)], 0.01)},
+                      log=lambda *a: None, clock=clock)
+        clock.t = NOW - 300                                # just before midnight UTC of the next day? (any day change)
+        day0 = time.strftime("%Y-%m-%d", time.gmtime(clock.t))
+
+        async def go():
+            await t.step(clock.t, {"C1": {"rate": 10.0, "v": 4.5, "min": 20.0}})
+            ex.cash = 310.0
+            clock.t += 86400                                 # the next day, 24 h later
+            await t.step(clock.t, {"C1": {"rate": 10.0, "v": 4.5, "min": 20.0}})
+        asyncio.run(go())
+        ev = journal_events(j)
+        eq = [e for e in ev if e["event"] == "equity"]
+        self.assertEqual(len(eq), 2)
+        self.assertAlmostEqual(eq[0]["collateral"], 300.0)
+        self.assertAlmostEqual(eq[1]["equity"] - eq[0]["equity"], 10.0)
+        earn = [e for e in ev if e["event"] == "earnings"]
+        self.assertEqual(earn[0]["day"], day0)
+        self.assertEqual(earn[0]["by_market"], {"C1": 1.5, "GONE": 2.0})
+        j.close()
+
+
+class LiveCheckTest(unittest.TestCase):
+    """lp-live-check: keys, wallet, allowance and a far-from-market post-only order placed and cancelled."""
+
+    def run_check(self, cash, allow):
+        log = []
+
+        class C:
+            async def get_balance_allowance(self, asset_type):
+                class B:
+                    balance = int(cash * 1e6)
+                    allowances = {"exchange": allow}
+                return B()
+
+            def list_account_trades(self, after):
+                class P:
+                    async def iter_items(self):
+                        for i in range(3):
+                            yield i
+                return P()
+
+            async def close(self):
+                pass
+
+        class Ex:
+            c = C()
+            placed, cancelled = [], []
+
+            async def place(self, m, side, price, size):
+                self.placed.append((m["cond"], side, price, size))
+                return "oid-1"
+
+            async def scoring(self, oids):
+                return {o: True for o in oids}
+
+            async def cancel(self, m, oid):
+                self.cancelled.append(oid)
+                return "one"
+
+            async def _cancel_market(self, cond):
+                pass
+
+            async def earnings(self, day):
+                return {"X": 1.0}
+
+            async def reward_pct(self):
+                return {}
+        ex = Ex()
+
+        async def create(*a, **k):
+            return ex
+        gm = {"C1": {"conditionId": "C1", "question": "Will it rain?", "events": [{"id": "E1"}],
+                     "clobTokenIds": json.dumps(["Y1", "N1"]), "active": True, "closed": False, "acceptingOrders": True,
+                     "orderMinSize": 5}}
+        with mock.patch.object(lp.LiveExec, "create", create), \
+                mock.patch.object(lp, "rewards_config", lambda: {"C1": {"rate": 10.0, "v": 4.5, "min": 20.0}}), \
+                mock.patch.object(lp, "gamma_markets", lambda conds: gm), \
+                mock.patch.object(lp, "books", lambda toks: {"Y1": ([(0.45, 100.0)], [(0.47, 100.0)], 0.01)}):
+            rc = asyncio.run(lp.live_check(lp.phase3_config(), out=log.append))
+        return rc, log, ex
+
+    def test_ok(self):
+        rc, log, ex = self.run_check(300.0, 10 ** 12)
+        self.assertEqual(rc, 0)
+        self.assertEqual(ex.placed, [("C1", "bid", 0.35, 5.0)])      # 10 ticks below the best bid, exchange minimum
+        self.assertEqual(ex.cancelled, ["oid-1"])
+        self.assertIn("RESULT: OK", log[-1])
+
+    def test_short_wallet_and_no_allowance(self):
+        rc, log, _ = self.run_check(100.0, 0)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("below 90%" in x for x in log))
+        self.assertTrue(any("no USDC allowance" in x for x in log))

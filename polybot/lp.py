@@ -28,6 +28,7 @@ import itertools
 import json
 import os
 import re
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -115,18 +116,38 @@ PHASE2 = {"quote_budget_usd": 300.0, "capital_usd": 500.0, "stop_loss_usd": 100.
           "exit_at_end": 0, "inv_reduce_h": 0.5, "inv_flatten_h": 1.0}
 
 
+# phase 3 (research/PREREG_PHASE3.md, user's decisions of 22-23 November): the phase 2 loop with the new exit rules
+# (reducing quotes one tick inside the spread, also before the position ages; position age by FIFO lots, only
+# lots older than 1 h are closed by taker), the corrected paper fill model, and the live capital of $300
+PHASE3 = {"exit_improve_ticks": 1, "reduce_improve_always": 1, "inv_fifo": 1, "paper_lifetime": 1,
+          "capital_usd": 300.0, "quote_budget_usd": 200.0, "stop_loss_usd": 60.0}
+
+
 def from_env(phase=None) -> LPConfig:
-    """Settings from LP_* environment variables. The phase (argument, else LP_PHASE, else 2) picks the defaults:
-    phase 2 starts from PHASE2, phase 1 from the LPConfig defaults."""
+    """Settings from LP_* environment variables. The phase (argument, else LP_PHASE, else 3) picks the defaults:
+    phase 3 starts from PHASE2 + PHASE3, phase 2 from PHASE2, phase 1 from the LPConfig defaults."""
     c = LPConfig()
-    c.phase = int(phase or os.environ.get("LP_PHASE") or 2)
-    if c.phase == 2:
+    c.phase = int(phase or os.environ.get("LP_PHASE") or 3)
+    if c.phase >= 2:
         for k, v in PHASE2.items():
+            setattr(c, k, v)
+    if c.phase >= 3:
+        for k, v in PHASE3.items():
             setattr(c, k, v)
     for f in dataclasses.fields(c):
         raw = os.environ.get("LP_" + f.name.upper())
         if raw is not None and f.name != "phase":
             setattr(c, f.name, type(getattr(c, f.name))(raw))
+    return c
+
+
+def phase3_config(**kw) -> LPConfig:
+    """LPConfig with the phase 3 settings (no environment), for tests and research tools."""
+    c = phase2_config(phase=3)
+    for k, v in PHASE3.items():
+        setattr(c, k, v)
+    for k, v in kw.items():
+        setattr(c, k, v)
     return c
 
 
@@ -1121,6 +1142,11 @@ class LiveExec:
             self.log(f"trade list failed: {e!r}")
         return out
 
+    async def collateral(self):
+        """USDC of the wallet (on-chain balance; resting orders do not lock it on chain)."""
+        b = await self.c.get_balance_allowance(asset_type="COLLATERAL")
+        return b.balance / 1e6
+
     async def balances(self, m):
         """On-chain shares (YES, NO) held by the wallet in market m."""
         out = []
@@ -1231,12 +1257,13 @@ class LiveExec:
 # the test loop
 
 class Journal:
-    def __init__(self, path):
+    def __init__(self, path, clock=time.time):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.f = open(path, "a", buffering=1)
+        self.clock = clock                              # research replays stamp events with their own clock
 
     def write(self, event, ts=None, **kw):
-        kw.update(ts=ts if ts is not None else time.time(), event=event)
+        kw.update(ts=ts if ts is not None else self.clock(), event=event)
         self.f.write(json.dumps(kw, separators=(",", ":")) + "\n")
 
     def close(self):
@@ -1299,7 +1326,7 @@ class MarketState:
 
 
 class LPTest:
-    """The quoting loop. Phase 1 / 1B: a fixed set of markets. Phase 2 (cfg.phase == 2, with a SnapStore): the
+    """The quoting loop. Phase 1 / 1B: a fixed set of markets. Phase 2 and 3 (cfg.phase >= 2, with a SnapStore): the
     portfolio is re-selected every rebalance_h hours inside run(); markets that leave it, lose their reward or come
     within exit_reduce_h of their end quote only the side that reduces the position, and after exit_window_h (or
     within exit_flatten_h of the end) the rest is closed by a taker order. A market is dropped once it is flat."""
@@ -1325,6 +1352,7 @@ class LPTest:
         self.closed_pnl = 0.0                           # mark-to-market of the markets that left the test
         self.last_rebalance = None
         self.pending_target = None                      # (markets, summary, ts) from the snapshot task, for step()
+        self.last_equity = -1e18                        # live: wallet equity (USDC + positions at mid) every 10 min
         self.status_path = os.path.join(os.path.dirname(getattr(journal.f, "name", "") or "."), "status.json")
 
     @staticmethod
@@ -1351,11 +1379,11 @@ class LPTest:
                       "cancels": a["cancels"], "fills": a["fills"], "contracts": a["contracts"], "markout60": a["markout60"],
                       "rebate": a["rebate"]}
             s = self.st.get(c)
-            if s is not None and self.cfg.phase == 2:
+            if s is not None and self.cfg.phase >= 2:
                 per[c].update(k=s.m.get("k"), exiting=s.exit_since is not None)
         tot = sum(v["m1_usd_day"] or 0.0 for v in per.values())
         extra = {}
-        if self.cfg.phase == 2:
+        if self.cfg.phase >= 2:
             extra = {"cap_target": mean(self.win_cap), "target": len(self.target),
                      "exiting": sum(1 for s in self.st.values() if s.exit_since is not None)}
         self.j.write("window", ts=now, start=w * self.cfg.window_s, end=(w + 1) * self.cfg.window_s,
@@ -1445,7 +1473,7 @@ class LPTest:
         p = f["price"] if f["side"] == "bid" else 1 - f["price"]
         rebate = f["size"] * float(s.m.get("fee_rate") or 0.0) * p * (1 - p) * float(s.m.get("rebate_rate") or 0.0)
         a["rebate"] += rebate
-        extra = {"rebate": round(rebate, 6)} if self.cfg.phase == 2 else {}
+        extra = {"rebate": round(rebate, 6)} if self.cfg.phase >= 2 else {}
         self.j.write("fill", mkt=f["mkt"], side=f["side"], price=f["price"], size=f["size"], fill_ts=f["ts"],
                      order=f["order"], **extra)
 
@@ -1608,7 +1636,7 @@ class LPTest:
             target, summary, t = self.pending_target
             self.pending_target = None
             self.apply_rebalance(target, summary, t)
-        p2 = self.cfg.phase == 2
+        p2 = self.cfg.phase >= 2
         bk = await asyncio.to_thread(self.books_fn, [s.m["yes"] for s in self.st.values()])
         reserve = self.cfg.capital_usd - self.cfg.quote_budget_usd
         over = sum(s.exposure() for s in self.st.values()) >= reserve
@@ -1763,11 +1791,19 @@ class LPTest:
                 for x in self.st.values():
                     x.orders = {"bid": None, "ask": None}
                 self.j.write("stop", reason=self.stopped, pnl=pnl)
+        if hasattr(self.ex, "collateral") and now - self.last_equity >= 600:
+            self.last_equity = now                      # the real result of a live run: rewards paid, fees and all
+            try:
+                cash = await self.ex.collateral()
+                pos = sum(x.yes * x.mid + x.no * (1 - x.mid) for x in self.st.values() if x.mid is not None)
+                self.j.write("equity", collateral=round(cash, 6), positions_usd=round(pos, 6), equity=round(cash + pos, 6))
+            except Exception as e:
+                self.log(f"equity read failed: {e!r}")
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
         if self.day and day != self.day:
             e = await self.ex.earnings(self.day)
-            if e is not None:
-                self.j.write("earnings", day=self.day, by_market={c: e.get(c, 0.0) for c in self.st})
+            if e is not None:                           # every market of the day, also those that left the test
+                self.j.write("earnings", day=self.day, by_market={c: float(v) for c, v in e.items()})
         self.day = day
 
     async def run(self):
@@ -2013,6 +2049,21 @@ def phase2(events, net_per100_min=20.0, cv_max=0.5, share_max=0.4, ratio_min=0.6
            "retired": sum(1 for e in inside if e["event"] == "retired"),
            "downtime_h": round(sum(b - a for a, b in zip(ticks, ticks[1:]) if b - a > 300) / 3600, 2),
            "process_starts": len(starts), "errors": sum(1 for e in inside if e["event"] == "error")}
+    # live: rewards actually paid (the latest fetch of each day) and the wallet equity (USDC + positions at mid)
+    earned = {}
+    for e in events:
+        if e["event"] == "earnings":
+            for c, v in (e.get("by_market") or {}).items():
+                earned[(e["day"], c)] = v
+    if earned:
+        out["reward_actual_usd"] = sum(earned.values())
+        out["reward_actual_days"] = sorted({d for d, _ in earned})
+        out["reward_actual_over_m1"] = out["reward_actual_usd"] / (m1 * days) if m1 > 0 and days > 0 else None
+    eq = [e for e in inside if e["event"] == "equity"]
+    if len(eq) > 1:
+        out["equity_start"], out["equity_end"] = eq[0]["equity"], eq[-1]["equity"]
+        out["equity_change_usd"] = eq[-1]["equity"] - eq[0]["equity"]
+        out["equity_per100"] = per100(out["equity_change_usd"])
     full = out["hours"] >= hours - 0.6
     checks = {
         f"net >= ${net_per100_min:g}/day per $100 of quotes": full and out["net_per100"] is not None and out["net_per100"] >= net_per100_min,
@@ -2047,10 +2098,94 @@ async def _live_exec():
                                  os.environ.get("POLYMARKET_RELAYER_ADDRESS", "").strip())
 
 
+async def live_check(cfg, out=print):
+    """Before a live run (research/PREREG_PHASE3.md, step 0): the keys, the wallet, the exchange allowance and the
+    order path, without spending money. One post-only BUY of the exchange minimum size rests 10 ticks below the
+    best bid of a liquid rewarded market for a few seconds and is cancelled; it fills only if that market falls
+    10 ticks within seconds (then it is a normal small position, closed by the bot's rules or by hand).
+    Returns 0 when every step passed, 1 otherwise."""
+    ok = True
+
+    def bad(msg):
+        nonlocal ok
+        ok = False
+        out("   !! " + msg)
+    ex = await LiveExec.create(os.environ.get("POLYMARKET_PRIVATE_KEY", ""), os.environ.get("FUNDER_ADDRESS"),
+                               os.environ.get("POLYMARKET_RELAYER_KEY"), os.environ.get("POLYMARKET_RELAYER_ADDRESS"),
+                               log=out)
+    cond = None
+    try:
+        b = await ex.c.get_balance_allowance(asset_type="COLLATERAL")
+        cash = b.balance / 1e6
+        out(f"1. wallet USDC ${cash:.2f} (planned capital ${cfg.capital_usd:.0f}); allowances {b.allowances}")
+        if cash < 0.9 * cfg.capital_usd:
+            bad(f"below 90% of the planned capital: the bot will refuse to start a live run")
+        if not any(int(v) > 0 for v in (b.allowances or {}).values()):
+            bad("no USDC allowance for the exchange: trade once on polymarket.com with this wallet, then check again")
+        rw = await asyncio.to_thread(rewards_config)
+        top = sorted((c for c, r in rw.items() if r["rate"] > 0 and r["min"] <= cfg.max_min_size),
+                     key=lambda c: -rw[c]["rate"])[:40]
+        gm = await asyncio.to_thread(gamma_markets, top)
+        pick = None
+        for c in top:
+            g = gm.get(c)
+            if not g or not g.get("active") or g.get("closed") or not g.get("acceptingOrders") or g.get("gameStartTime"):
+                continue
+            m = meta_of(g)
+            bk = (await asyncio.to_thread(books, [m["token"]])).get(m["token"])
+            if bk and bk[0] and bk[1] and 0.2 <= bk[0][0][0] <= 0.8:
+                pick = (c, m, g, bk)
+                break
+        if pick is None:
+            bad("no liquid rewarded market found for the order test")
+            return 1
+        cond, m, g, (bids, asks, tick) = pick
+        size = max(5.0, float(g.get("orderMinSize") or 5.0))
+        price = round(max(tick, bids[0][0] - 10 * tick), 4)
+        out(f"2. order test on \"{(g.get('question') or cond)[:60]}\": best bid {bids[0][0]}, our post-only BUY YES "
+            f"{size:g} at {price} (${size * price:.2f} would be spent only if it filled)")
+        oid = await ex.place({"cond": cond, "yes": m["token"], "no": m["no"]}, "bid", price, size)
+        if not oid:
+            bad("the order was not accepted (see the reason above)")
+        else:
+            out(f"   accepted: {oid}")
+            await asyncio.sleep(3)
+            sc = await ex.scoring([oid])
+            out(f"   reward scoring of the order: {sc}")
+            res = await ex.cancel({"cond": cond}, oid)
+            out(f"   cancelled ({res})")
+        n = 0
+        async for _ in ex.c.list_account_trades(after=str(int(time.time()) - 7 * 86400)).iter_items():
+            n += 1
+            if n >= 50:
+                break
+        out(f"3. account trade list readable: {n} trades in the last 7 days")
+        day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400))
+        e = await ex.earnings(day)
+        out(f"4. reward earnings readable: {day}: ${sum((e or {}).values()):.2f}" if e is not None else "4. earnings: failed")
+        if e is None:
+            bad("reward earnings could not be read")
+        pct = await ex.reward_pct()
+        out(f"5. reward percentages readable: {'yes' if pct is not None else 'no'}")
+        if not (os.environ.get("POLYMARKET_RELAYER_KEY") and os.environ.get("POLYMARKET_RELAYER_ADDRESS")):
+            out("   note: no relayer key: merging YES + NO pairs back into USDC may need gas (POL) in the wallet "
+                "or may fail; unmerged pairs only lock capital, they do not lose money")
+    except Exception as e:
+        bad(f"failed: {e!r:.300}")
+    finally:
+        if cond:
+            await ex._cancel_market(cond)
+        await ex.c.close()
+    out("RESULT: OK, the live path works" if ok else "RESULT: fix the problems marked !! before a live run")
+    return 0 if ok else 1
+
+
 def cli(cmd, args):
     from .config import load_dotenv
     load_dotenv()
     cfg = from_env()
+    if cmd == "lp-live-check":
+        sys.exit(asyncio.run(live_check(cfg)))
     if cmd == "lp-select":
         for m in select(cfg):
             print(f"  ${m['m1_usd_day']:6.2f}/day  N={m['N']:.0f}  v={m['v']}c  mid {m['mid']:.3f}  cap ${m['quote_cap']:.0f}  {m['q'][:70]}")
