@@ -1049,3 +1049,35 @@ class LiveCheckTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertTrue(any("below 90%" in x for x in log))
         self.assertTrue(any("no USDC allowance" in x for x in log))
+
+
+class EarningsCommandTest(unittest.TestCase):
+    def test_every_complete_day_and_every_market(self):
+        data = tempfile.mkdtemp()
+        os.makedirs(os.path.join(data, "live"))
+        t0 = time.time() - 2.5 * 86400
+        with open(os.path.join(data, "live", "live.jsonl"), "w") as f:
+            f.write(json.dumps({"ts": t0, "event": "start", "markets": ["A"]}) + "\n")
+
+        class C:
+            async def close(self):
+                pass
+
+        class Ex:
+            c = C()
+
+            async def earnings(self, day):
+                return {"A": 1.0, "B": 2.5}              # B joined the rolling portfolio later
+
+        async def fake():
+            return Ex()
+        with mock.patch.object(lp, "_live_exec", fake), mock.patch.dict(os.environ, {"POLYBOT_DATA": data}), \
+                mock.patch("builtins.print"):
+            lp.cli("lp-earnings", [])
+        ev = lp.load_events(os.path.join(data, "live"), "live")
+        earn = [e for e in ev if e["event"] == "earnings"]
+        days = [e["day"] for e in earn]
+        self.assertEqual(days[0], time.strftime("%Y-%m-%d", time.gmtime(t0)))
+        self.assertEqual(days[-1], time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400)))
+        self.assertEqual(len(days), len(set(days)))
+        self.assertEqual(earn[0]["by_market"], {"A": 1.0, "B": 2.5})

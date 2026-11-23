@@ -2221,24 +2221,29 @@ def cli(cmd, args):
             print(f"{k}: {round(v, 4) if isinstance(v, float) else v}")
         return
     if cmd == "lp-earnings":
-        # fetch actual earnings for every UTC day of the live test and append them to the journal
-        ev = load_events(cfg.lp_dir, "live")
+        # fetch the rewards actually paid for every complete UTC day of the live run (every market of the wallet,
+        # the rolling portfolio included) and append them to the journal; a later fetch of a day replaces it
+        lp_dir = os.path.join(os.environ["POLYBOT_DATA"], "live") if os.environ.get("POLYBOT_DATA") else cfg.lp_dir
+        ev = load_events(lp_dir, "live")
         t0 = min((e["ts"] for e in ev if e["event"] == "start"), default=None)
         if t0 is None:
-            raise SystemExit("no live journal")
-        conds = next(e["markets"] for e in ev if e["event"] == "start")
+            raise SystemExit(f"no live journal in {lp_dir}")
 
         async def go():
             ex = await _live_exec()
-            j = Journal(os.path.join(cfg.lp_dir, "live.jsonl"))
-            d = t0
-            while d < time.time() - 86400:          # complete days only
-                day = time.strftime("%Y-%m-%d", time.gmtime(d))
+            j = Journal(os.path.join(lp_dir, "live.jsonl"))
+            day = time.strftime("%Y-%m-%d", time.gmtime(t0))
+            last = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400))
+            tot = 0.0
+            while day <= last:                              # complete UTC days only
                 e = await ex.earnings(day)
                 if e is not None:
-                    j.write("earnings", day=day, by_market={c: e.get(c, 0.0) for c in conds})
-                    print(day, f"${sum(e.get(c, 0.0) for c in conds):.2f}")
-                d += 86400
+                    j.write("earnings", day=day, by_market={c: float(v) for c, v in e.items()})
+                    tot += sum(float(v) for v in e.values())
+                    print(day, f"${sum(float(v) for v in e.values()):.2f}")
+                day = time.strftime("%Y-%m-%d", time.gmtime(time.mktime(time.strptime(day, "%Y-%m-%d")) - time.timezone + 86400))
+            print(f"total ${tot:.2f}")
+            j.close()
             await ex.c.close()
         asyncio.run(go())
         return

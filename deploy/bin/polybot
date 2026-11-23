@@ -8,6 +8,7 @@
 #   polybot keys              enter Polymarket keys (hidden input); stored only in /etc/polybot/env
 #   polybot mode paper|live   switch mode; live asks for confirmation and needs keys and the main branch
 #   polybot live-check        check keys, wallet, allowance and the order path (one far post-only order, cancelled)
+#   polybot earnings          fetch the rewards actually paid for every complete day of the live run
 #   polybot new-run           archive the finished run and start a new one
 #   polybot telegram          optional alerts in Telegram (asks for the bot token and chat id)
 #   polybot update            deploy the newest commit now
@@ -76,6 +77,11 @@ case "$cmd" in
     # the keys are read from the env file by the bot user, never put on a command line
     runuser -u polybot -- bash -c "set -a; . '$ENVF'; set +a; cd /tmp; PYTHONPATH='$ROOT/current' POLYBOT_DATA='$DATA' \
       exec '$ROOT/current/.venv/bin/python' -m polybot lp-live-check"
+    ;;
+  earnings)
+    need_root earnings
+    runuser -u polybot -- bash -c "set -a; . '$ENVF'; set +a; cd /tmp; PYTHONPATH='$ROOT/current' POLYBOT_DATA='$DATA' \
+      exec '$ROOT/current/.venv/bin/python' -m polybot lp-earnings"
     ;;
   mode)
     need_root mode
