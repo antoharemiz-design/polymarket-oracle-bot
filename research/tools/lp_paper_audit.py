@@ -1,9 +1,11 @@
 """Audit of the paper fill model on a phase 2 journal (22 Nov): which public trades crossed our orders while they
 stood, and which of them paper counted.
 
-    python3 research/tools/lp_paper_audit.py JOURNAL.jsonl [--hours 48]
+    python3 research/tools/lp_paper_audit.py JOURNAL.jsonl [--hours 48] [--tape DIR]
 
 Standard library only, so it runs on the VPS as is (read-only: the journal and public market data).
+--tape DIR: read each market's taker trades from DIR/<condition>.jsonl (research/tools/lp_tape.py, collected during
+the test) instead of the newest 1000 from the data-api.
 
 Why. Paper (PaperExec) reads the public tape every 30 s and fills only the orders that still stand at that moment.
 An order cancelled or re-priced in between never gets the trades that crossed it while it stood. On a live exchange
@@ -31,6 +33,7 @@ import bisect
 import collections
 import itertools
 import json
+import os
 import sys
 import time
 import urllib.parse
@@ -98,6 +101,7 @@ def lifetimes(ev):
 def main():
     path = sys.argv[1]
     hours = float(sys.argv[sys.argv.index("--hours") + 1]) if "--hours" in sys.argv else 48.0
+    tape_dir = sys.argv[sys.argv.index("--tape") + 1] if "--tape" in sys.argv else None
     ev = [json.loads(line) for line in open(path)]
     t0 = min(e["ts"] for e in ev if e["event"] == "start")
     ev = [e for e in ev if t0 <= e["ts"] <= t0 + hours * 3600]
@@ -128,9 +132,14 @@ def main():
           f"{'paper':>13s} {'missed':>13s} | journal 600 s")
     for c, lts in sorted(by_mkt.items(), key=lambda kv: -len(kv[1])):
         try:
-            d = req(f"{DATA}/v2/trades?" + urllib.parse.urlencode({"condition": c, "taker_only": "true", "limit": 1000}))
+            local = os.path.join(tape_dir, f"{c}.jsonl") if tape_dir else None
+            if local and os.path.exists(local):              # a full tape collected during the test (lp_tape.py)
+                rows = [json.loads(line) for line in open(local)]
+            else:
+                rows = req(f"{DATA}/v2/trades?" + urllib.parse.urlencode(
+                    {"condition": c, "taker_only": "true", "limit": 1000})).get("data") or []
             tape = sorted((r["timestamp"], r["outcome_index"], r["side"][0], float(r["price"]), float(r["size"]))
-                          for r in d.get("data") or [])
+                          for r in rows)
         except Exception as e:
             print(f"{names.get(c, c)[:56]:56s} tape failed: {e!r:.80}")
             continue
