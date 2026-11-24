@@ -1,0 +1,111 @@
+#!/bin/bash
+# Deploy the newest commit of the configured branch:
+#   build a release -> run the tests as the bot user -> switch -> restart -> wait for a healthy service
+#   -> roll back to the previous release if the service does not come up on the new one.
+#
+#   polybot-update            timer mode (every 10 min; does nothing if POLYBOT_AUTO_UPDATE=no)
+#   polybot-update --force    deploy now
+#   polybot-update --install  first install: build, test and switch; the installer starts the service
+set -euo pipefail
+ROOT=${POLYBOT_ROOT:-/opt/polybot}
+DATA=${POLYBOT_DATA:-/var/lib/polybot}
+ETC=${POLYBOT_ETC:-/etc/polybot}
+MODE=${1:-timer}
+
+cfg() { sed -n "s/^$1=//p" "$ETC/env" 2>/dev/null | tail -1; }
+BRANCH=$(cfg POLYBOT_BRANCH); BRANCH=${BRANCH:-main}
+mkdir -p "$DATA/logs"
+LOG=$DATA/logs/update.log
+log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; echo "$*"; }
+sc() { [ -n "${POLYBOT_NO_SYSTEMD:-}" ] || systemctl "$@"; }
+
+if [ "$MODE" = timer ] && [ "$(cfg POLYBOT_AUTO_UPDATE)" = no ]; then exit 0; fi
+exec 9>"$ROOT/.update.lock"
+flock -n 9 || { echo "another update is running"; exit 0; }
+
+git -C "$ROOT/src" fetch -q origin "$BRANCH"
+NEW=$(git -C "$ROOT/src" rev-parse "origin/$BRANCH")
+CUR=$(basename "$(readlink -f "$ROOT/current" 2>/dev/null || echo none)")
+if [ "$MODE" = timer ] && { [ "$NEW" = "$CUR" ] || [ -e "$ROOT/releases/.bad/$NEW" ]; }; then exit 0; fi
+# commits that change no runtime file (reports, research, docs) are not worth a restart of the bot
+if [ "$MODE" = timer ] && [ -d "$ROOT/releases/$CUR" ] && \
+   [ -z "$(git -C "$ROOT/src" diff --name-only "$CUR" "$NEW" -- polybot deploy requirements.txt 2> /dev/null)" ] && \
+   git -C "$ROOT/src" cat-file -e "$CUR^{commit}" 2> /dev/null; then
+  [ -e "$ROOT/releases/.noop-$NEW" ] || { touch "$ROOT/releases/.noop-$NEW"; log "no runtime changes in ${NEW:0:10}; staying on ${CUR:0:10}"; }
+  exit 0
+fi
+
+REL=$ROOT/releases/$NEW
+mark_bad() { mkdir -p "$ROOT/releases/.bad"; touch "$ROOT/releases/.bad/$1"; }
+
+if [ -e "$REL/.ready" ]; then
+  echo "tests: passed ($(cat "$REL/.ready"), cached)"
+else
+  log "building ${NEW:0:10} from $BRANCH"
+  rm -rf "$REL"; mkdir -p "$REL"
+  git -C "$ROOT/src" archive "$NEW" | tar -x -C "$REL"
+  python3 -m venv "$REL/.venv"
+  if ! "$REL/.venv/bin/pip" install -q --disable-pip-version-check -r "$REL/requirements.txt" >> "$LOG" 2>&1; then
+    log "pip install failed for ${NEW:0:10}, see $LOG"; mark_bad "$NEW"; exit 1
+  fi
+  chmod -R a+rX "$REL"
+  if out=$(cd "$REL" && runuser -u polybot -- env HOME="$DATA" "$REL/.venv/bin/python" -B -m unittest discover -s tests 2>&1); then
+    n=$(grep -oE "Ran [0-9]+ tests" <<<"$out" | grep -oE "[0-9]+" || echo "?")
+    echo "$n" > "$REL/.ready"
+    log "tests: passed ($n)"
+  else
+    echo "$out" | tail -40 >> "$LOG"
+    log "tests: FAILED for ${NEW:0:10}; not deployed (details: $LOG)"
+    mark_bad "$NEW"; exit 1
+  fi
+fi
+
+install_runtime() {   # scripts and units of the release being switched to
+  install -d -m 755 "$ROOT/bin"
+  install -m 755 "$1"/deploy/bin/* "$ROOT/bin/"
+  ln -sf "$ROOT/bin/polybot" /usr/local/bin/polybot
+  # Ubuntu's needrestart restarts services after every unattended package upgrade (6 restarts in 20 min on
+  # 17 Nov, 06:17-06:37 UTC). The bot resumes safely, but each restart pulls all quotes: exclude it.
+  if [ -d /etc/needrestart ]; then
+    install -d /etc/needrestart/conf.d
+    printf '%s\n' '# polybot: never restarted by needrestart after package upgrades (a restart pulls all quotes)' \
+      '$nrconf{override_rc}{qr(^polybot)} = 0;' > /etc/needrestart/conf.d/polybot.conf
+  fi
+  if [ -z "${POLYBOT_NO_SYSTEMD:-}" ]; then
+    install -m 644 "$1"/deploy/systemd/* /etc/systemd/system/
+    systemctl daemon-reload
+  fi
+}
+switch_to() { ln -sfn "$1" "$ROOT/current.new"; mv -Tf "$ROOT/current.new" "$ROOT/current"; install_runtime "$1"; }
+
+switch_to "$REL"
+if [ "$MODE" = --install ]; then log "installed ${NEW:0:10}"; exit 0; fi
+
+T0=$(date +%s)
+sc restart polybot
+for _ in $(seq 1 24); do
+  sleep 5
+  if sc is-active --quiet polybot && python3 - "$DATA/service_status.json" "$T0" "$NEW" <<'PY'
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if s.get("ts", 0) >= float(sys.argv[2]) and s.get("release") == sys.argv[3] else 1)
+PY
+  then
+    log "deployed ${NEW:0:10} (was ${CUR:0:10})"
+    # keep the three newest releases and the running one
+    find "$ROOT/releases" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %f\n' | sort -rn | tail -n +4 |
+      while read -r _ d; do [ "$d" = "$NEW" ] || [ "$d" = "$CUR" ] || rm -rf -- "${ROOT:?}/releases/$d"; done
+    exit 0
+  fi
+done
+
+log "health check failed for ${NEW:0:10}; rolling back to ${CUR:0:10}"
+mark_bad "$NEW"
+if [ -d "$ROOT/releases/$CUR" ]; then
+  switch_to "$ROOT/releases/$CUR"
+  sc restart polybot
+fi
+exit 1

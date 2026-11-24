@@ -1,0 +1,144 @@
+#!/bin/bash
+# polybot server control. Run with sudo (status and logs also work without).
+#
+#   polybot status            the same status as status.md in polybot-reports
+#   polybot logs [N]          last N lines of the bot log (default 50)
+#   polybot stop              cancel every quote and stop the bot (the health check leaves it stopped)
+#   polybot start | restart
+#   polybot keys              enter Polymarket keys (hidden input); stored only in /etc/polybot/env
+#   polybot mode paper|live   switch mode; live asks for confirmation and needs keys and the main branch
+#   polybot live-check        check keys, wallet, allowance and the order path (one far post-only order, cancelled)
+#   polybot earnings          fetch the rewards actually paid for every complete day of the live run
+#   polybot new-run           archive the finished run and start a new one
+#   polybot telegram          optional alerts in Telegram (asks for the bot token and chat id)
+#   polybot update            deploy the newest commit now
+#   polybot report            publish status.md now (shows the error if the deploy key is missing)
+#   polybot version
+set -uo pipefail
+ROOT=${POLYBOT_ROOT:-/opt/polybot}
+DATA=${POLYBOT_DATA:-/var/lib/polybot}
+ETC=${POLYBOT_ETC:-/etc/polybot}
+ENVF=$ETC/env
+cfg() { sed -n "s/^$1=//p" "$ENVF" 2>/dev/null | tail -1; }
+need_root() { [ "$(id -u)" = 0 ] || { echo "run with sudo: sudo polybot $*"; exit 1; }; }
+set_kv() {   # set_kv KEY VALUE in /etc/polybot/env
+  local tmp
+  tmp=$(mktemp "$ETC/.env.XXXXXX")
+  grep -v "^$1=" "$ENVF" > "$tmp" || true
+  printf '%s=%s\n' "$1" "$2" >> "$tmp"
+  chown root:polybot "$tmp"; chmod 640 "$tmp"
+  mv -f "$tmp" "$ENVF"
+}
+ask() { local v; read -r -p "$1" v < /dev/tty; echo "$v"; }
+ask_secret() { local v; read -r -s -p "$1" v < /dev/tty; echo >&2; echo "$v"; }
+
+cmd=${1:-help}
+case "$cmd" in
+  status)
+    if [ "$(id -u)" = 0 ]; then as=(runuser -u polybot --); else as=(); fi
+    "${as[@]}" env PYTHONPATH="$ROOT/current" POLYBOT_DATA="$DATA" POLYBOT_MODE="$(cfg POLYBOT_MODE)" \
+      POLYBOT_BRANCH="$(cfg POLYBOT_BRANCH)" "$ROOT/current/.venv/bin/python" -m polybot status-md
+    echo; echo "systemd: $(systemctl is-active polybot) | reports: $(python3 -c "import json;s=json.load(open('$DATA/report_state.json'));print(s['message'])" 2>/dev/null || echo 'not run yet')"
+    ;;
+  logs)
+    tail -n "${2:-50}" "$DATA/logs/service.log"
+    ;;
+  stop)
+    need_root stop
+    touch "$DATA/.stopped"
+    systemctl stop polybot && echo "polybot stopped; all quotes cancelled. Start again: sudo polybot start"
+    ;;
+  start)
+    need_root start
+    rm -f "$DATA/.stopped"
+    systemctl start polybot && sleep 3 && systemctl is-active polybot
+    ;;
+  restart)
+    need_root restart
+    rm -f "$DATA/.stopped"
+    systemctl restart polybot && sleep 3 && systemctl is-active polybot
+    ;;
+  keys)
+    need_root keys
+    echo "Polymarket keys are stored only in $ENVF (readable by root and the bot user). They are never sent anywhere else."
+    k=$(ask_secret "POLYMARKET_PRIVATE_KEY (hidden, Enter to keep the current one): ")
+    [ -n "$k" ] && set_kv POLYMARKET_PRIVATE_KEY "$k"
+    a=$(ask "FUNDER_ADDRESS (your Polymarket wallet address, Enter to keep): ")
+    [ -n "$a" ] && set_kv FUNDER_ADDRESS "$a"
+    r=$(ask_secret "POLYMARKET_RELAYER_KEY (optional, hidden, Enter to skip): ")
+    [ -n "$r" ] && set_kv POLYMARKET_RELAYER_KEY "$r"
+    ra=$(ask "POLYMARKET_RELAYER_ADDRESS (optional, Enter to skip): ")
+    [ -n "$ra" ] && set_kv POLYMARKET_RELAYER_ADDRESS "$ra"
+    echo "saved. Mode is unchanged: $(cfg POLYBOT_MODE). Live is switched on separately: sudo polybot mode live"
+    ;;
+  live-check)
+    need_root live-check
+    [ -n "$(cfg POLYMARKET_PRIVATE_KEY)" ] || { echo "no keys yet: sudo polybot keys"; exit 1; }
+    # the keys are read from the env file by the bot user, never put on a command line
+    runuser -u polybot -- bash -c "set -a; . '$ENVF'; set +a; cd /tmp; PYTHONPATH='$ROOT/current' POLYBOT_DATA='$DATA' \
+      exec '$ROOT/current/.venv/bin/python' -m polybot lp-live-check"
+    ;;
+  earnings)
+    need_root earnings
+    runuser -u polybot -- bash -c "set -a; . '$ENVF'; set +a; cd /tmp; PYTHONPATH='$ROOT/current' POLYBOT_DATA='$DATA' \
+      exec '$ROOT/current/.venv/bin/python' -m polybot lp-earnings"
+    ;;
+  mode)
+    need_root mode
+    case "${2:-}" in
+      paper)
+        set_kv POLYBOT_MODE paper; set_kv POLYBOT_ALLOW_LIVE no
+        systemctl restart polybot; echo "mode: paper" ;;
+      live)
+        [ -n "$(cfg POLYMARKET_PRIVATE_KEY)" ] || { echo "no keys yet: sudo polybot keys"; exit 1; }
+        [ "$(cfg POLYBOT_BRANCH)" = main ] || { echo "live runs only from the main branch (this server: $(cfg POLYBOT_BRANCH)). Merge first, then: sudo polybot branch main"; exit 1; }
+        g=$(curl -fsS --max-time 20 https://polymarket.com/api/geoblock || echo '{}')
+        echo "geoblock: $g"
+        echo "$g" | grep -q '"blocked":false' || { echo "Polymarket blocks or did not confirm this server; live refused"; exit 1; }
+        c=$(ask "This sends REAL orders with REAL money. Type LIVE to confirm: ")
+        [ "$c" = LIVE ] || { echo "not confirmed"; exit 1; }
+        set_kv POLYBOT_MODE live; set_kv POLYBOT_ALLOW_LIVE yes
+        systemctl restart polybot; echo "mode: live" ;;
+      *) echo "usage: polybot mode paper|live"; exit 1 ;;
+    esac
+    ;;
+  branch)
+    need_root branch
+    [ -n "${2:-}" ] || { echo "usage: polybot branch NAME"; exit 1; }
+    set_kv POLYBOT_BRANCH "$2"; "$ROOT/bin/polybot-update" --force
+    ;;
+  telegram)
+    need_root telegram
+    echo "1) In Telegram open @BotFather, send /newbot, copy the token. 2) Send any message to your new bot."
+    t=$(ask_secret "bot token (hidden): ")
+    [ -n "$t" ] || { echo "nothing changed"; exit 0; }
+    chat=$(curl -fsS --max-time 20 "https://api.telegram.org/bot$t/getUpdates" | python3 -c '
+import json, sys
+r = json.load(sys.stdin).get("result") or []
+print(r[-1]["message"]["chat"]["id"] if r and "message" in r[-1] else "")' 2> /dev/null || true)
+    [ -n "$chat" ] || { echo "no message found: send any message to your bot first, then run sudo polybot telegram again"; exit 1; }
+    set_kv TELEGRAM_BOT_TOKEN "$t"; set_kv TELEGRAM_CHAT_ID "$chat"
+    curl -fsS --max-time 20 "https://api.telegram.org/bot$t/sendMessage" -d chat_id="$chat" -d text="polybot: alerts are on" > /dev/null \
+      && echo "test message sent to chat $chat; alerts are on"
+    ;;
+  new-run)
+    need_root new-run
+    m=$(cfg POLYBOT_MODE); m=${m:-paper}
+    [ -d "$DATA/$m" ] && mv "$DATA/$m" "$DATA/$m-archived-$(date -u +%Y%m%dT%H%M%SZ)"
+    systemctl restart polybot; echo "new $m run started; the previous one is in $DATA/$m-archived-*"
+    ;;
+  update)
+    need_root update
+    "$ROOT/bin/polybot-update" --force
+    ;;
+  report)
+    need_root report
+    runuser -u polybot -- "$ROOT/bin/polybot-report"
+    ;;
+  version)
+    echo "release $(basename "$(readlink -f "$ROOT/current")"), branch $(cfg POLYBOT_BRANCH), mode $(cfg POLYBOT_MODE)"
+    ;;
+  *)
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+    ;;
+esac

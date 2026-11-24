@@ -1,0 +1,23 @@
+[Unit]
+Description=polybot: liquidity-rewards bot (paper by default)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polybot
+Group=polybot
+EnvironmentFile=/etc/polybot/env
+WorkingDirectory=/opt/polybot/current
+ExecStart=/opt/polybot/current/.venv/bin/python -m polybot service
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/polybot
+
+[Install]
+WantedBy=multi-user.target
