@@ -7,7 +7,9 @@ import json
 import os
 import tempfile
 import time
+import types
 import unittest
+from decimal import Decimal
 from unittest import mock
 
 from polybot import lp
@@ -471,6 +473,34 @@ class Phase2LoopTest(unittest.TestCase):
         self.step(t, 5)
         self.assertIsNotNone(s.orders["bid"])              # flat again: two-sided quotes come back
         self.assertIn("C1", t.st)
+
+    def test_failed_taker_close_waits_and_is_reported(self):
+        """A taker close that does not fill is an error in the journal and is not retried for flatten_retry_s, so the
+        reducing quote can rest in between (live, 25 Nov: every close was refused and the quotes were cancelled every
+        step)."""
+        t = self.make([mk("C1")])
+        self.step(t)
+        oid = t.st["C1"].orders["bid"][0]
+        self.ex.inject = [{"order": oid, "mkt": "C1", "side": "bid", "price": 0.48, "size": 20.0, "ts": self.clock.t, "done": True}]
+        self.step(t, 1)
+        s = t.st["C1"]
+        self.step(t, 1)
+        calls = []
+
+        async def refuse(m, side, size, bids, asks, **kw):
+            calls.append((side, size))
+            return None
+        self.ex.take = refuse
+        self.step(t, 3600)
+        self.assertEqual(calls, [("ask", 20.0)])
+        self.assertEqual(t.errors, 1)
+        err = [e for e in journal_events(self.j) if e["event"] == "error"]
+        self.assertIn("taker close did not fill (position held 1 h)", err[0]["error"])
+        self.step(t, 5)
+        self.assertEqual(len(calls), 1)                    # paused
+        self.assertIsNotNone(s.orders["ask"])              # the reducing quote rests meanwhile
+        self.step(t, 60)
+        self.assertEqual(len(calls), 2)                    # tried again after the pause
 
     def test_mid_out_of_range_starts_exit(self):
         t = self.make([mk("C1")])
@@ -975,6 +1005,75 @@ class LiveAccountingTest(unittest.TestCase):
         self.assertEqual(earn[0]["day"], day0)
         self.assertEqual(earn[0]["by_market"], {"C1": 1.5, "GONE": 2.0})
         j.close()
+
+
+class LiveTakeTest(unittest.TestCase):
+    """LiveExec.take: the closing order is a FAK market BUY sized in USDC (polymarket-client refuses `shares` for a
+    BUY: every live close failed on 25 Nov), and the shares bought come from the order's taking amount."""
+
+    def client(self, resp=None, fill=None, exc=None):
+        class C:
+            def __init__(self):
+                self.bal = {"YC1": 0.0, "NC1": 0.0}
+                self.sent = []
+
+            async def get_balance_allowance(self, asset_type, token_id):
+                return types.SimpleNamespace(balance=int(self.bal[token_id] * 1e6))
+
+            async def place_market_order(self, **kw):
+                self.sent.append(kw)
+                if exc:
+                    raise exc
+                if fill:
+                    self.bal[kw["token_id"]] += fill
+                return resp
+        return C()
+
+    def take(self, c, side, size, bids, asks):
+        log = []
+        ex = lp.LiveExec(c, log=log.append)
+        return asyncio.run(ex.take(mk("C1"), side, size, bids, asks, wait_s=1.5)), log
+
+    def test_long_yes_buys_no_with_usdc(self):
+        resp = types.SimpleNamespace(ok=True, taking_amount=Decimal("20"), making_amount=Decimal("10.6"), status="matched")
+        c = self.client(resp, fill=20.0)
+        r, log = self.take(c, "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
+        self.assertEqual(c.sent, [{"token_id": "NC1", "side": "BUY", "amount": "10.60", "max_price": "0.55",
+                                   "order_type": "FAK"}])
+        self.assertNotIn("shares", c.sent[0])
+        self.assertAlmostEqual(r["size"], 20.0)
+        self.assertAlmostEqual(r["price"], 0.47)           # YES terms: 1 - 10.60 / 20
+        self.assertAlmostEqual(r["fee"], 20.0 * 0.05 * 0.53 * 0.47)
+        self.assertIn("closing order filled", log[-1])
+
+    def test_long_no_buys_yes_partial_fill(self):
+        resp = types.SimpleNamespace(ok=True, taking_amount=Decimal("12.5"), making_amount=Decimal("6.25"), status="matched")
+        r, _ = self.take(self.client(resp, fill=12.5), "bid", 30.0, [(0.47, 50.0)], [(0.49, 12.0), (0.51, 50.0)])
+        self.assertAlmostEqual(r["size"], 12.5)            # deeper fills buy fewer shares; the rest closes later
+        self.assertAlmostEqual(r["price"], 0.5)
+
+    def test_small_lot_spends_the_minimum(self):
+        resp = types.SimpleNamespace(ok=True, taking_amount=Decimal("6"), making_amount=Decimal("0.9"), status="matched")
+        c = self.client(resp, fill=6.0)
+        self.take(c, "bid", 5.0, [(0.12, 50.0)], [(0.15, 50.0)])
+        self.assertEqual((c.sent[0]["token_id"], c.sent[0]["amount"], c.sent[0]["max_price"]), ("YC1", "1.00", "0.17"))
+
+    def test_wallet_fallback_when_amounts_missing(self):
+        resp = types.SimpleNamespace(ok=True, taking_amount=Decimal("0"), making_amount=Decimal("0"), status="delayed")
+        r, _ = self.take(self.client(resp, fill=19.0), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
+        self.assertAlmostEqual(r["size"], 19.0)
+        self.assertAlmostEqual(r["price"], 0.47)           # no amounts: the best price
+
+    def test_rejected_and_failed(self):
+        rej = types.SimpleNamespace(ok=False, code="fak_not_filled", message="no orders found to match")
+        r, log = self.take(self.client(rej), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
+        self.assertIsNone(r)
+        self.assertIn("closing order rejected: fak_not_filled", log[-1])
+        r, log = self.take(self.client(exc=RuntimeError("down")), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
+        self.assertIsNone(r)
+        self.assertIn("closing order failed", log[-1])
+        r, _ = self.take(self.client(), "ask", 20.0, [], [(0.49, 50.0)])
+        self.assertIsNone(r)                               # no bids to sell into
 
 
 class LiveCheckTest(unittest.TestCase):

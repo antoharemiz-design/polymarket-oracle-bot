@@ -85,6 +85,8 @@ class LPConfig:
     dust_shares: float = 5.0           # positions below this are left alone (the exchange's minimum order)
     inv_reduce_h: float = 0.0          # a position held this long: only the reducing side is quoted (0 = off)
     inv_flatten_h: float = 0.0         # a position held this long is closed by a taker order (0 = off)
+    flatten_retry_s: float = 60.0      # after a taker close that did not fill, the next try waits this long (the quotes
+                                       # are cancelled before each try and would otherwise never rest)
     exit_improve_ticks: int = 0        # phase 3: quotes that reduce a position sit this many ticks inside the spread
                                        # (first in the queue), never crossing; 0 = join the best price
     reduce_improve_always: int = 0     # 1: also while not exiting / aged, the reducing side is improved (when |pos| >=
@@ -1155,41 +1157,57 @@ class LiveExec:
             out.append(b.balance / 1e6)
         return tuple(out)
 
+    MIN_TAKE_USD = 1.0                    # the exchange's minimum spend of a marketable BUY order
+
     async def take(self, m, side, size, bids, asks, slippage=0.02, wait_s=10.0):
-        """Taker order closing a position (phase 2 exit): a fill-and-kill BUY of the NO token (side "ask") or the
-        YES token (side "bid") for `size` shares, at most `slippage` worse than the best price of the other orders.
-        The filled size is read from the on-chain balance; reconcile() adopts any difference later.
-        Not exercised by the paper test; live use needs its own check with small size first."""
+        """Taker order closing a position (phase 2 exit): a fill-and-kill BUY of the NO token (side "ask", long YES)
+        or of the YES token (side "bid", long NO); the pairs are merged afterwards.
+        A market BUY is sized in USDC (polymarket-client: `amount`; `shares` is refused for BUY, 25 Nov live):
+        `size` shares at the best price of the other orders, at most `slippage` worse (`max_price`). Fills deeper
+        in the book buy fewer shares, and the rest is closed at a later step. The spend is at least
+        MIN_TAKE_USD, so a small lot may buy a few more shares than `size`.
+        The bought shares and their price are the order's taking and making amounts; the on-chain balance change is
+        the fallback, and reconcile() adopts any difference later."""
         levels = bids if side == "ask" else asks
         if not levels:
             return None
         best = levels[0][0]
-        token, limit = (m["no"], 1 - best + slippage) if side == "ask" else (m["yes"], best + slippage)
-        limit = min(0.99, round(limit, 2))
+        token, pay = (m["no"], 1 - best) if side == "ask" else (m["yes"], best)
+        limit = min(0.99, round(pay + slippage, 2))
+        amount = max(self.MIN_TAKE_USD, int(size * pay * 100 + 1e-6) / 100)
         try:
             before = await self.balances(m)
-            r = await self.c.place_market_order(token_id=token, side="BUY", shares=str(round(size, 2)),
-                                                max_price=str(limit), order_type="FAK")
+            r = await self.c.place_market_order(token_id=token, side="BUY", amount=f"{amount:.2f}",
+                                                max_price=f"{limit:.2f}", order_type="FAK")
         except Exception as e:
             self.log(f"closing order failed: {e!r}")
             return None
         if not getattr(r, "ok", False):
-            self.log(f"closing order rejected: {getattr(r, 'code', r)}")
+            self.log(f"closing order rejected: {getattr(r, 'code', r)} {getattr(r, 'message', '')}".rstrip())
             return None
+        try:
+            shares, spent = float(r.taking_amount), float(r.making_amount)
+        except Exception:
+            shares = spent = 0.0
+        if not 0 < shares <= 3 * amount / max(pay, 0.01):   # implausible amounts: trust the wallet instead
+            shares = spent = 0.0
         got, t0 = 0.0, time.time()
-        while time.time() - t0 < wait_s:
+        while time.time() - t0 < wait_s:              # wait for the settlement, so the merge finds the shares
             await asyncio.sleep(1.0)
             try:
                 after = await self.balances(m)
             except Exception:
                 continue
             got = (after[1] - before[1]) if side == "ask" else (after[0] - before[0])
-            if got > 1e-9:
+            if got > 1e-9 and got >= 0.99 * shares:
                 break
+        got = shares or got
         if got <= 1e-9:
             return None
-        px = best                                     # YES-terms estimate: the best price at the time of the order
+        paid = spent / shares if shares and 0 < spent < shares else pay   # average price of the bought token
+        px = 1 - paid if side == "ask" else paid      # in YES terms
         tp = 1 - px if side == "ask" else px
+        self.log(f"closing order filled: {side} {got:.2f} at {paid:.3f} (asked {size:.2f}, spent ${spent or amount:.2f})")
         return {"side": side, "price": px, "size": got, "fee": got * float(m.get("fee_rate") or 0.0) * tp * (1 - tp)}
 
     async def merge(self, m, pairs):
@@ -1280,6 +1298,7 @@ class MarketState:
         self.exit_since = None                          # phase 2: left the portfolio (or lost its reward) at this time
         self.pos_since = None                           # phase 2: since when |YES - NO| >= dust_shares
         self.lots = []                                  # phase 3 (inv_fifo): [ts, signed YES - NO quantity], oldest first
+        self.flatten_retry_at = 0.0                     # no taker close before this time (the last one did not fill)
         self.book = None                                # (bids, asks) of the other orders at the last step
         try:
             self.end_ts = _ts(m["end"]) if m.get("end") else None
@@ -1566,8 +1585,13 @@ class LPTest:
                 self.j.write("cancel", mkt=s.m["cond"], side=side, price=cur[1], scope=res)
         pos = s.pos()
         side = "ask" if pos > 0 else "bid"
-        r = await self.ex.take(s.m, side, round(min(abs(pos), qty) if qty else abs(pos), 2), ob, oa)
+        want = round(min(abs(pos), qty) if qty else abs(pos), 2)
+        r = await self.ex.take(s.m, side, want, ob, oa)
         if not r or r.get("size", 0.0) <= 1e-9:
+            s.flatten_retry_at = now + self.cfg.flatten_retry_s
+            self.errors += 1
+            self.j.write("error", error=f"taker close did not fill ({reason}): {s.m.get('q', s.m['cond'])[:60]} "
+                                        f"{side} {want:.2f}; next try in {self.cfg.flatten_retry_s:.0f} s")
             return
         if side == "bid":
             s.yes += r["size"]; s.cash -= r["size"] * r["price"]
@@ -1727,6 +1751,8 @@ class LPTest:
                     qty = s.aged_qty(now, self.cfg.inv_flatten_h * 3600)   # only the lots older than the limit
                     if qty < self.cfg.dust_shares:
                         due = None
+                if due and now < s.flatten_retry_at:
+                    due = None
                 if due:
                     await self._flatten(s, now, ob, oa, due, qty)
             if sample:
