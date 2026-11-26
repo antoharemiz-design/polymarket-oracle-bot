@@ -1145,15 +1145,22 @@ class LiveTakeTest(unittest.TestCase):
 class LiveCheckTest(unittest.TestCase):
     """lp-live-check: keys, wallet, allowance and a far-from-market post-only order placed and cancelled."""
 
-    def run_check(self, cash, allow):
+    def run_check(self, cash, allow, cfg=None, token_allow=10 ** 12, broken_sdk=False):
         log = []
+        built = []
 
         class C:
-            async def get_balance_allowance(self, asset_type):
+            async def get_balance_allowance(self, asset_type, token_id=None):
                 class B:
                     balance = int(cash * 1e6)
-                    allowances = {"exchange": allow}
+                    allowances = {"exchange": allow if asset_type == "COLLATERAL" else token_allow}
                 return B()
+
+            async def create_market_order(self, *, token_id, side, amount=None, shares=None, min_price=None,
+                                          max_price=None, order_type="FAK"):
+                if broken_sdk or (side == "BUY" and amount is None) or (side == "SELL" and shares is None):
+                    raise ValueError("amount is required for BUY market orders.")
+                built.append((token_id, side, amount, shares))
 
             def list_account_trades(self, after):
                 class P:
@@ -1199,7 +1206,8 @@ class LiveCheckTest(unittest.TestCase):
                 mock.patch.object(lp, "rewards_config", lambda: {"C1": {"rate": 10.0, "v": 4.5, "min": 20.0}}), \
                 mock.patch.object(lp, "gamma_markets", lambda conds: gm), \
                 mock.patch.object(lp, "books", lambda toks: {"Y1": ([(0.45, 100.0)], [(0.47, 100.0)], 0.01)}):
-            rc = asyncio.run(lp.live_check(lp.phase3_config(), out=log.append))
+            rc = asyncio.run(lp.live_check(cfg or lp.phase4_config(), out=log.append))
+        self.built = built
         return rc, log, ex
 
     def test_ok(self):
@@ -1207,7 +1215,24 @@ class LiveCheckTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(ex.placed, [("C1", "bid", 0.35, 5.0)])      # 10 ticks below the best bid, exchange minimum
         self.assertEqual(ex.cancelled, ["oid-1"])
+        self.assertEqual([(b[0], b[1]) for b in self.built], [("Y1", "SELL"), ("N1", "BUY")])   # built, never posted
+        self.assertTrue(any(x.startswith("8. note: no relayer key") for x in log))
         self.assertIn("RESULT: OK", log[-1])
+
+    def test_taker_close_contract_is_checked(self):
+        rc, log, _ = self.run_check(300.0, 10 ** 12, broken_sdk=True)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("taker close order cannot be built" in x for x in log))
+
+    def test_selling_needs_the_token_allowance(self):
+        rc, log, _ = self.run_check(300.0, 10 ** 12, token_allow=0)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("no conditional token allowance" in x for x in log))
+
+    def test_phase3_needs_a_relayer_key(self):
+        rc, log, _ = self.run_check(300.0, 10 ** 12, cfg=lp.phase3_config())
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("merges pairs only through the relayer" in x for x in log))
 
     def test_short_wallet_and_no_allowance(self):
         rc, log, _ = self.run_check(100.0, 0)

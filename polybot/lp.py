@@ -2500,9 +2500,33 @@ async def live_check(cfg, out=print):
             bad("reward earnings could not be read")
         pct = await ex.reward_pct()
         out(f"5. reward percentages readable: {'yes' if pct is not None else 'no'}")
-        if not (os.environ.get("POLYMARKET_RELAYER_KEY") and os.environ.get("POLYMARKET_RELAYER_ADDRESS")):
-            out("   note: no relayer key: merging YES + NO pairs back into USDC may need gas (POL) in the wallet "
-                "or may fail; unmerged pairs only lock capital, they do not lose money")
+        # 6 (26 Nov): the calls that failed live, built and signed by the SDK but NOT posted: a market SELL of
+        # shares (phase 4 taker close) and a market BUY of an amount (phase 2-3 taker close)
+        try:
+            await ex.c.create_market_order(token_id=m["token"], side="SELL", shares=f"{size:.2f}",
+                                           min_price=f"{max(tick, bids[0][0] - 2 * tick):.4f}", order_type="FAK")
+            await ex.c.create_market_order(token_id=m["no"], side="BUY", amount="1.00",
+                                           max_price=f"{min(0.99, 1 - bids[0][0] + 2 * tick):.4f}", order_type="FAK")
+            out("6. taker close orders (market SELL of shares, market BUY of an amount): built and signed, not posted")
+        except Exception as e:
+            bad(f"a taker close order cannot be built: {e!r:.200}")
+        # 7: selling the tokens held (sell_to_reduce) needs the exchange's approval of the conditional tokens
+        tb = await ex.c.get_balance_allowance(asset_type="CONDITIONAL", token_id=m["token"])
+        if any(int(v) > 0 for v in (tb.allowances or {}).values()):
+            out("7. conditional token allowance for the exchange: set (the bot can sell the tokens it holds)")
+        elif cfg.sell_to_reduce:
+            bad("no conditional token allowance: the bot could buy but not sell; sell any token once on "
+                "polymarket.com with this wallet, then check again")
+        else:
+            out("7. note: no conditional token allowance (only needed with sell_to_reduce)")
+        if os.environ.get("POLYMARKET_RELAYER_KEY") and os.environ.get("POLYMARKET_RELAYER_ADDRESS"):
+            out("8. relayer key: set (YES + NO pairs can be merged)")
+        elif cfg.sell_to_reduce:
+            out("8. note: no relayer key: polymarket-client cannot merge YES + NO pairs without one; with "
+                "sell_to_reduce the bot forms no pairs, pairs made by hand wait for the outcome ($1 each)")
+        else:
+            bad("no relayer key: polymarket-client merges pairs only through the relayer (with a relayer or builder "
+                "API key); without one the pairs lock the capital (phases 2-3)")
     except Exception as e:
         bad(f"failed: {e!r:.300}")
     finally:
