@@ -26,6 +26,7 @@ import dataclasses
 import gzip
 import itertools
 import json
+import math
 import os
 import re
 import sys
@@ -86,6 +87,26 @@ class LPConfig:
     merge_min_shares: float = 0.0      # > 0: YES + NO pairs are merged from this many on (0: from N, the quote size);
                                        # live 26 Nov: pairs just below N locked the whole wallet (USDC $3.29 left)
     reserve_counts_pairs: int = 0      # 1: unmerged pairs count toward the reserve like the net position
+    # phase 4 (26 Nov, after the live loss): safety of the live path
+    sell_to_reduce: int = 0            # 1: the side that reduces the position SELLs the token held (post-only) instead of
+                                       # buying the other one, and the taker close is a market SELL of exact shares:
+                                       # no YES + NO pairs, no merges (they need a relayer key), cash comes back at once
+    liquidate_on_stop: int = 0         # 1: the loss stop also closes every position by taker orders (retried every
+                                       # flatten_retry_s, at most liquidate_max_h), not only cancels the quotes
+    liquidate_max_h: float = 2.0
+    market_loss_usd: float = 0.0       # > 0: a market whose own PnL (marked to mid) falls below -this is closed by taker
+                                       # and blocked for the rest of the run
+    markout_kill_usd: float = 0.0      # > 0: a market whose fills lost this much at the 600 s markout is closed and blocked
+    vol_risk_usd: float = 0.0          # > 0: a side may grow the position only while vol_k sigma of the mid over an hour
+    vol_k: float = 2.0                 #   costs at most vol_risk_usd on the position after a fill of N
+    vol_floor: float = 0.01            #   sigma below this counts as this (price units per hour)
+    fill_cooldown_s: float = 0.0       # > 0: after a fill, that side is not quoted again for this long while it would grow
+                                       # the position (an informed sweep fills us once, not again and again)
+    equity_stop: int = 0               # 1 (live): the loss stop also uses the wallet equity (USDC + on-chain positions at
+                                       # mid), read every equity_every_s, so a wrong internal position cannot hide a loss
+    equity_every_s: float = 600.0
+    wx_local_stop_h: float = -1.0      # >= 0: weather markets are not quoted from this local hour of their measured day on
+                                       # (the outcome is being observed: informed flow); -1 = off
     inv_reduce_h: float = 0.0          # a position held this long: only the reducing side is quoted (0 = off)
     inv_flatten_h: float = 0.0         # a position held this long is closed by a taker order (0 = off)
     flatten_retry_s: float = 60.0      # after a taker close that did not fill, the next try waits this long (the quotes
@@ -127,6 +148,11 @@ PHASE2 = {"quote_budget_usd": 300.0, "capital_usd": 500.0, "stop_loss_usd": 100.
 PHASE3 = {"exit_improve_ticks": 1, "reduce_improve_always": 1, "inv_fifo": 1, "paper_lifetime": 1,
           "capital_usd": 300.0, "quote_budget_usd": 200.0, "stop_loss_usd": 60.0, "merge_min_shares": 5.0,
           "reserve_counts_pairs": 1}
+# phase 4 (26 Nov, after the live loss of 25-26 Nov): the phase 3 rules plus the safety of the live path; the
+# adverse-selection settings are set from research/lp_phase3_report.md (weather study)
+PHASE4 = {"sell_to_reduce": 1, "liquidate_on_stop": 1, "equity_stop": 1, "equity_every_s": 60.0,
+          "market_loss_usd": 6.0, "markout_kill_usd": 3.0, "vol_risk_usd": 4.0, "vol_k": 2.0,
+          "fill_cooldown_s": 300.0}
 
 
 def from_env(phase=None) -> LPConfig:
@@ -140,6 +166,9 @@ def from_env(phase=None) -> LPConfig:
     if c.phase >= 3:
         for k, v in PHASE3.items():
             setattr(c, k, v)
+    if c.phase >= 4:
+        for k, v in PHASE4.items():
+            setattr(c, k, v)
     for f in dataclasses.fields(c):
         raw = os.environ.get("LP_" + f.name.upper())
         if raw is not None and f.name != "phase":
@@ -151,6 +180,16 @@ def phase3_config(**kw) -> LPConfig:
     """LPConfig with the phase 3 settings (no environment), for tests and research tools."""
     c = phase2_config(phase=3)
     for k, v in PHASE3.items():
+        setattr(c, k, v)
+    for k, v in kw.items():
+        setattr(c, k, v)
+    return c
+
+
+def phase4_config(**kw) -> LPConfig:
+    """LPConfig with the phase 4 settings (phase 3 + the safety of the live path), for tests and research tools."""
+    c = phase3_config(phase=4)
+    for k, v in PHASE4.items():
         setattr(c, k, v)
     for k, v in kw.items():
         setattr(c, k, v)
@@ -230,6 +269,65 @@ def m1_fraction(bids, asks, my_bid, my_ask, size, v_c, min_size) -> float:
         return 0.0
     comp = (side_score(bids, mid, v_c, min_size, "bid") + side_score(asks, mid, v_c, min_size, "ask")) / 2
     return mine / (comp + mine)
+
+
+# weather markets ("highest temperature in <city> ... on <Month> <day>?"): the city's time zone, so the bot knows when
+# the measured day starts there (phase 4, wx_local_stop_h)
+WX_TZ = {
+    "amsterdam": "Europe/Amsterdam", "ankara": "Europe/Istanbul", "athens": "Europe/Athens", "atlanta": "America/New_York",
+    "auckland": "Pacific/Auckland", "austin": "America/Chicago", "bangkok": "Asia/Bangkok", "barcelona": "Europe/Madrid",
+    "beijing": "Asia/Shanghai", "berlin": "Europe/Berlin", "bogota": "America/Bogota", "boston": "America/New_York",
+    "buenos aires": "America/Argentina/Buenos_Aires", "busan": "Asia/Seoul", "cairo": "Africa/Cairo",
+    "calgary": "America/Edmonton", "cape town": "Africa/Johannesburg", "chengdu": "Asia/Shanghai",
+    "chicago": "America/Chicago", "chongqing": "Asia/Shanghai", "copenhagen": "Europe/Copenhagen",
+    "dallas": "America/Chicago", "delhi": "Asia/Kolkata", "denver": "America/Denver", "doha": "Asia/Qatar",
+    "dubai": "Asia/Dubai", "dublin": "Europe/Dublin", "guangzhou": "Asia/Shanghai", "hanoi": "Asia/Bangkok",
+    "helsinki": "Europe/Helsinki", "ho chi minh city": "Asia/Ho_Chi_Minh", "hong kong": "Asia/Hong_Kong",
+    "houston": "America/Chicago", "istanbul": "Europe/Istanbul", "jakarta": "Asia/Jakarta", "jeddah": "Asia/Riyadh",
+    "johannesburg": "Africa/Johannesburg", "karachi": "Asia/Karachi", "kuala lumpur": "Asia/Kuala_Lumpur",
+    "kyiv": "Europe/Kyiv", "lagos": "Africa/Lagos", "las vegas": "America/Los_Angeles", "lima": "America/Lima",
+    "lisbon": "Europe/Lisbon", "london": "Europe/London", "los angeles": "America/Los_Angeles",
+    "lucknow": "Asia/Kolkata", "madrid": "Europe/Madrid", "manila": "Asia/Manila", "melbourne": "Australia/Melbourne",
+    "mexico city": "America/Mexico_City", "miami": "America/New_York", "milan": "Europe/Rome",
+    "minneapolis": "America/Chicago", "montreal": "America/Toronto", "moscow": "Europe/Moscow", "mumbai": "Asia/Kolkata",
+    "munich": "Europe/Berlin", "nairobi": "Africa/Nairobi", "new delhi": "Asia/Kolkata", "new york": "America/New_York",
+    "new york city": "America/New_York", "nyc": "America/New_York", "osaka": "Asia/Tokyo", "oslo": "Europe/Oslo",
+    "panama city": "America/Panama", "paris": "Europe/Paris", "philadelphia": "America/New_York",
+    "phoenix": "America/Phoenix", "prague": "Europe/Prague", "qingdao": "Asia/Shanghai", "riyadh": "Asia/Riyadh",
+    "rome": "Europe/Rome", "san francisco": "America/Los_Angeles", "santiago": "America/Santiago",
+    "sao paulo": "America/Sao_Paulo", "seattle": "America/Los_Angeles", "seoul": "Asia/Seoul",
+    "shanghai": "Asia/Shanghai", "shenzhen": "Asia/Shanghai", "singapore": "Asia/Singapore",
+    "stockholm": "Europe/Stockholm", "sydney": "Australia/Sydney", "taipei": "Asia/Taipei", "tel aviv": "Asia/Jerusalem",
+    "tokyo": "Asia/Tokyo", "toronto": "America/Toronto", "vancouver": "America/Vancouver", "vienna": "Europe/Vienna",
+    "warsaw": "Europe/Warsaw", "washington": "America/New_York", "washington dc": "America/New_York",
+    "wellington": "Pacific/Auckland", "wuhan": "Asia/Shanghai", "zurich": "Europe/Zurich",
+}
+_WX_RE = re.compile(r"(?:highest|lowest) temperature in (.+?) (?:be|on) .*?on ([A-Z][a-z]+) (\d{1,2})\b")
+_MONTHS = {m: i for i, m in enumerate(("January", "February", "March", "April", "May", "June", "July", "August",
+                                         "September", "October", "November", "December"), 1)}
+
+
+def wx_local_hours(question, now):
+    """Hours since local midnight of the measured day of a weather market at `now` (negative before the day starts),
+    or None when the question is not a known city's daily temperature market."""
+    m = _WX_RE.search(question or "")
+    if not m or m.group(2) not in _MONTHS:
+        return None
+    city = m.group(1).split(" (")[0].strip().lower()
+    tz = WX_TZ.get(city)
+    if tz is None:
+        return None
+    try:
+        import datetime
+        import zoneinfo
+        z = zoneinfo.ZoneInfo(tz)
+    except Exception:
+        return None
+    local = datetime.datetime.fromtimestamp(now, z)
+    month, day = _MONTHS[m.group(2)], int(m.group(3))
+    year = local.year + (1 if month < local.month - 6 else -1 if month > local.month + 6 else 0)
+    start = datetime.datetime(year, month, day, tzinfo=z)
+    return (local - start).total_seconds() / 3600
 
 
 def targets(bids, asks, tick, v_c, pos, cap):
@@ -975,10 +1073,10 @@ class PaperExec:
         self.trades_fn, self.every_s, self.last_poll = trades_fn, every_s, 0.0
         self.skipped = 0
 
-    async def place(self, m, side, price, size):
+    async def place(self, m, side, price, size, sell=False):
         self.n += 1
         oid = f"paper-{self.n}"
-        self.orders[oid] = {"mkt": m["cond"], "side": side, "price": price, "rem": size, "t": self.clock()}
+        self.orders[oid] = {"mkt": m["cond"], "side": side, "price": price, "rem": size, "t": self.clock(), "sell": sell}
         return oid
 
     def _gone(self, oid, o):
@@ -1035,13 +1133,14 @@ class PaperExec:
                 if done:
                     self.orders.pop(oid, None)
                     self.gone.pop(oid, None)
-                out.append({"order": oid, "mkt": m["cond"], "side": hit, "price": o["price"], "size": q, "ts": ts, "done": done})
+                out.append({"order": oid, "mkt": m["cond"], "side": hit, "price": o["price"], "size": q, "ts": ts, "done": done,
+                            "sell": bool(o.get("sell"))})
         return out
 
     async def merge(self, m, pairs):
         return pairs
 
-    async def take(self, m, side, size, bids, asks):
+    async def take(self, m, side, size, bids, asks, sell=False):
         """Paper taker order of `size` against the other orders' YES book: side "ask" = BUY NO (closes a long YES)
         walking the YES bids, side "bid" = BUY YES walking the YES asks. Taker fee fee_rate x p x (1 - p) per share
         of the token bought. Returns {side, price (YES terms, size-weighted), size, fee} or None (empty book)."""
@@ -1056,7 +1155,10 @@ class PaperExec:
             return None
         px = val / got
         tp = 1 - px if side == "ask" else px
-        return {"side": side, "price": px, "size": got, "fee": got * float(m.get("fee_rate") or 0.0) * tp * (1 - tp)}
+        r = {"side": side, "price": px, "size": got, "fee": got * float(m.get("fee_rate") or 0.0) * tp * (1 - tp)}
+        if sell:                                        # same price in YES terms: selling YES into the bids
+            r["sell"] = True
+        return r
 
     async def reward_pct(self):
         return None
@@ -1089,10 +1191,16 @@ class LiveExec:
         api_key = RelayerApiKey(key=relayer_key, address=relayer_address) if relayer_key and relayer_address else None
         return cls(await AsyncSecureClient.create(private_key=private_key, wallet=wallet or None, api_key=api_key), log)
 
-    async def place(self, m, side, price, size):
-        token, paid = (m["yes"], price) if side == "bid" else (m["no"], round(1 - price, 4))
+    async def place(self, m, side, price, size, sell=False):
+        """Post-only limit order. side "bid" = BUY YES at price, "ask" = BUY NO at 1 - price; with sell=True the side
+        sells the token held instead: "ask" = SELL YES at price, "bid" = SELL NO at 1 - price (sell_to_reduce)."""
+        if sell:
+            token, paid = (m["yes"], price) if side == "ask" else (m["no"], round(1 - price, 4))
+        else:
+            token, paid = (m["yes"], price) if side == "bid" else (m["no"], round(1 - price, 4))
         try:
-            r = await self.c.place_limit_order(token_id=token, price=str(paid), size=str(size), side="BUY", post_only=True)
+            r = await self.c.place_limit_order(token_id=token, price=str(paid), size=str(size),
+                                               side="SELL" if sell else "BUY", post_only=True)
         except Exception as e:
             if type(e).__name__ == "RequestRejectedError" and getattr(e, "status", 500) < 500:
                 self.log(f"place rejected: {e!r:.200}")      # refused by the exchange (e.g. not enough balance)
@@ -1101,7 +1209,7 @@ class LiveExec:
             await self._cancel_market(m["cond"])
             return None
         if getattr(r, "ok", False):
-            self.ours[r.order_id] = [m["cond"], side, price, float(size), 0.0]
+            self.ours[r.order_id] = [m["cond"], side, price, float(size), 0.0, bool(sell)]
             return r.order_id
         self.log(f"place rejected: {getattr(r, 'code', r)}")
         return None
@@ -1146,7 +1254,8 @@ class LiveExec:
                     rec = self.ours[mo.order_id]
                     rec[4] += float(mo.matched_amount)
                     out.append({"order": mo.order_id, "mkt": rec[0], "side": rec[1], "price": rec[2],
-                                "size": float(mo.matched_amount), "ts": t.matched_at.timestamp(), "done": rec[4] >= rec[3] - 1e-9})
+                                "size": float(mo.matched_amount), "ts": t.matched_at.timestamp(), "done": rec[4] >= rec[3] - 1e-9,
+                                "sell": rec[5] if len(rec) > 5 else False})
         except Exception as e:
             self.log(f"trade list failed: {e!r}")
         return out
@@ -1166,7 +1275,72 @@ class LiveExec:
 
     MIN_TAKE_USD = 1.0                    # the exchange's minimum spend of a marketable BUY order
 
-    async def take(self, m, side, size, bids, asks, slippage=0.02, wait_s=10.0):
+    async def take(self, m, side, size, bids, asks, slippage=0.02, wait_s=10.0, sell=False):
+        """Taker order closing a position. sell=True (phase 4): a market SELL of the token held, exact shares
+        (_take_sell). Otherwise (phases 2-3): a fill-and-kill BUY of the other token, merged afterwards (below)."""
+        if sell:
+            return await self._take_sell(m, side, size, bids, asks, slippage, wait_s)
+        return await self._take_buy(m, side, size, bids, asks, slippage, wait_s)
+
+    @staticmethod
+    def _tick_floor(x, tick):
+        return max(tick, math.floor(x / tick + 1e-9) * tick)
+
+    async def _take_sell(self, m, side, size, bids, asks, slippage, wait_s):
+        """Close a long YES (side "ask") by a FAK market SELL of YES into the YES bids, or a long NO (side "bid") by
+        a FAK SELL of NO into the NO bids (1 - YES asks); never below the best price minus `slippage` (min_price).
+        The shares are exact (at most what the wallet holds); the sold shares and the USDC received are the order's
+        making and taking amounts, the wallet change is the fallback."""
+        levels = bids if side == "ask" else asks
+        if not levels:
+            return None
+        tick = float(m.get("tick") or 0.01)
+        ref = levels[0][0] if side == "ask" else 1 - levels[0][0]      # best bid of the token sold
+        token, k = (m["yes"], 0) if side == "ask" else (m["no"], 1)
+        floor = self._tick_floor(ref - slippage, tick)
+        dec = max(2, len(f"{tick:.6f}".rstrip("0").split(".")[1]))
+        try:
+            before = await self.balances(m)
+            shares = math.floor(min(size, before[k]) * 100 + 1e-9) / 100
+            if shares < 1e-9:
+                self.log(f"taker close skipped: the wallet holds {before[k]:.2f} of the token to sell")
+                return None
+            r = await self.c.place_market_order(token_id=token, side="SELL", shares=f"{shares:.2f}",
+                                                min_price=f"{floor:.{dec}f}", order_type="FAK")
+        except Exception as e:
+            self.log(f"closing order failed: {e!r}")
+            return None
+        if not getattr(r, "ok", False):
+            self.log(f"closing order rejected: {getattr(r, 'code', r)} {getattr(r, 'message', '')}".rstrip())
+            return None
+        try:
+            sold, usd = float(r.making_amount), float(r.taking_amount)
+        except Exception:
+            sold = usd = 0.0
+        if not 0 < sold <= shares + 1e-6:                     # implausible amounts: trust the wallet instead
+            sold = usd = 0.0
+        got, t0 = 0.0, time.time()
+        while time.time() - t0 < wait_s:                     # wait for the settlement, so the balances agree
+            await asyncio.sleep(1.0)
+            try:
+                after = await self.balances(m)
+            except Exception:
+                continue
+            got = before[k] - after[k]
+            if got > 1e-9 and got >= 0.99 * sold:
+                break
+        got = sold or got
+        if got <= 1e-9:
+            return None
+        paid = usd / sold if sold and 0 < usd < sold else ref           # price of the token sold
+        px = paid if side == "ask" else 1 - paid                        # in YES terms
+        tp = px if side == "ask" else 1 - px
+        self.log(f"taker close success: sold {got:.2f} {'YES' if k == 0 else 'NO'} at {paid:.3f} "
+                 f"(asked {size:.2f}, floor {floor:.{dec}f}, received ${usd or got * paid:.2f})")
+        return {"side": side, "price": px, "size": got, "fee": got * float(m.get("fee_rate") or 0.0) * tp * (1 - tp),
+                "sell": True}
+
+    async def _take_buy(self, m, side, size, bids, asks, slippage, wait_s):
         """Taker order closing a position (phase 2 exit): a fill-and-kill BUY of the NO token (side "ask", long YES)
         or of the YES token (side "bid", long NO); the pairs are merged afterwards.
         A market BUY is sized in USDC (polymarket-client: `amount`; `shares` is refused for BUY, 25 Nov live):
@@ -1218,10 +1392,19 @@ class LiveExec:
         return {"side": side, "price": px, "size": got, "fee": got * float(m.get("fee_rate") or 0.0) * tp * (1 - tp)}
 
     async def merge(self, m, pairs):
+        """YES + NO pairs back into USDC through the relayer (polymarket-client needs a relayer or builder API key for
+        it: without one every merge fails, 26 Nov). Returns the pairs merged (the wallet change), 0.0 on failure."""
         try:
+            before = await self.balances(m)
             h = await self.c.merge_positions(condition_id=m["cond"], amount="max")
             await h.wait()
-            return pairs
+            after = await self.balances(m)
+            done = max(0.0, min(before[0] - after[0], before[1] - after[1]))
+            if done <= 1e-9:
+                self.log(f"merge failed: the transaction left the balances unchanged ({before} -> {after})")
+                return 0.0
+            self.log(f"merge success: {done:.2f} pairs -> ${done:.2f} USDC")
+            return done                                   # what the chain merged ("max": maybe more than tracked)
         except Exception as e:
             self.log(f"merge failed: {e!r}")
             return 0.0
@@ -1306,6 +1489,8 @@ class MarketState:
         self.pos_since = None                           # phase 2: since when |YES - NO| >= dust_shares
         self.lots = []                                  # phase 3 (inv_fifo): [ts, signed YES - NO quantity], oldest first
         self.flatten_retry_at = 0.0                     # no taker close before this time (the last one did not fill)
+        self.cool = {"bid": 0.0, "ask": 0.0}            # phase 4: a side is not re-quoted to grow before this time
+        self.mk_usd = 0.0                               # phase 4: dollars of the 600 s markouts of this market's fills
         self.book = None                                # (bids, asks) of the other orders at the last step
         try:
             self.end_ts = _ts(m["end"]) if m.get("end") else None
@@ -1340,6 +1525,34 @@ class MarketState:
 
     def pos(self):
         return self.yes - self.no
+
+    def sigma_1h(self, now, window_s=1800.0):
+        """Volatility of the mid (price units per hour) from the minute changes of the last window_s, or None with
+        fewer than 10 minutes of samples."""
+        pts, last = [], None
+        for t, m in self.mids:
+            if t >= now - window_s and (last is None or t - last >= 60.0):
+                pts.append(m)
+                last = t
+        if len(pts) < 10:
+            return None
+        d = [b - a for a, b in zip(pts, pts[1:])]
+        mean = sum(d) / len(d)
+        var = sum((x - mean) ** 2 for x in d) / max(1, len(d) - 1)
+        return math.sqrt(var * 60.0)
+
+    def book_fill(self, side, price, size, sell=False, fee=0.0):
+        """A fill or taker close of `size` at YES `price`: side "bid" makes YES - NO grow, "ask" shrink. sell=True:
+        the token held was sold (ask = SELL YES, bid = SELL NO), the same as buying the other one and merging."""
+        if sell and side == "ask":
+            self.yes -= size; self.cash += size * price
+        elif sell:
+            self.no -= size; self.cash += size * (1 - price)
+        elif side == "bid":
+            self.yes += size; self.cash -= size * price
+        else:
+            self.no += size; self.cash -= size * (1 - price)
+        self.cash -= fee
 
     def mtm(self):
         return self.cash + (self.yes * self.mid + self.no * (1 - self.mid) if self.mid is not None else 0.0)
@@ -1383,6 +1596,9 @@ class LPTest:
         self.last_rebalance = None
         self.pending_target = None                      # (markets, summary, ts) from the snapshot task, for step()
         self.last_equity = -1e18                        # live: wallet equity (USDC + positions at mid) every 10 min
+        self.equity0 = None                             # phase 4: the first equity of the run (equity_stop)
+        self.blocked = {}                               # phase 4: market -> reason; closed and never quoted again
+        self.liquidating = None                         # phase 4: since when the stop closes every position
         self.status_path = os.path.join(os.path.dirname(getattr(journal.f, "name", "") or "."), "status.json")
 
     @staticmethod
@@ -1452,15 +1668,18 @@ class LPTest:
                 if self.st.pop(e["mkt"], None) is not None:
                     self.closed_pnl += e.get("pnl", 0.0)
                 continue
+            if ev == "block":
+                self.blocked[e["mkt"]] = e.get("reason", "")
+                continue
+            if ev == "equity":
+                if self.equity0 is None:
+                    self.equity0 = e.get("equity")
+                continue
             s = self.st.get(e.get("mkt"))
             if s is None:
                 continue
             if ev in ("fill", "flatten"):
-                if e["side"] == "bid":
-                    s.yes += e["size"]; s.cash -= e["size"] * e["price"]
-                else:
-                    s.no += e["size"]; s.cash -= e["size"] * (1 - e["price"])
-                s.cash -= e.get("fee", 0.0)
+                s.book_fill(e["side"], e["price"], e["size"], sell=bool(e.get("sell")), fee=e.get("fee", 0.0))
                 s.lot_update(e.get("fill_ts", e.get("ts", 0.0)), e["size"] if e["side"] == "bid" else -e["size"])
                 n += ev == "fill"
             elif ev == "merge":
@@ -1489,11 +1708,11 @@ class LPTest:
         a = self._a(f["mkt"])
         a["fills"] += 1
         a["contracts"] += f["size"]
-        if f["side"] == "bid":
-            s.yes += f["size"]; s.cash -= f["size"] * f["price"]
-        else:
-            s.no += f["size"]; s.cash -= f["size"] * (1 - f["price"])
+        s.book_fill(f["side"], f["price"], f["size"], sell=bool(f.get("sell")))
         s.lot_update(f["ts"], f["size"] if f["side"] == "bid" else -f["size"])
+        grows = (f["side"] == "bid") == (s.pos() > 0)
+        if self.cfg.fill_cooldown_s > 0 and grows:      # an informed sweep: do not stand in its way again at once
+            s.cool[f["side"]] = f["ts"] + self.cfg.fill_cooldown_s
         o = s.orders[f["side"]]
         if f.get("done") and o and o[0] == f["order"]:
             s.orders[f["side"]] = None
@@ -1504,6 +1723,8 @@ class LPTest:
         rebate = f["size"] * float(s.m.get("fee_rate") or 0.0) * p * (1 - p) * float(s.m.get("rebate_rate") or 0.0)
         a["rebate"] += rebate
         extra = {"rebate": round(rebate, 6)} if self.cfg.phase >= 2 else {}
+        if f.get("sell"):
+            extra["sell"] = True
         self.j.write("fill", mkt=f["mkt"], side=f["side"], price=f["price"], size=f["size"], fill_ts=f["ts"],
                      order=f["order"], **extra)
 
@@ -1522,6 +1743,8 @@ class LPTest:
             self.j.write("markout", mkt=cond, horizon=h, side=side, price=price, size=size, mid=later, markout=mk)
             if h == 60:
                 self._a(cond)["markout60"].append([round(100 * mk, 3), size])
+            elif h == 600:
+                s.mk_usd += mk * size
         self.pending = keep
 
     # ---- phase 2: portfolio changes and exits
@@ -1530,7 +1753,7 @@ class LPTest:
         """New target portfolio: new markets start quoting at their size, markets whose size changed re-quote at
         the new size, markets no longer in the target start their exit. Written to the journal with every market
         dict, so a restart rebuilds the same state."""
-        want = {m["cond"]: m for m in target}
+        want = {m["cond"]: m for m in target if m["cond"] not in self.blocked}
         added, resized, retired, back = [], [], [], []
         for c, m in want.items():
             s = self.st.get(c)
@@ -1597,24 +1820,20 @@ class LPTest:
         pos = s.pos()
         side = "ask" if pos > 0 else "bid"
         want = round(min(abs(pos), qty) if qty else abs(pos), 2)
-        r = await self.ex.take(s.m, side, want, ob, oa)
+        r = await self.ex.take(s.m, side, want, ob, oa, **({"sell": True} if self.cfg.sell_to_reduce else {}))
         if not r or r.get("size", 0.0) <= 1e-9:
             s.flatten_retry_at = now + self.cfg.flatten_retry_s
             self.errors += 1
             self.j.write("error", error=f"taker close did not fill ({reason}): {s.m.get('q', s.m['cond'])[:60]} "
                                         f"{side} {want:.2f}; next try in {self.cfg.flatten_retry_s:.0f} s")
             return
-        if side == "bid":
-            s.yes += r["size"]; s.cash -= r["size"] * r["price"]
-        else:
-            s.no += r["size"]; s.cash -= r["size"] * (1 - r["price"])
+        s.book_fill(side, r["price"], r["size"], sell=bool(r.get("sell")), fee=r.get("fee", 0.0))
         s.lot_update(now, r["size"] if side == "bid" else -r["size"])
-        s.cash -= r.get("fee", 0.0)
         mid = s.mid if s.mid is not None else r["price"]
         # cost against the mid: buying YES above it ("bid") or selling YES (buying NO) below it ("ask"), plus the fee
         loss = r["size"] * ((r["price"] - mid) if side == "bid" else (mid - r["price"])) + r.get("fee", 0.0)
         self.j.write("flatten", mkt=s.m["cond"], side=side, price=r["price"], size=r["size"], fee=r.get("fee", 0.0),
-                     mid=s.mid, cost=round(-loss, 6), hours_left=round(s.hours_left(now), 3),
+                     sell=bool(r.get("sell")), mid=s.mid, cost=round(-loss, 6), hours_left=round(s.hours_left(now), 3),
                      since_exit_h=round((now - s.exit_since) / 3600, 3) if s.exit_since else None, reason=reason,
                      held_h=round((now - s.pos_since) / 3600, 3) if s.pos_since else None)
         if abs(s.pos()) < self.cfg.dust_shares:
@@ -1694,6 +1913,15 @@ class LPTest:
             if ob and oa:
                 s.mid = (ob[0][0] + oa[0][0]) / 2
                 s.mids = (s.mids + [(now, s.mid)])[-400:]
+            if p2 and cond not in self.blocked and s.mid is not None:
+                why_b = ("market loss" if self.cfg.market_loss_usd > 0 and s.mtm() < -self.cfg.market_loss_usd else
+                         "toxic flow" if self.cfg.markout_kill_usd > 0 and s.mk_usd < -self.cfg.markout_kill_usd else None)
+                if why_b:                               # phase 4: closed now by taker, never quoted again in this run
+                    self.blocked[cond] = why_b
+                    self.target.discard(cond)
+                    self.j.write("block", mkt=cond, reason=why_b, pnl=round(s.mtm(), 4), markout_usd=round(s.mk_usd, 4))
+                    self.log(f"market blocked ({why_b}): {s.m.get('q', cond)[:60]}; its PnL {s.mtm():.2f}, "
+                             f"600 s markouts {s.mk_usd:.2f}")
             if cond in cfgs:
                 c = cfgs[cond] or {"v": s.m["v"], "min": s.m["min"], "rate": 0.0}
             else:                                       # phase 2: a market added since the last reward refresh
@@ -1705,7 +1933,10 @@ class LPTest:
                 cap = min(cap, abs(s.pos()))           # capital guard: no side may grow the position
             exiting = aged = False
             if p2:
-                why = ("reward removed" if c["rate"] <= 0 else
+                wxh = wx_local_hours(s.m.get("q"), now) if self.cfg.wx_local_stop_h >= 0 else None
+                why = (f"blocked: {self.blocked[cond]}" if cond in self.blocked else
+                       "weather measured day" if wxh is not None and wxh >= self.cfg.wx_local_stop_h else
+                       "reward removed" if c["rate"] <= 0 else
                        "end near" if self.cfg.exit_at_end and s.hours_left(now) < self.cfg.exit_reduce_h else
                        "mid out of range" if s.mid is not None and not self.cfg.exit_mid_lo <= s.mid <= self.cfg.exit_mid_hi else None)
                 if s.exit_since is None and why:
@@ -1731,11 +1962,31 @@ class LPTest:
                     red = "ask" if s.pos() > 0 else "bid"
                     if (oa if red == "ask" else ob):       # quoted even outside the zone, at full size N
                         want[red] = self._reduce_price(red, ob, oa, tick)
+                pos = s.pos()
+                grows = {"bid": pos >= -1e-9, "ask": pos <= 1e-9}
+                if self.cfg.vol_risk_usd > 0:           # phase 4: a fill of N may not put more than vol_risk_usd at
+                    sig = s.sigma_1h(now)               # risk in a vol_k sigma hour
+                    if sig is not None:
+                        lim = self.cfg.vol_risk_usd / (self.cfg.vol_k * max(sig, self.cfg.vol_floor))
+                        for side in ("bid", "ask"):
+                            if want[side] is not None and grows[side] and abs(pos) + s.m["N"] > lim:
+                                want[side] = None
+                for side in ("bid", "ask"):             # phase 4: no new position into a sweep that just filled us
+                    if want[side] is not None and grows[side] and now < s.cool[side]:
+                        want[side] = None
             if self.stopped or self.paused or (c["rate"] <= 0 and not exiting):
                 want = {"bid": None, "ask": None}
+            sell = {"bid": False, "ask": False}
+            if self.cfg.sell_to_reduce:                 # phase 4: the reducing side sells the token held
+                for side, held in (("ask", s.yes), ("bid", s.no)):
+                    if want[side] is not None and size[side] > 0 and held >= self.cfg.dust_shares:
+                        sell[side] = True
+                        size[side] = min(size[side], math.floor(held * 100 + 1e-9) / 100)
             for side in ("bid", "ask"):
                 cur = s.orders[side]
-                if cur and (want[side] is None or abs(cur[1] - want[side]) > 1e-9 or abs(cur[3] - size[side]) > 1e-9):
+                was_sell = len(cur) > 4 and cur[4] if cur else False
+                resize = (cur[3] < size[side] - 1e-9 if was_sell else abs(cur[3] - size[side]) > 1e-9) if cur else False
+                if cur and (want[side] is None or abs(cur[1] - want[side]) > 1e-9 or resize or was_sell != sell[side]):
                     res = await self.ex.cancel(s.m, cur[0])
                     if res == "market":
                         s.orders = {"bid": None, "ask": None}
@@ -1745,14 +1996,18 @@ class LPTest:
                     self._a(cond)["cancels"] += 1
             for side in ("bid", "ask"):
                 if s.orders[side] is None and want[side] is not None and size[side] > 0:
-                    oid = await self.ex.place(s.m, side, want[side], size[side])
+                    oid = await self.ex.place(s.m, side, want[side], size[side], **({"sell": True} if sell[side] else {}))
                     if oid:
-                        s.orders[side] = (oid, want[side], now, size[side])
+                        s.orders[side] = (oid, want[side], now, size[side], sell[side])
                         self.j.write("place", mkt=cond, side=side, price=want[side], size=size[side])
                         self._a(cond)["places"] += 1
+            if self.liquidating and abs(s.pos()) >= self.cfg.dust_shares and now >= s.flatten_retry_at:
+                await self._flatten(s, now, ob, oa, "stop: liquidate")
             if p2 and not (self.stopped or self.paused) and abs(s.pos()) >= self.cfg.dust_shares:
                 due = None
-                if exiting and now - s.exit_since >= self.cfg.exit_window_h * 3600:
+                if cond in self.blocked:
+                    due = f"blocked: {self.blocked[cond]}"
+                elif exiting and now - s.exit_since >= self.cfg.exit_window_h * 3600:
                     due = "exit window"
                 elif exiting and self.cfg.exit_at_end and s.hours_left(now) < self.cfg.exit_flatten_h:
                     due = "end near"
@@ -1796,6 +2051,13 @@ class LPTest:
                 if done:
                     s.yes -= done; s.no -= done; s.cash += done
                     self.j.write("merge", mkt=cond, pairs=done)
+        if self.liquidating:
+            left = {c: round(x.pos(), 2) for c, x in self.st.items() if abs(x.pos()) >= self.cfg.dust_shares}
+            if not left or now - self.liquidating > self.cfg.liquidate_max_h * 3600:
+                self.j.write("liquidated", left=left, pnl=self.pnl())
+                self.log(f"liquidation {'done' if not left else 'stopped after the time limit'}: "
+                         f"{len(left)} positions left, PnL {self.pnl():.2f}")
+                self.liquidating = None
         if p2:
             self._drop_finished()
         if sample:
@@ -1825,18 +2087,25 @@ class LPTest:
             except OSError:
                 pass
             if pnl <= -self.cfg.stop_loss_usd and not self.stopped:
-                self.stopped = f"stop_loss {pnl:.2f}"
-                self.log(f"STOP: mark-to-market {pnl:.2f} <= -{self.cfg.stop_loss_usd:.0f}")
-                await self.ex.cancel_all()
-                for x in self.st.values():
-                    x.orders = {"bid": None, "ask": None}
-                self.j.write("stop", reason=self.stopped, pnl=pnl)
-        if hasattr(self.ex, "collateral") and now - self.last_equity >= 600:
+                await self._stop(f"stop_loss {pnl:.2f}", pnl, f"mark-to-market {pnl:.2f}", now)
+        every = self.cfg.equity_every_s if self.cfg.equity_stop else 600.0
+        if hasattr(self.ex, "collateral") and now - self.last_equity >= every:
             self.last_equity = now                      # the real result of a live run: rewards paid, fees and all
             try:
                 cash = await self.ex.collateral()
-                pos = sum(x.yes * x.mid + x.no * (1 - x.mid) for x in self.st.values() if x.mid is not None)
-                self.j.write("equity", collateral=round(cash, 6), positions_usd=round(pos, 6), equity=round(cash + pos, 6))
+                pos = 0.0
+                for x in self.st.values():
+                    if x.mid is None:
+                        continue
+                    y, n = (await self.ex.balances(x.m)) if self.cfg.equity_stop and hasattr(self.ex, "balances") else (x.yes, x.no)
+                    pos += y * x.mid + n * (1 - x.mid)
+                eq = cash + pos
+                if self.equity0 is None:
+                    self.equity0 = eq
+                self.j.write("equity", collateral=round(cash, 6), positions_usd=round(pos, 6), equity=round(eq, 6))
+                if self.cfg.equity_stop and eq - self.equity0 <= -self.cfg.stop_loss_usd and not self.stopped:
+                    await self._stop(f"equity_stop {eq - self.equity0:.2f}", self.pnl(),
+                                     f"wallet equity {eq:.2f} vs {self.equity0:.2f} at the start", now)
             except Exception as e:
                 self.log(f"equity read failed: {e!r}")
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
@@ -1846,6 +2115,21 @@ class LPTest:
                 self.j.write("earnings", day=self.day, by_market={c: float(v) for c, v in e.items()})
         self.day = day
 
+    async def _stop(self, reason, pnl, what, now):
+        """The loss stop: every quote is cancelled; with liquidate_on_stop every position is then closed by taker orders
+        (step(), retried every flatten_retry_s, at most liquidate_max_h); run() ends after that."""
+        self.stopped = reason
+        self.log(f"STOP: {what}; limit -{self.cfg.stop_loss_usd:.0f}")
+        await self.ex.cancel_all()
+        for x in self.st.values():
+            x.orders = {"bid": None, "ask": None}
+        self.j.write("stop", reason=self.stopped, pnl=pnl)
+        if self.cfg.liquidate_on_stop and any(abs(x.pos()) >= self.cfg.dust_shares for x in self.st.values()):
+            self.liquidating = now
+            self.j.write("liquidate", positions={c: round(x.pos(), 2) for c, x in self.st.items()
+                                                 if abs(x.pos()) >= self.cfg.dust_shares})
+            self.log("liquidating every position by taker orders")
+
     async def run(self):
         t_end = self.clock() + self.cfg.test_days * 86400
         cfgs, cfg_t = {}, -1e18
@@ -1854,7 +2138,7 @@ class LPTest:
         await self.reconcile()
         snaps = asyncio.create_task(self._snapshots()) if self.store is not None else None
         try:
-            while self.clock() < t_end and not self.stopped:
+            while self.clock() < t_end and (not self.stopped or self.liquidating):
                 now = self.clock()
                 if self.control_fn is not None:
                     paused = self.control_fn() == "stop"

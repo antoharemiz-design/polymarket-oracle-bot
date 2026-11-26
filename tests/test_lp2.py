@@ -1246,3 +1246,198 @@ class EarningsCommandTest(unittest.TestCase):
         self.assertEqual(days[-1], time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400)))
         self.assertEqual(len(days), len(set(days)))
         self.assertEqual(earn[0]["by_market"], {"A": 1.0, "B": 2.5})
+
+
+class Phase4SafetyTest(unittest.TestCase):
+    """Phase 4 (26 Nov, after the live loss): sell-to-reduce (no pairs, no merges), liquidation on the loss stop, the
+    per-market loss and markout blocks, the volatility cap, the fill cooldown, the equity stop, weather local time."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        self.cfg = lp.phase4_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0)
+        self.ex = FakeEx()
+        self.j = lp.Journal(os.path.join(self.tmp, "live.jsonl"))
+        self.books = {"YC1": ([(0.48, 100.0)], [(0.52, 100.0)], 0.01), "YC2": ([(0.38, 100.0)], [(0.42, 100.0)], 0.01)}
+
+    def make(self, markets=None, **kw):
+        for k, v in kw.items():
+            setattr(self.cfg, k, v)
+        return lp.LPTest(self.cfg, self.ex, self.j, markets or [mk("C1")],
+                         books_fn=lambda toks: {t: self.books[t] for t in toks if t in self.books},
+                         log=lambda *a: None, clock=self.clock)
+
+    def step(self, t, dt=0.0):
+        self.clock.t += dt
+        asyncio.run(t.step(self.clock.t, {c: {"v": 4.5, "min": s.m["min"], "rate": 10.0} for c, s in t.st.items()}))
+
+    def fill(self, t, cond, side, price, size, sell=False):
+        oid = t.st[cond].orders[side][0]
+        self.ex.inject = [{"order": oid, "mkt": cond, "side": side, "price": price, "size": size, "ts": self.clock.t,
+                           "done": True, "sell": sell}]
+
+    def test_preset(self):
+        c = lp.phase4_config(lp_dir=self.tmp)
+        self.assertEqual((c.phase, c.sell_to_reduce, c.liquidate_on_stop, c.equity_stop), (4, 1, 1, 1))
+        self.assertEqual((c.inv_fifo, c.exit_improve_ticks), (1, 1))         # phase 3 rules kept
+        self.assertEqual(lp.phase3_config(lp_dir=self.tmp).sell_to_reduce, 0)
+
+    def test_reducing_side_sells_the_token_held(self):
+        t = self.make(fill_cooldown_s=0.0)
+        self.step(t)
+        self.assertFalse(t.st["C1"].orders["ask"][4])      # flat: the ask buys NO as before
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        self.step(t, 1)
+        s = t.st["C1"]
+        self.assertEqual((s.yes, s.no), (20.0, 0.0))
+        self.assertTrue(s.orders["ask"][4])                 # long YES: the ask now SELLs the 20 YES held
+        o = self.ex.orders[s.orders["ask"][0]]
+        self.assertTrue(o["sell"])
+        self.fill(t, "C1", "ask", 0.51, 20.0, sell=True)
+        self.step(t, 1)
+        self.assertEqual((s.yes, s.no), (0.0, 0.0))         # no pair: nothing to merge
+        self.assertAlmostEqual(s.cash, 20 * (0.51 - 0.48))
+        self.assertEqual(self.ex.merged, [])
+        ev = journal_events(self.j)
+        self.assertTrue(any(e["event"] == "fill" and e.get("sell") for e in ev))
+        t2 = lp.LPTest(self.cfg, FakeEx(), lp.Journal(os.path.join(self.tmp, "x.jsonl")), [], books_fn=lambda k: {},
+                       log=lambda *a: None, clock=self.clock)
+        t2.restore([{"event": "rebalance", "ts": NOW, "target": ["C1"], "markets": {"C1": mk("C1")}, "exiting": {}}] + ev)
+        self.assertEqual((t2.st["C1"].yes, t2.st["C1"].no), (0.0, 0.0))
+        self.assertAlmostEqual(t2.st["C1"].cash, s.cash)
+
+    def test_taker_close_sells(self):
+        t = self.make(fill_cooldown_s=0.0)
+        self.step(t)
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        self.step(t, 1)
+        self.step(t, 3600)                                   # held 1 h: closed by taker, selling the YES held
+        s = t.st["C1"]
+        fl = [e for e in journal_events(self.j) if e["event"] == "flatten"]
+        self.assertEqual(len(fl), 1)
+        self.assertTrue(fl[0]["sell"])
+        self.assertEqual((s.yes, s.no), (0.0, 0.0))
+
+    def test_stop_liquidates_every_position(self):
+        t = self.make(fill_cooldown_s=0.0, market_loss_usd=0.0)
+        self.step(t)
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        t.st["C1"].cash -= 100.0                            # a loss beyond the stop
+        self.step(t, 120)
+        self.assertTrue(t.stopped)
+        self.assertIsNotNone(t.liquidating)                 # the stop is checked at the end of a pass
+        self.step(t, 5)
+        self.assertIsNone(t.liquidating)                    # the next pass closed everything
+        s = t.st["C1"]
+        self.assertAlmostEqual(s.pos(), 0.0)
+        ev = journal_events(self.j)
+        self.assertEqual([e["event"] for e in ev if e["event"] in ("stop", "liquidate", "flatten", "liquidated")],
+                         ["stop", "liquidate", "flatten", "liquidated"])
+        self.assertEqual([e for e in ev if e["event"] == "flatten"][0]["reason"], "stop: liquidate")
+
+    def test_liquidation_retries_until_flat(self):
+        t = self.make(fill_cooldown_s=0.0, market_loss_usd=0.0)
+        self.step(t)
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        t.st["C1"].cash -= 100.0
+        calls = []
+        real = self.ex.take
+
+        async def flaky(m, side, size, bids, asks, **kw):
+            calls.append(size)
+            return None if len(calls) == 1 else await real(m, side, size, bids, asks, **kw)
+        self.ex.take = flaky
+        self.step(t, 120)
+        self.step(t, 5)
+        self.assertIsNotNone(t.liquidating)                 # the first try failed: still liquidating
+        self.step(t, 5)
+        self.assertEqual(len(calls), 1)                     # waits flatten_retry_s
+        self.step(t, 60)
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(t.liquidating)
+        self.assertAlmostEqual(t.st["C1"].pos(), 0.0)
+
+    def test_market_loss_blocks_and_closes(self):
+        t = self.make([mk("C1"), mk("C2")], fill_cooldown_s=0.0)
+        self.step(t)
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        t.st["C1"].cash -= 7.0                              # its own PnL below -6
+        self.step(t, 1)
+        self.assertIn("C1", t.blocked)
+        self.assertAlmostEqual(t.st["C1"].pos(), 0.0)       # closed by taker at once
+        self.assertIsNotNone(t.st["C2"].orders["bid"])      # the other market keeps quoting
+        t.apply_rebalance([mk("C1"), mk("C2")], {}, self.clock.t)
+        self.assertNotIn("C1", t.target)                    # never selected again in this run
+        self.step(t, 1)
+        self.assertIsNone(t.st["C1"].orders["bid"])
+
+    def test_markout_kill(self):
+        t = self.make(fill_cooldown_s=0.0)
+        self.step(t)
+        t.st["C1"].mk_usd = -3.5
+        self.step(t, 1)
+        self.assertEqual(t.blocked.get("C1"), "toxic flow")
+
+    def test_volatility_cap_withdraws_the_growing_side(self):
+        t = self.make(fill_cooldown_s=0.0)
+        s = t.st["C1"]
+        s.mids = [(self.clock.t - 1800 + 60 * i, 0.5 + (0.03 if i % 2 else -0.03)) for i in range(30)]
+        self.step(t)                                        # sigma ~ 0.06 x sqrt(60) per hour: 4 / (2 x sigma) < 20
+        self.assertIsNone(s.orders["bid"])
+        self.assertIsNone(s.orders["ask"])
+        s.mids = [(self.clock.t - 1800 + 60 * i, 0.5) for i in range(30)]
+        self.step(t, 1)
+        self.assertIsNotNone(s.orders["bid"])               # calm: both sides back
+
+    def test_fill_cooldown(self):
+        t = self.make()
+        self.step(t)
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        s = t.st["C1"]
+        self.step(t, 1)
+        self.assertIsNone(s.orders["bid"])                  # the side that filled would grow the position: paused
+        self.assertIsNotNone(s.orders["ask"])               # the reducing side stays
+        self.step(t, 300)
+        self.assertIsNotNone(s.orders["bid"])
+
+    def test_equity_stop(self):
+        class Ex(FakeEx):
+            cash = 300.0
+
+            async def collateral(self):
+                return self.cash
+
+            async def balances(self, m):
+                return (0.0, 0.0)
+        self.ex = Ex()
+        t = self.make()
+        self.step(t)
+        self.assertEqual(t.equity0, 300.0)
+        self.ex.cash = 230.0                                # the wallet lost $70, the internal MTM sees nothing
+        self.step(t, 61)
+        self.assertTrue(t.stopped.startswith("equity_stop"))
+
+    def test_weather_local_time(self):
+        q = "Will the highest temperature in Seoul (Incheon) be 15°C on November 26?"
+        at = time.mktime(time.strptime("2026-11-26 00:05", "%Y-%m-%d %H:%M")) - time.timezone   # 09:05 KST
+        self.assertAlmostEqual(lp.wx_local_hours(q, at), 9 + 5 / 60, places=3)
+        self.assertAlmostEqual(lp.wx_local_hours(q, at - 86400), 9 + 5 / 60 - 24, places=3)
+        self.assertIsNone(lp.wx_local_hours("Will BTC be above 100k on November 26?", at))
+        q2 = "Will the highest temperature in Dallas be between 54-55°F on November 26?"
+        self.assertAlmostEqual(lp.wx_local_hours(q2, at), 18 + 5 / 60 - 24, places=3)      # 18:05 on 25 Nov in Dallas
+
+    def test_weather_measured_day_exit(self):
+        q = "Will the highest temperature in Seoul (Incheon) be 15°C on November 26?"
+        self.clock.t = time.mktime(time.strptime("2026-11-26 00:05", "%Y-%m-%d %H:%M")) - time.timezone
+        t = self.make([mk("C1", q=q)], wx_local_stop_h=6.0)
+        self.step(t)
+        ex = [e for e in journal_events(self.j) if e["event"] == "exit"]
+        self.assertEqual(ex[0]["reason"], "weather measured day")
+        self.assertNotIn("place", [e["event"] for e in journal_events(self.j)])   # never quoted
+        self.assertNotIn("C1", t.st)                                               # flat, so it left at once
