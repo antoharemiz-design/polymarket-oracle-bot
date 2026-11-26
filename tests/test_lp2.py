@@ -1007,6 +1007,51 @@ class LiveAccountingTest(unittest.TestCase):
         j.close()
 
 
+class Phase3CapitalTest(unittest.TestCase):
+    """Live 26 Nov: pairs below N were never merged and did not count toward the reserve, so two-sided quoting
+    locked the whole wallet in YES + NO pairs (USDC $3.29 left, every order refused)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        self.cfg = lp.phase3_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0)
+        self.ex = FakeEx()
+        self.j = lp.Journal(os.path.join(self.tmp, "live.jsonl"))
+        self.t = lp.LPTest(self.cfg, self.ex, self.j, [mk("C1"), mk("C2")],
+                           books_fn=lambda toks: {t: ([(0.48, 100.0)], [(0.52, 100.0)], 0.01) for t in toks},
+                           log=lambda *a: None, clock=self.clock)
+
+    def step(self, dt=0.0):
+        self.clock.t += dt
+        asyncio.run(self.t.step(self.clock.t, {c: {"v": 4.5, "min": 20.0, "rate": 10.0} for c in self.t.st}))
+
+    def test_preset(self):
+        self.assertEqual((self.cfg.merge_min_shares, self.cfg.reserve_counts_pairs), (5.0, 1))
+        c2 = lp.phase2_config(lp_dir=self.tmp)
+        self.assertEqual((c2.merge_min_shares, c2.reserve_counts_pairs), (0.0, 0))   # phase 2 replays unchanged
+
+    def test_pairs_merged_from_five(self):
+        self.step()
+        s = self.t.st["C1"]
+        s.yes, s.no = 7.0, 6.0                              # 6 pairs, N = 20
+        self.step(1)
+        self.assertEqual(self.ex.merged, [("C1", 6.0)])
+        self.assertEqual((s.yes, s.no), (1.0, 0.0))
+        s.yes, s.no = 4.0, 4.0                              # below 5: left alone
+        self.step(1)
+        self.assertEqual(len(self.ex.merged), 1)
+
+    def test_pairs_count_toward_reserve(self):
+        self.step()
+        self.assertIsNotNone(self.t.st["C2"].orders["bid"])
+        self.ex.merge = lambda m, pairs: asyncio.sleep(0, result=0.0)   # merges failing: the pairs stay
+        s = self.t.st["C1"]
+        s.yes = s.no = 100.0                                # $100 locked = the reserve (capital 300 - quotes 200)
+        self.step(1)
+        self.assertIsNone(self.t.st["C2"].orders["bid"])   # flat market: no side may grow a position
+        self.assertIsNone(self.t.st["C2"].orders["ask"])
+
+
 class LiveTakeTest(unittest.TestCase):
     """LiveExec.take: the closing order is a FAK market BUY sized in USDC (polymarket-client refuses `shares` for a
     BUY: every live close failed on 25 Nov), and the shares bought come from the order's taking amount."""
@@ -1063,6 +1108,27 @@ class LiveTakeTest(unittest.TestCase):
         r, _ = self.take(self.client(resp, fill=19.0), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
         self.assertAlmostEqual(r["size"], 19.0)
         self.assertAlmostEqual(r["price"], 0.47)           # no amounts: the best price
+
+    def test_place_refused_by_exchange_keeps_other_orders(self):
+        class RequestRejectedError(Exception):
+            def __init__(self, msg, status):
+                super().__init__(msg)
+                self.status = status
+
+        class C:
+            cancelled = []
+
+            async def place_limit_order(self, **kw):
+                raise RequestRejectedError("not enough balance / allowance", 400)
+
+            async def cancel_market_orders(self, market):
+                self.cancelled.append(market)
+
+        log = []
+        ex = lp.LiveExec(C(), log=log.append)
+        self.assertIsNone(asyncio.run(ex.place(mk("C1"), "bid", 0.48, 20.0)))
+        self.assertEqual(C.cancelled, [])                  # nothing was placed: the market's orders stay
+        self.assertIn("place rejected", log[-1])
 
     def test_rejected_and_failed(self):
         rej = types.SimpleNamespace(ok=False, code="fak_not_filled", message="no orders found to match")

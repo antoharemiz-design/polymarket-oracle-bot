@@ -83,6 +83,9 @@ class LPConfig:
     exit_window_h: float = 1.0         # a market leaving the portfolio has this long to exit through quotes
     exit_flatten_h: float = 0.25       # then (or this close to endDate) the rest is closed by a taker order
     dust_shares: float = 5.0           # positions below this are left alone (the exchange's minimum order)
+    merge_min_shares: float = 0.0      # > 0: YES + NO pairs are merged from this many on (0: from N, the quote size);
+                                       # live 26 Nov: pairs just below N locked the whole wallet (USDC $3.29 left)
+    reserve_counts_pairs: int = 0      # 1: unmerged pairs count toward the reserve like the net position
     inv_reduce_h: float = 0.0          # a position held this long: only the reducing side is quoted (0 = off)
     inv_flatten_h: float = 0.0         # a position held this long is closed by a taker order (0 = off)
     flatten_retry_s: float = 60.0      # after a taker close that did not fill, the next try waits this long (the quotes
@@ -122,7 +125,8 @@ PHASE2 = {"quote_budget_usd": 300.0, "capital_usd": 500.0, "stop_loss_usd": 100.
 # (reducing quotes one tick inside the spread, also before the position ages; position age by FIFO lots, only
 # lots older than 1 h are closed by taker), the corrected paper fill model, and the live capital of $300
 PHASE3 = {"exit_improve_ticks": 1, "reduce_improve_always": 1, "inv_fifo": 1, "paper_lifetime": 1,
-          "capital_usd": 300.0, "quote_budget_usd": 200.0, "stop_loss_usd": 60.0}
+          "capital_usd": 300.0, "quote_budget_usd": 200.0, "stop_loss_usd": 60.0, "merge_min_shares": 5.0,
+          "reserve_counts_pairs": 1}
 
 
 def from_env(phase=None) -> LPConfig:
@@ -1090,6 +1094,9 @@ class LiveExec:
         try:
             r = await self.c.place_limit_order(token_id=token, price=str(paid), size=str(size), side="BUY", post_only=True)
         except Exception as e:
+            if type(e).__name__ == "RequestRejectedError" and getattr(e, "status", 500) < 500:
+                self.log(f"place rejected: {e!r:.200}")      # refused by the exchange (e.g. not enough balance)
+                return None
             self.log(f"place failed with unknown outcome: {e!r}; cancelling every order in the market")
             await self._cancel_market(m["cond"])
             return None
@@ -1342,6 +1349,10 @@ class MarketState:
             return 0.0
         p = self.pos()
         return p * self.mid if p > 0 else -p * (1 - self.mid)
+
+    def locked(self):
+        """USDC held in YES + NO pairs until they are merged ($1 a pair)."""
+        return max(0.0, min(self.yes, self.no))
 
 
 class LPTest:
@@ -1663,7 +1674,8 @@ class LPTest:
         p2 = self.cfg.phase >= 2
         bk = await asyncio.to_thread(self.books_fn, [s.m["yes"] for s in self.st.values()])
         reserve = self.cfg.capital_usd - self.cfg.quote_budget_usd
-        over = sum(s.exposure() for s in self.st.values()) >= reserve
+        over = sum(s.exposure() + (s.locked() if self.cfg.reserve_counts_pairs else 0.0)
+                   for s in self.st.values()) >= reserve
         sample = now - self.last_sample >= self.cfg.sample_s
         for cond, s in list(self.st.items()):
             b = bk.get(s.m["yes"])
@@ -1777,6 +1789,8 @@ class LPTest:
         for cond, s in self.st.items():
             pairs = min(s.yes, s.no)
             need = min(s.m["N"], self.cfg.dust_shares) if p2 and s.exit_since is not None else s.m["N"]
+            if self.cfg.merge_min_shares > 0:
+                need = min(need, self.cfg.merge_min_shares)
             if pairs >= need:
                 done = await self.ex.merge(s.m, pairs)
                 if done:
