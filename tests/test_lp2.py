@@ -216,17 +216,20 @@ class ConfigTest(unittest.TestCase):
         c = lp.phase2_config(kmax=3)
         self.assertEqual((c.phase, c.kmax, c.max_min_size), (2, 3, 200.0))
 
-    def test_phase3_is_the_default(self):
+    def test_phase4_is_the_default(self):
         old = {k: os.environ.pop(k, None) for k in ("LP_PHASE", "LP_CAPITAL_USD")}
         try:
             c = lp.from_env()
-            self.assertEqual(c.phase, 3)
-            # the phase 2 rules stay (rolling selection, exclusions, kmax, the 1 h position rule)
-            self.assertEqual((c.kmax, c.max_min_size, c.inv_flatten_h, c.rebalance_h), (5, 200.0, 1.0, 3.0))
+            self.assertEqual(c.phase, 4)
+            # the phase 2 rules stay (rolling selection, exclusions); phase 4: k = 1, 2 h before a taker close
+            self.assertEqual((c.kmax, c.max_min_size, c.inv_flatten_h, c.rebalance_h), (1, 200.0, 2.0, 3.0))
             self.assertIn("economics_fees", c.exclude_categories)
-            # phase 3: tick-better reducing quotes, FIFO lots, lifetime paper fills, live capital $300
-            self.assertEqual((c.exit_improve_ticks, c.reduce_improve_always, c.inv_fifo, c.paper_lifetime), (1, 1, 1, 1))
+            # phase 3 FIFO lots and lifetime paper fills stay; the tick-better quotes are gone (the 25-26 Nov loss)
+            self.assertEqual((c.exit_improve_ticks, c.reduce_improve_always, c.inv_fifo, c.paper_lifetime), (0, 0, 1, 1))
             self.assertEqual((c.capital_usd, c.quote_budget_usd, c.stop_loss_usd), (300.0, 200.0, 60.0))
+            self.assertEqual((c.sell_to_reduce, c.liquidate_on_stop, c.equity_stop, c.wx_local_stop_h), (1, 1, 1, 0.0))
+            p3 = lp.from_env(phase=3)                     # a resumed phase 3 run keeps its rules
+            self.assertEqual((p3.exit_improve_ticks, p3.sell_to_reduce, p3.kmax), (1, 0, 5))
             os.environ["LP_CAPITAL_USD"] = "320"
             self.assertEqual(lp.from_env().capital_usd, 320.0)
             self.assertEqual(lp.phase3_config(kmax=2).phase, 3)

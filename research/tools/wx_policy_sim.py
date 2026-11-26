@@ -1,7 +1,7 @@
 """Policy backtest of liquidity provision on resolved daily-temperature markets (26 Nov, after the live loss): one
 market at a time, the public taker tape and the 1-minute mid, our quotes at the touch, our fills from the tape.
 
-    python research/tools/wx_policy_sim.py DATA_DIR [--policies all] [--share 1.0] [--reward 25] [--out OUT.json]
+    python research/tools/wx_policy_sim.py DATA_DIR [--policies all | "name|name"] [--share 1.0] [--reward 25] [--out OUT.json]
 
 The touch is rebuilt from the mid (tick 0.01): a mid on a half cent is a one-tick book (bid = mid - 0.005), a mid on
 a whole cent a two-tick book (bid = mid - 0.01). Our bid and ask join the touch while it is inside the reward zone
@@ -199,7 +199,7 @@ def main():
     data = sys.argv[1]
     arg = lambda k, dflt: type(dflt)(sys.argv[sys.argv.index(k) + 1]) if k in sys.argv else dflt
     share, reward = arg("--share", 1.0), arg("--reward", 25.0)
-    names = list(POLICIES) if arg("--policies", "all") == "all" else arg("--policies", "").split(",")
+    names = list(POLICIES) if arg("--policies", "all") == "all" else arg("--policies", "").split("|")
     outp = arg("--out", "")
     d_from, d_to = arg("--from", "0000"), arg("--to", "9999")
     mk = []
