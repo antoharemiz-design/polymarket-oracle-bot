@@ -152,7 +152,11 @@ PHASE3 = {"exit_improve_ticks": 1, "reduce_improve_always": 1, "inv_fifo": 1, "p
 # adverse-selection settings are set from research/lp_phase3_report.md (weather study)
 PHASE4 = {"sell_to_reduce": 1, "liquidate_on_stop": 1, "equity_stop": 1, "equity_every_s": 60.0,
           "market_loss_usd": 6.0, "markout_kill_usd": 3.0, "vol_risk_usd": 4.0, "vol_k": 2.0,
-          "fill_cooldown_s": 300.0}
+          "fill_cooldown_s": 300.0,
+          # research/lp_phase3_report.md: quotes inside the spread lost 4.6 c per contract live (the phase 3 tick-better
+          # exits): every quote joins the touch; weather is not quoted on its measured day (local midnight on)
+          "exit_improve_ticks": 0, "reduce_improve_always": 0, "wx_local_stop_h": 0.0, "kmax": 1,
+          "inv_reduce_h": 1.0, "inv_flatten_h": 2.0}
 
 
 def from_env(phase=None) -> LPConfig:
@@ -983,6 +987,11 @@ class SnapStore:
         first = set(w[0].get("elig") or w[0]["rows"]) if w else set()
         left = cfg.min_hours_left if cfg.exit_at_end else -1e6
         cands = sorted(c for c in first if eligible(self.meta.get(c), now, self.exclude, min_hours_left=left))
+        if cfg.wx_local_stop_h >= 0:                    # phase 4: weather markets whose measured day starts before the
+            def wx_ok(c):                               # next rebalance are not selected (they would exit at once)
+                h = wx_local_hours((self.meta.get(c) or {}).get("question", ""), now + cfg.rebalance_h * 3600)
+                return h is None or h < cfg.wx_local_stop_h
+            cands = [c for c in cands if wx_ok(c)]
         events = {c: (self.meta.get(c) or {}).get("event", c) for c in cands}
         groups_merged = 0
         if cfg.related_filter:

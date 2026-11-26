@@ -6,7 +6,7 @@ with LiveExec and the real polymarket-client SDK, without network and without mo
 Scenario, one simulated market (book 0.48 / 0.52):
   1. quotes both sides; another trader sells 20 YES into our bid (fill);
   2. the ask becomes a SELL of the 20 YES held (sell_to_reduce): no YES + NO pair is ever formed;
-  3. nobody takes it for an hour: the position is closed by a market SELL (taker close);
+  3. nobody takes it for two hours (inv_flatten_h): the position is closed by a market SELL (taker close);
   4. a YES + NO pair made outside the bot (as by hand on the site) is merged through the relayer;
   5. a new position, then a loss beyond the stop: every quote is cancelled and the position is liquidated.
 Prints the bot's log; the lines to look for: "taker close success", "merge success", "liquidation done".
@@ -78,8 +78,8 @@ async def scenario(log=print, relayer=True):
         log(f"--- 2. the ask is now a {o['side'] if o else '?'} of {o['token'][:1] == '1' and 'YES' or 'NO'} "
             f"{o['left'] if o else 0:.2f} at {o['price'] if o else 0}")
 
-        log("--- 3. nobody takes it for an hour: taker close")
-        await step(3600)
+        log("--- 3. nobody takes it for two hours: taker close")
+        await step(cfg.inv_flatten_h * 3600)
         log(f"position YES {s.yes:.2f} / NO {s.no:.2f}; wallet {await ex.balances(m)}; USDC {await ex.collateral():.2f}")
 
         log("--- 4. a YES + NO pair made outside the bot is merged through the relayer")

@@ -1279,7 +1279,9 @@ class Phase4SafetyTest(unittest.TestCase):
     def test_preset(self):
         c = lp.phase4_config(lp_dir=self.tmp)
         self.assertEqual((c.phase, c.sell_to_reduce, c.liquidate_on_stop, c.equity_stop), (4, 1, 1, 1))
-        self.assertEqual((c.inv_fifo, c.exit_improve_ticks), (1, 1))         # phase 3 rules kept
+        self.assertEqual(c.inv_fifo, 1)                                       # phase 3 FIFO lots kept
+        self.assertEqual((c.exit_improve_ticks, c.reduce_improve_always), (0, 0))   # never inside the spread
+        self.assertEqual((c.wx_local_stop_h, c.kmax, c.inv_flatten_h), (0.0, 1, 2.0))
         self.assertEqual(lp.phase3_config(lp_dir=self.tmp).sell_to_reduce, 0)
 
     def test_reducing_side_sells_the_token_held(self):
@@ -1313,7 +1315,7 @@ class Phase4SafetyTest(unittest.TestCase):
         self.fill(t, "C1", "bid", 0.48, 20.0)
         self.step(t, 1)
         self.step(t, 1)
-        self.step(t, 3600)                                   # held 1 h: closed by taker, selling the YES held
+        self.step(t, 7200)                                   # held 2 h: closed by taker, selling the YES held
         s = t.st["C1"]
         fl = [e for e in journal_events(self.j) if e["event"] == "flatten"]
         self.assertEqual(len(fl), 1)
