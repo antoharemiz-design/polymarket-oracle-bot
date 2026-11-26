@@ -32,7 +32,7 @@ E6 = 10 ** 6
 
 class SimExchange:
     def __init__(self, cond=None, tick=0.01, bids=((0.48, 500.0), (0.47, 500.0)), asks=((0.52, 500.0), (0.53, 500.0)),
-                 usdc=300.0, relayer=True):
+                 usdc=300.0, relayer=True, clock=time.time):
         self.cond = cond or "0x" + "ab" * 32
         self.yes, self.no = "1" + "1" * 70, "2" + "2" * 70
         self.tick = tick
@@ -40,6 +40,7 @@ class SimExchange:
         self.book[self.no] = {"BUY": [[round(1 - p, 6), z] for p, z in asks], "SELL": [[round(1 - p, 6), z] for p, z in bids]}
         self.bal = {"USDC": usdc, self.yes: 0.0, self.no: 0.0}
         self.relayer_enabled = relayer               # False: the relayer refuses (no API key accepted)
+        self.clock = clock                           # trade times (a scenario may run on its own clock)
         self.orders = {}                             # our resting orders: id -> dict
         self.trades = []                             # account trades (ClobTrade JSON)
         self.requests = []                           # (method, host, path) of every request, for the tests
@@ -107,7 +108,7 @@ class SimExchange:
         return size - left
 
     def _record(self, token, our_side, price, size, maker_order=None, taker_order=None):
-        now = int(time.time())
+        now = int(self.clock())
         mo = []
         if maker_order:
             mo = [{"order_id": maker_order, "asset_id": token, "maker_address": self.wallet or "0x0", "owner": "k",
@@ -185,6 +186,11 @@ class SimExchange:
             return ok({"canceled": ids, "not_canceled": {}})
         if path == "/data/trades":
             return ok({"data": self.trades, "next_cursor": "LTE="})
+        if path == "/orders-scoring":
+            ids = body if isinstance(body, list) else (body or {}).get("orderIds", [])
+            return ok({i: i in self.orders for i in ids})
+        if path.startswith("/rewards/user/percentages"):
+            return ok({self.cond: 50.0})
         if path in ("/heartbeats", "/v1/heartbeats"):
             return ok({"heartbeat_id": "h"})
         return httpx.Response(404, json={"error": f"simulator: no route {method} {path}"})
