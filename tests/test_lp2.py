@@ -7,7 +7,9 @@ import json
 import os
 import tempfile
 import time
+import types
 import unittest
+from decimal import Decimal
 from unittest import mock
 
 from polybot import lp
@@ -214,17 +216,20 @@ class ConfigTest(unittest.TestCase):
         c = lp.phase2_config(kmax=3)
         self.assertEqual((c.phase, c.kmax, c.max_min_size), (2, 3, 200.0))
 
-    def test_phase3_is_the_default(self):
+    def test_phase4_is_the_default(self):
         old = {k: os.environ.pop(k, None) for k in ("LP_PHASE", "LP_CAPITAL_USD")}
         try:
             c = lp.from_env()
-            self.assertEqual(c.phase, 3)
-            # the phase 2 rules stay (rolling selection, exclusions, kmax, the 1 h position rule)
-            self.assertEqual((c.kmax, c.max_min_size, c.inv_flatten_h, c.rebalance_h), (5, 200.0, 1.0, 3.0))
+            self.assertEqual(c.phase, 4)
+            # the phase 2 rules stay (rolling selection, exclusions); phase 4: k = 1, 2 h before a taker close
+            self.assertEqual((c.kmax, c.max_min_size, c.inv_flatten_h, c.rebalance_h), (1, 200.0, 2.0, 3.0))
             self.assertIn("economics_fees", c.exclude_categories)
-            # phase 3: tick-better reducing quotes, FIFO lots, lifetime paper fills, live capital $300
-            self.assertEqual((c.exit_improve_ticks, c.reduce_improve_always, c.inv_fifo, c.paper_lifetime), (1, 1, 1, 1))
+            # phase 3 FIFO lots and lifetime paper fills stay; the tick-better quotes are gone (the 25-26 Nov loss)
+            self.assertEqual((c.exit_improve_ticks, c.reduce_improve_always, c.inv_fifo, c.paper_lifetime), (0, 0, 1, 1))
             self.assertEqual((c.capital_usd, c.quote_budget_usd, c.stop_loss_usd), (300.0, 200.0, 60.0))
+            self.assertEqual((c.sell_to_reduce, c.liquidate_on_stop, c.equity_stop, c.wx_local_stop_h), (1, 1, 1, 0.0))
+            p3 = lp.from_env(phase=3)                     # a resumed phase 3 run keeps its rules
+            self.assertEqual((p3.exit_improve_ticks, p3.sell_to_reduce, p3.kmax), (1, 0, 5))
             os.environ["LP_CAPITAL_USD"] = "320"
             self.assertEqual(lp.from_env().capital_usd, 320.0)
             self.assertEqual(lp.phase3_config(kmax=2).phase, 3)
@@ -471,6 +476,34 @@ class Phase2LoopTest(unittest.TestCase):
         self.step(t, 5)
         self.assertIsNotNone(s.orders["bid"])              # flat again: two-sided quotes come back
         self.assertIn("C1", t.st)
+
+    def test_failed_taker_close_waits_and_is_reported(self):
+        """A taker close that does not fill is an error in the journal and is not retried for flatten_retry_s, so the
+        reducing quote can rest in between (live, 25 Nov: every close was refused and the quotes were cancelled every
+        step)."""
+        t = self.make([mk("C1")])
+        self.step(t)
+        oid = t.st["C1"].orders["bid"][0]
+        self.ex.inject = [{"order": oid, "mkt": "C1", "side": "bid", "price": 0.48, "size": 20.0, "ts": self.clock.t, "done": True}]
+        self.step(t, 1)
+        s = t.st["C1"]
+        self.step(t, 1)
+        calls = []
+
+        async def refuse(m, side, size, bids, asks, **kw):
+            calls.append((side, size))
+            return None
+        self.ex.take = refuse
+        self.step(t, 3600)
+        self.assertEqual(calls, [("ask", 20.0)])
+        self.assertEqual(t.errors, 1)
+        err = [e for e in journal_events(self.j) if e["event"] == "error"]
+        self.assertIn("taker close did not fill (position held 1 h)", err[0]["error"])
+        self.step(t, 5)
+        self.assertEqual(len(calls), 1)                    # paused
+        self.assertIsNotNone(s.orders["ask"])              # the reducing quote rests meanwhile
+        self.step(t, 60)
+        self.assertEqual(len(calls), 2)                    # tried again after the pause
 
     def test_mid_out_of_range_starts_exit(self):
         t = self.make([mk("C1")])
@@ -977,18 +1010,160 @@ class LiveAccountingTest(unittest.TestCase):
         j.close()
 
 
+class Phase3CapitalTest(unittest.TestCase):
+    """Live 26 Nov: pairs below N were never merged and did not count toward the reserve, so two-sided quoting
+    locked the whole wallet in YES + NO pairs (USDC $3.29 left, every order refused)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        self.cfg = lp.phase3_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0)
+        self.ex = FakeEx()
+        self.j = lp.Journal(os.path.join(self.tmp, "live.jsonl"))
+        self.t = lp.LPTest(self.cfg, self.ex, self.j, [mk("C1"), mk("C2")],
+                           books_fn=lambda toks: {t: ([(0.48, 100.0)], [(0.52, 100.0)], 0.01) for t in toks},
+                           log=lambda *a: None, clock=self.clock)
+
+    def step(self, dt=0.0):
+        self.clock.t += dt
+        asyncio.run(self.t.step(self.clock.t, {c: {"v": 4.5, "min": 20.0, "rate": 10.0} for c in self.t.st}))
+
+    def test_preset(self):
+        self.assertEqual((self.cfg.merge_min_shares, self.cfg.reserve_counts_pairs), (5.0, 1))
+        c2 = lp.phase2_config(lp_dir=self.tmp)
+        self.assertEqual((c2.merge_min_shares, c2.reserve_counts_pairs), (0.0, 0))   # phase 2 replays unchanged
+
+    def test_pairs_merged_from_five(self):
+        self.step()
+        s = self.t.st["C1"]
+        s.yes, s.no = 7.0, 6.0                              # 6 pairs, N = 20
+        self.step(1)
+        self.assertEqual(self.ex.merged, [("C1", 6.0)])
+        self.assertEqual((s.yes, s.no), (1.0, 0.0))
+        s.yes, s.no = 4.0, 4.0                              # below 5: left alone
+        self.step(1)
+        self.assertEqual(len(self.ex.merged), 1)
+
+    def test_pairs_count_toward_reserve(self):
+        self.step()
+        self.assertIsNotNone(self.t.st["C2"].orders["bid"])
+        self.ex.merge = lambda m, pairs: asyncio.sleep(0, result=0.0)   # merges failing: the pairs stay
+        s = self.t.st["C1"]
+        s.yes = s.no = 100.0                                # $100 locked = the reserve (capital 300 - quotes 200)
+        self.step(1)
+        self.assertIsNone(self.t.st["C2"].orders["bid"])   # flat market: no side may grow a position
+        self.assertIsNone(self.t.st["C2"].orders["ask"])
+
+
+class LiveTakeTest(unittest.TestCase):
+    """LiveExec.take: the closing order is a FAK market BUY sized in USDC (polymarket-client refuses `shares` for a
+    BUY: every live close failed on 25 Nov), and the shares bought come from the order's taking amount."""
+
+    def client(self, resp=None, fill=None, exc=None):
+        class C:
+            def __init__(self):
+                self.bal = {"YC1": 0.0, "NC1": 0.0}
+                self.sent = []
+
+            async def get_balance_allowance(self, asset_type, token_id):
+                return types.SimpleNamespace(balance=int(self.bal[token_id] * 1e6))
+
+            async def place_market_order(self, **kw):
+                self.sent.append(kw)
+                if exc:
+                    raise exc
+                if fill:
+                    self.bal[kw["token_id"]] += fill
+                return resp
+        return C()
+
+    def take(self, c, side, size, bids, asks):
+        log = []
+        ex = lp.LiveExec(c, log=log.append)
+        return asyncio.run(ex.take(mk("C1"), side, size, bids, asks, wait_s=1.5)), log
+
+    def test_long_yes_buys_no_with_usdc(self):
+        resp = types.SimpleNamespace(ok=True, taking_amount=Decimal("20"), making_amount=Decimal("10.6"), status="matched")
+        c = self.client(resp, fill=20.0)
+        r, log = self.take(c, "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
+        self.assertEqual(c.sent, [{"token_id": "NC1", "side": "BUY", "amount": "10.60", "max_price": "0.55",
+                                   "order_type": "FAK"}])
+        self.assertNotIn("shares", c.sent[0])
+        self.assertAlmostEqual(r["size"], 20.0)
+        self.assertAlmostEqual(r["price"], 0.47)           # YES terms: 1 - 10.60 / 20
+        self.assertAlmostEqual(r["fee"], 20.0 * 0.05 * 0.53 * 0.47)
+        self.assertIn("closing order filled", log[-1])
+
+    def test_long_no_buys_yes_partial_fill(self):
+        resp = types.SimpleNamespace(ok=True, taking_amount=Decimal("12.5"), making_amount=Decimal("6.25"), status="matched")
+        r, _ = self.take(self.client(resp, fill=12.5), "bid", 30.0, [(0.47, 50.0)], [(0.49, 12.0), (0.51, 50.0)])
+        self.assertAlmostEqual(r["size"], 12.5)            # deeper fills buy fewer shares; the rest closes later
+        self.assertAlmostEqual(r["price"], 0.5)
+
+    def test_small_lot_spends_the_minimum(self):
+        resp = types.SimpleNamespace(ok=True, taking_amount=Decimal("6"), making_amount=Decimal("0.9"), status="matched")
+        c = self.client(resp, fill=6.0)
+        self.take(c, "bid", 5.0, [(0.12, 50.0)], [(0.15, 50.0)])
+        self.assertEqual((c.sent[0]["token_id"], c.sent[0]["amount"], c.sent[0]["max_price"]), ("YC1", "1.00", "0.17"))
+
+    def test_wallet_fallback_when_amounts_missing(self):
+        resp = types.SimpleNamespace(ok=True, taking_amount=Decimal("0"), making_amount=Decimal("0"), status="delayed")
+        r, _ = self.take(self.client(resp, fill=19.0), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
+        self.assertAlmostEqual(r["size"], 19.0)
+        self.assertAlmostEqual(r["price"], 0.47)           # no amounts: the best price
+
+    def test_place_refused_by_exchange_keeps_other_orders(self):
+        class RequestRejectedError(Exception):
+            def __init__(self, msg, status):
+                super().__init__(msg)
+                self.status = status
+
+        class C:
+            cancelled = []
+
+            async def place_limit_order(self, **kw):
+                raise RequestRejectedError("not enough balance / allowance", 400)
+
+            async def cancel_market_orders(self, market):
+                self.cancelled.append(market)
+
+        log = []
+        ex = lp.LiveExec(C(), log=log.append)
+        self.assertIsNone(asyncio.run(ex.place(mk("C1"), "bid", 0.48, 20.0)))
+        self.assertEqual(C.cancelled, [])                  # nothing was placed: the market's orders stay
+        self.assertIn("place rejected", log[-1])
+
+    def test_rejected_and_failed(self):
+        rej = types.SimpleNamespace(ok=False, code="fak_not_filled", message="no orders found to match")
+        r, log = self.take(self.client(rej), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
+        self.assertIsNone(r)
+        self.assertIn("closing order rejected: fak_not_filled", log[-1])
+        r, log = self.take(self.client(exc=RuntimeError("down")), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
+        self.assertIsNone(r)
+        self.assertIn("closing order failed", log[-1])
+        r, _ = self.take(self.client(), "ask", 20.0, [], [(0.49, 50.0)])
+        self.assertIsNone(r)                               # no bids to sell into
+
+
 class LiveCheckTest(unittest.TestCase):
     """lp-live-check: keys, wallet, allowance and a far-from-market post-only order placed and cancelled."""
 
-    def run_check(self, cash, allow):
+    def run_check(self, cash, allow, cfg=None, token_allow=10 ** 12, broken_sdk=False):
         log = []
+        built = []
 
         class C:
-            async def get_balance_allowance(self, asset_type):
+            async def get_balance_allowance(self, asset_type, token_id=None):
                 class B:
                     balance = int(cash * 1e6)
-                    allowances = {"exchange": allow}
+                    allowances = {"exchange": allow if asset_type == "COLLATERAL" else token_allow}
                 return B()
+
+            async def create_market_order(self, *, token_id, side, amount=None, shares=None, min_price=None,
+                                          max_price=None, order_type="FAK"):
+                if broken_sdk or (side == "BUY" and amount is None) or (side == "SELL" and shares is None):
+                    raise ValueError("amount is required for BUY market orders.")
+                built.append((token_id, side, amount, shares))
 
             def list_account_trades(self, after):
                 class P:
@@ -1034,7 +1209,8 @@ class LiveCheckTest(unittest.TestCase):
                 mock.patch.object(lp, "rewards_config", lambda: {"C1": {"rate": 10.0, "v": 4.5, "min": 20.0}}), \
                 mock.patch.object(lp, "gamma_markets", lambda conds: gm), \
                 mock.patch.object(lp, "books", lambda toks: {"Y1": ([(0.45, 100.0)], [(0.47, 100.0)], 0.01)}):
-            rc = asyncio.run(lp.live_check(lp.phase3_config(), out=log.append))
+            rc = asyncio.run(lp.live_check(cfg or lp.phase4_config(), out=log.append))
+        self.built = built
         return rc, log, ex
 
     def test_ok(self):
@@ -1042,7 +1218,24 @@ class LiveCheckTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(ex.placed, [("C1", "bid", 0.35, 5.0)])      # 10 ticks below the best bid, exchange minimum
         self.assertEqual(ex.cancelled, ["oid-1"])
+        self.assertEqual([(b[0], b[1]) for b in self.built], [("Y1", "SELL"), ("N1", "BUY")])   # built, never posted
+        self.assertTrue(any(x.startswith("8. note: no relayer key") for x in log))
         self.assertIn("RESULT: OK", log[-1])
+
+    def test_taker_close_contract_is_checked(self):
+        rc, log, _ = self.run_check(300.0, 10 ** 12, broken_sdk=True)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("taker close order cannot be built" in x for x in log))
+
+    def test_selling_needs_the_token_allowance(self):
+        rc, log, _ = self.run_check(300.0, 10 ** 12, token_allow=0)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("no conditional token allowance" in x for x in log))
+
+    def test_phase3_needs_a_relayer_key(self):
+        rc, log, _ = self.run_check(300.0, 10 ** 12, cfg=lp.phase3_config())
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("merges pairs only through the relayer" in x for x in log))
 
     def test_short_wallet_and_no_allowance(self):
         rc, log, _ = self.run_check(100.0, 0)
@@ -1081,3 +1274,200 @@ class EarningsCommandTest(unittest.TestCase):
         self.assertEqual(days[-1], time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400)))
         self.assertEqual(len(days), len(set(days)))
         self.assertEqual(earn[0]["by_market"], {"A": 1.0, "B": 2.5})
+
+
+class Phase4SafetyTest(unittest.TestCase):
+    """Phase 4 (26 Nov, after the live loss): sell-to-reduce (no pairs, no merges), liquidation on the loss stop, the
+    per-market loss and markout blocks, the volatility cap, the fill cooldown, the equity stop, weather local time."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        self.cfg = lp.phase4_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0)
+        self.ex = FakeEx()
+        self.j = lp.Journal(os.path.join(self.tmp, "live.jsonl"))
+        self.books = {"YC1": ([(0.48, 100.0)], [(0.52, 100.0)], 0.01), "YC2": ([(0.38, 100.0)], [(0.42, 100.0)], 0.01)}
+
+    def make(self, markets=None, **kw):
+        for k, v in kw.items():
+            setattr(self.cfg, k, v)
+        return lp.LPTest(self.cfg, self.ex, self.j, markets or [mk("C1")],
+                         books_fn=lambda toks: {t: self.books[t] for t in toks if t in self.books},
+                         log=lambda *a: None, clock=self.clock)
+
+    def step(self, t, dt=0.0):
+        self.clock.t += dt
+        asyncio.run(t.step(self.clock.t, {c: {"v": 4.5, "min": s.m["min"], "rate": 10.0} for c, s in t.st.items()}))
+
+    def fill(self, t, cond, side, price, size, sell=False):
+        oid = t.st[cond].orders[side][0]
+        self.ex.inject = [{"order": oid, "mkt": cond, "side": side, "price": price, "size": size, "ts": self.clock.t,
+                           "done": True, "sell": sell}]
+
+    def test_preset(self):
+        c = lp.phase4_config(lp_dir=self.tmp)
+        self.assertEqual((c.phase, c.sell_to_reduce, c.liquidate_on_stop, c.equity_stop), (4, 1, 1, 1))
+        self.assertEqual(c.inv_fifo, 1)                                       # phase 3 FIFO lots kept
+        self.assertEqual((c.exit_improve_ticks, c.reduce_improve_always), (0, 0))   # never inside the spread
+        self.assertEqual((c.wx_local_stop_h, c.kmax, c.inv_flatten_h), (0.0, 1, 2.0))
+        self.assertEqual(lp.phase3_config(lp_dir=self.tmp).sell_to_reduce, 0)
+
+    def test_reducing_side_sells_the_token_held(self):
+        t = self.make(fill_cooldown_s=0.0)
+        self.step(t)
+        self.assertFalse(t.st["C1"].orders["ask"][4])      # flat: the ask buys NO as before
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        self.step(t, 1)
+        s = t.st["C1"]
+        self.assertEqual((s.yes, s.no), (20.0, 0.0))
+        self.assertTrue(s.orders["ask"][4])                 # long YES: the ask now SELLs the 20 YES held
+        o = self.ex.orders[s.orders["ask"][0]]
+        self.assertTrue(o["sell"])
+        self.fill(t, "C1", "ask", 0.51, 20.0, sell=True)
+        self.step(t, 1)
+        self.assertEqual((s.yes, s.no), (0.0, 0.0))         # no pair: nothing to merge
+        self.assertAlmostEqual(s.cash, 20 * (0.51 - 0.48))
+        self.assertEqual(self.ex.merged, [])
+        ev = journal_events(self.j)
+        self.assertTrue(any(e["event"] == "fill" and e.get("sell") for e in ev))
+        t2 = lp.LPTest(self.cfg, FakeEx(), lp.Journal(os.path.join(self.tmp, "x.jsonl")), [], books_fn=lambda k: {},
+                       log=lambda *a: None, clock=self.clock)
+        t2.restore([{"event": "rebalance", "ts": NOW, "target": ["C1"], "markets": {"C1": mk("C1")}, "exiting": {}}] + ev)
+        self.assertEqual((t2.st["C1"].yes, t2.st["C1"].no), (0.0, 0.0))
+        self.assertAlmostEqual(t2.st["C1"].cash, s.cash)
+
+    def test_taker_close_sells(self):
+        t = self.make(fill_cooldown_s=0.0)
+        self.step(t)
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        self.step(t, 1)
+        self.step(t, 7200)                                   # held 2 h: closed by taker, selling the YES held
+        s = t.st["C1"]
+        fl = [e for e in journal_events(self.j) if e["event"] == "flatten"]
+        self.assertEqual(len(fl), 1)
+        self.assertTrue(fl[0]["sell"])
+        self.assertEqual((s.yes, s.no), (0.0, 0.0))
+
+    def test_stop_liquidates_every_position(self):
+        t = self.make(fill_cooldown_s=0.0, market_loss_usd=0.0)
+        self.step(t)
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        t.st["C1"].cash -= 100.0                            # a loss beyond the stop
+        self.step(t, 120)
+        self.assertTrue(t.stopped)
+        self.assertIsNotNone(t.liquidating)                 # the stop is checked at the end of a pass
+        self.step(t, 5)
+        self.assertIsNone(t.liquidating)                    # the next pass closed everything
+        s = t.st["C1"]
+        self.assertAlmostEqual(s.pos(), 0.0)
+        ev = journal_events(self.j)
+        self.assertEqual([e["event"] for e in ev if e["event"] in ("stop", "liquidate", "flatten", "liquidated")],
+                         ["stop", "liquidate", "flatten", "liquidated"])
+        self.assertEqual([e for e in ev if e["event"] == "flatten"][0]["reason"], "stop: liquidate")
+
+    def test_liquidation_retries_until_flat(self):
+        t = self.make(fill_cooldown_s=0.0, market_loss_usd=0.0)
+        self.step(t)
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        t.st["C1"].cash -= 100.0
+        calls = []
+        real = self.ex.take
+
+        async def flaky(m, side, size, bids, asks, **kw):
+            calls.append(size)
+            return None if len(calls) == 1 else await real(m, side, size, bids, asks, **kw)
+        self.ex.take = flaky
+        self.step(t, 120)
+        self.step(t, 5)
+        self.assertIsNotNone(t.liquidating)                 # the first try failed: still liquidating
+        self.step(t, 5)
+        self.assertEqual(len(calls), 1)                     # waits flatten_retry_s
+        self.step(t, 60)
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(t.liquidating)
+        self.assertAlmostEqual(t.st["C1"].pos(), 0.0)
+
+    def test_market_loss_blocks_and_closes(self):
+        t = self.make([mk("C1"), mk("C2")], fill_cooldown_s=0.0)
+        self.step(t)
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        t.st["C1"].cash -= 7.0                              # its own PnL below -6
+        self.step(t, 1)
+        self.assertIn("C1", t.blocked)
+        self.assertAlmostEqual(t.st["C1"].pos(), 0.0)       # closed by taker at once
+        self.assertIsNotNone(t.st["C2"].orders["bid"])      # the other market keeps quoting
+        t.apply_rebalance([mk("C1"), mk("C2")], {}, self.clock.t)
+        self.assertNotIn("C1", t.target)                    # never selected again in this run
+        self.step(t, 1)
+        self.assertIsNone(t.st["C1"].orders["bid"])
+
+    def test_markout_kill(self):
+        t = self.make(fill_cooldown_s=0.0)
+        self.step(t)
+        t.st["C1"].mk_usd = -3.5
+        self.step(t, 1)
+        self.assertEqual(t.blocked.get("C1"), "toxic flow")
+
+    def test_volatility_cap_withdraws_the_growing_side(self):
+        t = self.make(fill_cooldown_s=0.0)
+        s = t.st["C1"]
+        s.mids = [(self.clock.t - 1800 + 60 * i, 0.5 + (0.03 if i % 2 else -0.03)) for i in range(30)]
+        self.step(t)                                        # sigma ~ 0.06 x sqrt(60) per hour: 4 / (2 x sigma) < 20
+        self.assertIsNone(s.orders["bid"])
+        self.assertIsNone(s.orders["ask"])
+        s.mids = [(self.clock.t - 1800 + 60 * i, 0.5) for i in range(30)]
+        self.step(t, 1)
+        self.assertIsNotNone(s.orders["bid"])               # calm: both sides back
+
+    def test_fill_cooldown(self):
+        t = self.make()
+        self.step(t)
+        self.fill(t, "C1", "bid", 0.48, 20.0)
+        self.step(t, 1)
+        s = t.st["C1"]
+        self.step(t, 1)
+        self.assertIsNone(s.orders["bid"])                  # the side that filled would grow the position: paused
+        self.assertIsNotNone(s.orders["ask"])               # the reducing side stays
+        self.step(t, 300)
+        self.assertIsNotNone(s.orders["bid"])
+
+    def test_equity_stop(self):
+        class Ex(FakeEx):
+            cash = 300.0
+
+            async def collateral(self):
+                return self.cash
+
+            async def balances(self, m):
+                return (0.0, 0.0)
+        self.ex = Ex()
+        t = self.make()
+        self.step(t)
+        self.assertEqual(t.equity0, 300.0)
+        self.ex.cash = 230.0                                # the wallet lost $70, the internal MTM sees nothing
+        self.step(t, 61)
+        self.assertTrue(t.stopped.startswith("equity_stop"))
+
+    def test_weather_local_time(self):
+        q = "Will the highest temperature in Seoul (Incheon) be 15°C on November 26?"
+        at = time.mktime(time.strptime("2026-11-26 00:05", "%Y-%m-%d %H:%M")) - time.timezone   # 09:05 KST
+        self.assertAlmostEqual(lp.wx_local_hours(q, at), 9 + 5 / 60, places=3)
+        self.assertAlmostEqual(lp.wx_local_hours(q, at - 86400), 9 + 5 / 60 - 24, places=3)
+        self.assertIsNone(lp.wx_local_hours("Will BTC be above 100k on November 26?", at))
+        q2 = "Will the highest temperature in Dallas be between 54-55°F on November 26?"
+        self.assertAlmostEqual(lp.wx_local_hours(q2, at), 18 + 5 / 60 - 24, places=3)      # 18:05 on 25 Nov in Dallas
+
+    def test_weather_measured_day_exit(self):
+        q = "Will the highest temperature in Seoul (Incheon) be 15°C on November 26?"
+        self.clock.t = time.mktime(time.strptime("2026-11-26 00:05", "%Y-%m-%d %H:%M")) - time.timezone
+        t = self.make([mk("C1", q=q)], wx_local_stop_h=6.0)
+        self.step(t)
+        ex = [e for e in journal_events(self.j) if e["event"] == "exit"]
+        self.assertEqual(ex[0]["reason"], "weather measured day")
+        self.assertNotIn("place", [e["event"] for e in journal_events(self.j)])   # never quoted
+        self.assertNotIn("C1", t.st)                                               # flat, so it left at once

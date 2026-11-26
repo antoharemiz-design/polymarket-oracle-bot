@@ -1,6 +1,6 @@
 # Runtime
 websockets>=12.0            # market and spot feeds
-polymarket-client>=0.18     # official Polymarket SDK: signing, orders, user stream (live mode only)
+polymarket-client==0.18.0   # official Polymarket SDK, pinned: tests/test_simexchange.py checks the live calls against this version
 
 # Research tools only (research/tools/*.py)
 numpy>=1.24
