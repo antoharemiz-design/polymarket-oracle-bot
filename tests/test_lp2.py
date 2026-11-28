@@ -216,11 +216,15 @@ class ConfigTest(unittest.TestCase):
         c = lp.phase2_config(kmax=3)
         self.assertEqual((c.phase, c.kmax, c.max_min_size), (2, 3, 200.0))
 
-    def test_phase4_is_the_default(self):
+    def test_phase5_is_the_default(self):
         old = {k: os.environ.pop(k, None) for k in ("LP_PHASE", "LP_CAPITAL_USD")}
         try:
             c = lp.from_env()
-            self.assertEqual(c.phase, 4)
+            self.assertEqual(c.phase, 5)
+            # phase 5: weather only, the position at most N, market loss $4; the H11 fair value stays off
+            self.assertEqual((c.weather_only, c.pos_limit_mult, c.market_loss_usd, c.fv_on), (1, 1.0, 4.0, 0))
+            p4 = lp.from_env(phase=4)                     # a resumed phase 4 run keeps its rules
+            self.assertEqual((p4.weather_only, p4.pos_limit_mult, p4.market_loss_usd), (0, 3.0, 6.0))
             # the phase 2 rules stay (rolling selection, exclusions); phase 4: k = 1, 2 h before a taker close
             self.assertEqual((c.kmax, c.max_min_size, c.inv_flatten_h, c.rebalance_h), (1, 200.0, 2.0, 3.0))
             self.assertIn("economics_fees", c.exclude_categories)

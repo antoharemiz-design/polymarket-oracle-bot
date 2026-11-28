@@ -172,11 +172,11 @@ PHASE4 = {"sell_to_reduce": 1, "liquidate_on_stop": 1, "equity_stop": 1, "equity
 
 
 def from_env(phase=None) -> LPConfig:
-    """Settings from LP_* environment variables. The phase (argument, else LP_PHASE, else 4) picks the defaults:
-    phase 4 starts from PHASE2 + PHASE3 + PHASE4, phase 3 from PHASE2 + PHASE3, phase 2 from PHASE2, phase 1 from the
-    LPConfig defaults. A resumed run keeps the phase it started with (polybot/service.py)."""
+    """Settings from LP_* environment variables. The phase (argument, else LP_PHASE, else 5) picks the defaults:
+    phase 5 starts from PHASE2..PHASE5, phase 4 from PHASE2..PHASE4, phase 3 from PHASE2 + PHASE3, phase 2 from PHASE2,
+    phase 1 from the LPConfig defaults. A resumed run keeps the phase it started with (polybot/service.py)."""
     c = LPConfig()
-    c.phase = int(phase or os.environ.get("LP_PHASE") or 4)
+    c.phase = int(phase or os.environ.get("LP_PHASE") or 5)
     if c.phase >= 2:
         for k, v in PHASE2.items():
             setattr(c, k, v)
