@@ -107,6 +107,13 @@ class LPConfig:
     equity_every_s: float = 600.0
     wx_local_stop_h: float = -1.0      # >= 0: weather markets are not quoted from this local hour of their measured day on
                                        # (the outcome is being observed: informed flow); -1 = off
+    # H11 (research/PREREG_H11.md): fair value of weather markets from METARs and forecast runs (polybot/wxfair.py)
+    fv_on: int = 0                     # 1: quotes follow the fair value
+    fv_one: float = 0.05               #   |fair - mid| >= this: only the side the model favours is quoted
+    fv_pull: float = 0.20              #   |fair - mid| >= this: nothing is quoted, a position against the model is closed
+    fv_refresh_s: float = 300.0        #   METARs and forecasts are fetched this often
+    fv_require: int = 1                #   1: a weather market without a fair value (no data) is not quoted
+    weather_only: int = 0              # 1: only markets polybot.wxfair can value are selected
     inv_reduce_h: float = 0.0          # a position held this long: only the reducing side is quoted (0 = off)
     inv_flatten_h: float = 0.0         # a position held this long is closed by a taker order (0 = off)
     flatten_retry_s: float = 60.0      # after a taker close that did not fill, the next try waits this long (the quotes
@@ -150,6 +157,9 @@ PHASE3 = {"exit_improve_ticks": 1, "reduce_improve_always": 1, "inv_fifo": 1, "p
           "reserve_counts_pairs": 1}
 # phase 4 (26 Nov, after the live loss of 25-26 Nov): the phase 3 rules plus the safety of the live path; the
 # adverse-selection settings are set from research/lp_phase3_report.md (weather study)
+# phase 5 = H11 on top of phase 4, with the risk lessons of the phase 4 paper run (27-28 Nov: the three blocked markets
+# held 40-61 contracts when they jumped; two of them were not weather): the position is at most N, weather only
+PHASE5 = {"fv_on": 1, "weather_only": 1, "pos_limit_mult": 1.0, "market_loss_usd": 4.0}
 PHASE4 = {"sell_to_reduce": 1, "liquidate_on_stop": 1, "equity_stop": 1, "equity_every_s": 60.0,
           "market_loss_usd": 6.0, "markout_kill_usd": 3.0, "vol_risk_usd": 4.0, "vol_k": 2.0,
           "fill_cooldown_s": 300.0,
@@ -174,6 +184,9 @@ def from_env(phase=None) -> LPConfig:
     if c.phase >= 4:
         for k, v in PHASE4.items():
             setattr(c, k, v)
+    if c.phase >= 5:
+        for k, v in PHASE5.items():
+            setattr(c, k, v)
     for f in dataclasses.fields(c):
         raw = os.environ.get("LP_" + f.name.upper())
         if raw is not None and f.name != "phase":
@@ -195,6 +208,16 @@ def phase4_config(**kw) -> LPConfig:
     """LPConfig with the phase 4 settings (phase 3 + the safety of the live path), for tests and research tools."""
     c = phase3_config(phase=4)
     for k, v in PHASE4.items():
+        setattr(c, k, v)
+    for k, v in kw.items():
+        setattr(c, k, v)
+    return c
+
+
+def phase5_config(**kw) -> LPConfig:
+    """LPConfig with the phase 5 settings (phase 4 + H11 fair value), for tests and research tools."""
+    c = phase4_config(phase=5)
+    for k, v in PHASE5.items():
         setattr(c, k, v)
     for k, v in kw.items():
         setattr(c, k, v)
@@ -333,6 +356,11 @@ def wx_local_hours(question, now):
     year = local.year + (1 if month < local.month - 6 else -1 if month > local.month + 6 else 0)
     start = datetime.datetime(year, month, day, tzinfo=z)
     return (local - start).total_seconds() / 3600
+
+
+def _wx_market(q):
+    from . import wxfair
+    return wxfair.parse_market(q) is not None
 
 
 def targets(bids, asks, tick, v_c, pos, cap):
@@ -988,6 +1016,9 @@ class SnapStore:
         first = set(w[0].get("elig") or w[0]["rows"]) if w else set()
         left = cfg.min_hours_left if cfg.exit_at_end else -1e6
         cands = sorted(c for c in first if eligible(self.meta.get(c), now, self.exclude, min_hours_left=left))
+        if cfg.weather_only:                            # phase 5: only markets the fair value model can value
+            from . import wxfair
+            cands = [c for c in cands if wxfair.parse_market((self.meta.get(c) or {}).get("question", ""), now)]
         if cfg.wx_local_stop_h >= 0:                    # phase 4: weather markets whose measured day starts before the
             def wx_ok(c):                               # next rebalance are not selected (they would exit at once)
                 h = wx_local_hours((self.meta.get(c) or {}).get("question", ""), now + cfg.rebalance_h * 3600)
@@ -1501,6 +1532,7 @@ class MarketState:
         self.flatten_retry_at = 0.0                     # no taker close before this time (the last one did not fill)
         self.cool = {"bid": 0.0, "ask": 0.0}            # phase 4: a side is not re-quoted to grow before this time
         self.mk_usd = 0.0                               # phase 4: dollars of the 600 s markouts of this market's fills
+        self.fair = None                                # H11: (ts, fair value, fair - mid) at the last step
         self.book = None                                # (bids, asks) of the other orders at the last step
         try:
             self.end_ts = _ts(m["end"]) if m.get("end") else None
@@ -1585,8 +1617,10 @@ class LPTest:
     within exit_flatten_h of the end) the rest is closed by a taker order. A market is dropped once it is flat."""
 
     def __init__(self, cfg: LPConfig, ex, journal: Journal, markets, books_fn=books, rewards_fn=rewards_config,
-                 log=print, clock=time.time, control_fn=None, store=None):
+                 log=print, clock=time.time, control_fn=None, store=None, fair=None):
         self.cfg, self.ex, self.j, self.log, self.clock = cfg, ex, journal, log, clock
+        self.fair = fair                                # H11: polybot.wxfair.WxFair (refresh(questions, now), value(q, now))
+        self.fair_t = -1e18
         self.control_fn = control_fn                    # returns "run" or "stop"; "stop" pulls every quote
         self.paused = False
         self.end_reason = None
@@ -1901,6 +1935,12 @@ class LPTest:
             self.pending_target = None
             self.apply_rebalance(target, summary, t)
         p2 = self.cfg.phase >= 2
+        if self.fair is not None and self.cfg.fv_on and now - self.fair_t >= self.cfg.fv_refresh_s:
+            self.fair_t = now
+            try:
+                await asyncio.to_thread(self.fair.refresh, [s.m.get("q", "") for s in self.st.values()], now)
+            except Exception as e:
+                self.log(f"fair value refresh failed: {e!r:.200}")
         bk = await asyncio.to_thread(self.books_fn, [s.m["yes"] for s in self.st.values()])
         reserve = self.cfg.capital_usd - self.cfg.quote_budget_usd
         over = sum(s.exposure() + (s.locked() if self.cfg.reserve_counts_pairs else 0.0)
@@ -1984,6 +2024,25 @@ class LPTest:
                 for side in ("bid", "ask"):             # phase 4: no new position into a sweep that just filled us
                     if want[side] is not None and grows[side] and now < s.cool[side]:
                         want[side] = None
+            fv_edge = None
+            if self.fair is not None and self.cfg.fv_on:
+                fv = self.fair.value(s.m.get("q", ""), now)
+                if fv is not None and s.mid is not None:
+                    fv_edge = fv["p"] - s.mid
+                    s.fair = (now, fv["p"], fv_edge)
+                    if sample:
+                        self.j.write("fair", mkt=cond, p=round(fv["p"], 4), mid=s.mid, edge=round(fv_edge, 4),
+                                     m_obs=fv["m_obs"], mu=None if fv["mu"] is None else round(fv["mu"], 2),
+                                     sigma=fv["sigma"], h_end=round(fv["h_end"], 2))
+                    if not (exiting or aged):
+                        if abs(fv_edge) >= self.cfg.fv_pull:
+                            want = {"bid": None, "ask": None}   # model and market disagree hard: stand aside
+                        elif fv_edge >= self.cfg.fv_one:
+                            want["ask"] = None              # YES cheap by the model: do not sell it
+                        elif fv_edge <= -self.cfg.fv_one:
+                            want["bid"] = None              # YES dear by the model: do not buy it
+                elif fv is None and self.cfg.fv_require and s.m.get("q") and _wx_market(s.m.get("q")):
+                    want = {"bid": None, "ask": None}       # a weather market without data: not quoted
             if self.stopped or self.paused or (c["rate"] <= 0 and not exiting):
                 want = {"bid": None, "ask": None}
             sell = {"bid": False, "ask": False}
@@ -2017,6 +2076,9 @@ class LPTest:
                 due = None
                 if cond in self.blocked:
                     due = f"blocked: {self.blocked[cond]}"
+                elif fv_edge is not None and abs(fv_edge) >= self.cfg.fv_pull and fv_edge * s.pos() < 0 \
+                        and now >= s.flatten_retry_at:
+                    due = "fair value against the position"
                 elif exiting and now - s.exit_since >= self.cfg.exit_window_h * 3600:
                     due = "exit window"
                 elif exiting and self.cfg.exit_at_end and s.hours_left(now) < self.cfg.exit_flatten_h:

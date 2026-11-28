@@ -362,6 +362,9 @@ class Service:
         if self.rewards_fn:
             kw["rewards_fn"] = self.rewards_fn
         prior = lp.load_events(self.run_dir, self.mode) if resumed else []
+        if cfg.fv_on:                                   # H11: fair value of weather markets
+            from . import wxfair
+            kw["fair"] = self.fair_fn() if getattr(self, "fair_fn", None) else wxfair.WxFair(clock=self.clock)
         self.test = lp.LPTest(cfg, ex, journal, markets, log=self.log.info, clock=self.clock,
                               control_fn=self.control_for_test, store=store, **kw)
         if prior:

@@ -336,6 +336,16 @@ class StoreTest(unittest.TestCase):
         st.take(NOW + 3 * 1800)                            # an outage in between: 2 of 4 snapshots
         self.assertFalse(st.warm(NOW + 3 * 1800))
 
+    def test_weather_only_selection(self):
+        self.metas["W"] = meta("W", q="Will the highest temperature in Seoul (Incheon) be 15°C on January 20?", event="EW")
+        self.rw["W"] = {"rate": 10.0, "v": 4.5, "min": 20.0}
+        self.books["YW"] = ([(0.48, 100.0), (0.47, 100.0)], [(0.52, 100.0), (0.53, 100.0)], 0.01)
+        st = self.store(weather_only=1)
+        for i in range(5):
+            st.take(NOW + i * 1800)
+        target, _ = st.rank(NOW + 4 * 1800)
+        self.assertEqual([m["cond"] for m in target], ["W"])     # the other markets are not weather
+
     def test_rank_market_dicts(self):
         st = self.store()
         for i in range(5):
@@ -1471,3 +1481,85 @@ class Phase4SafetyTest(unittest.TestCase):
         self.assertEqual(ex[0]["reason"], "weather measured day")
         self.assertNotIn("place", [e["event"] for e in journal_events(self.j)])   # never quoted
         self.assertNotIn("C1", t.st)                                               # flat, so it left at once
+
+
+class Phase5FairValueTest(unittest.TestCase):
+    """H11 in the loop (phase 5): quotes follow the fair value of polybot.wxfair (here a fixed fake)."""
+    Q = "Will the highest temperature in Seoul (Incheon) be 15°C on January 20?"
+
+    class Fair:
+        def __init__(self):
+            self.p, self.refreshed = 0.5, []
+
+        def refresh(self, questions, now):
+            self.refreshed.append(now)
+
+        def value(self, q, now):
+            if self.p is None or "temperature" not in q:
+                return None
+            return {"p": self.p, "mu": 15.0, "sigma": 1.0, "m_obs": None, "h_end": 30.0, "models": 2, "obs": 0}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        self.cfg = lp.phase5_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0, fill_cooldown_s=0.0, market_loss_usd=0.0)
+        self.ex = FakeEx()
+        self.j = lp.Journal(os.path.join(self.tmp, "paper.jsonl"))
+        self.fair = self.Fair()
+        self.t = lp.LPTest(self.cfg, self.ex, self.j, [mk("C1", q=self.Q)],
+                           books_fn=lambda toks: {t: ([(0.48, 100.0)], [(0.52, 100.0)], 0.01) for t in toks},
+                           log=lambda *a: None, clock=self.clock, fair=self.fair)
+
+    def step(self, dt=0.0):
+        self.clock.t += dt
+        asyncio.run(self.t.step(self.clock.t, {c: {"v": 4.5, "min": 20.0, "rate": 10.0} for c in self.t.st}))
+
+    def quotes(self):
+        o = self.t.st["C1"].orders
+        return (o["bid"] is not None, o["ask"] is not None)
+
+    def test_preset(self):
+        c = lp.phase5_config(lp_dir=self.tmp)
+        self.assertEqual((c.phase, c.fv_on, c.weather_only, c.pos_limit_mult), (5, 1, 1, 1.0))
+        self.assertEqual((c.sell_to_reduce, c.wx_local_stop_h), (1, 0.0))   # phase 4 kept
+
+    def test_sides_follow_the_edge(self):
+        self.step()
+        self.assertEqual(self.quotes(), (True, True))              # fair 0.50 = mid: both sides
+        self.fair.p = 0.60                                           # YES cheap by the model
+        self.step(1)
+        self.assertEqual(self.quotes(), (True, False))
+        self.fair.p = 0.40                                           # YES dear by the model
+        self.step(1)
+        self.assertEqual(self.quotes(), (False, True))
+        self.fair.p = 0.80                                           # hard disagreement: stand aside
+        self.step(1)
+        self.assertEqual(self.quotes(), (False, False))
+        ev = [e for e in journal_events(self.j) if e["event"] == "fair"]
+        self.assertEqual([round(e["edge"], 2) for e in ev], [0.0, 0.1, -0.1, 0.3])
+        self.assertTrue(self.fair.refreshed)
+
+    def test_position_against_the_model_is_closed(self):
+        self.step()
+        oid = self.t.st["C1"].orders["bid"][0]
+        self.ex.inject = [{"order": oid, "mkt": "C1", "side": "bid", "price": 0.48, "size": 20.0, "ts": self.clock.t, "done": True}]
+        self.step(1)
+        self.assertEqual(self.t.st["C1"].pos(), 20.0)
+        self.fair.p = 0.20                                           # long YES, the model says it is worth 0.20
+        self.step(1)
+        fl = [e for e in journal_events(self.j) if e["event"] == "flatten"]
+        self.assertEqual(fl[0]["reason"], "fair value against the position")
+        self.assertAlmostEqual(self.t.st["C1"].pos(), 0.0)
+
+    def test_no_data_no_quotes(self):
+        self.fair.p = None
+        self.step()
+        self.assertEqual(self.quotes(), (False, False))
+
+    def test_position_cap_is_n(self):
+        self.step()
+        oid = self.t.st["C1"].orders["bid"][0]
+        self.ex.inject = [{"order": oid, "mkt": "C1", "side": "bid", "price": 0.48, "size": 20.0, "ts": self.clock.t, "done": True}]
+        self.step(1)
+        self.step(1)
+        self.assertEqual(self.quotes(), (False, True))               # long N: the bid may not grow it further
