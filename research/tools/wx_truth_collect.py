@@ -6,6 +6,7 @@ temperature markets.
 STATIONS.json: city -> {icao, unit, lat, lon} (the ICAO comes from the market description: Polymarket resolves on the
 routine METARs of aviationweather.gov for that station). Writes:
   OUT_DIR/metar.jsonl        every METAR / SPECI of aviationweather.gov for the stations (icao, time, raw, temp)
+  OUT_DIR/prev/<icao>.json   Open-Meteo previous-runs API: every hour's forecast as issued 1..4 days before it
   OUT_DIR/runs/<model>_<run>.json   the archived forecast run (Open-Meteo single-runs API): hourly 2 m temperature
                                     of every station for 3 days from the run time; models ecmwf_ifs025 and
                                     gfs_seamless, runs 00z and 12z
@@ -88,6 +89,26 @@ def main():
     lat = ",".join(str(st[c]["lat"]) for c in st)
     lon = ",".join(str(st[c]["lon"]) for c in st)
     order = list(st)
+    # previous runs (one request a station for the whole period): the forecast of every hour as issued 1..4 days
+    # before it, for both models; polybot.wxfair.file_sources serves, for a decision at t, only what was published
+    os.makedirs(os.path.join(out, "prev"), exist_ok=True)
+    for c in order:
+        path = os.path.join(out, "prev", f"{st[c]['icao']}.json")
+        if os.path.exists(path):
+            continue
+        q = {"latitude": st[c]["lat"], "longitude": st[c]["lon"], "models": ",".join(MODELS),
+             "hourly": ",".join(["temperature_2m"] + [f"temperature_2m_previous_day{k}" for k in range(1, 5)]),
+             "start_date": d0, "end_date": d1}
+        try:
+            d = get("https://previous-runs-api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(q))
+        except Exception as e:
+            print(f"previous runs {c} failed: {e!r:.100}", flush=True)
+            continue
+        json.dump(d["hourly"], open(path, "w"))
+        print(f"previous runs {c}", flush=True)
+        time.sleep(2.0)
+    if "--previous-only" in sys.argv:
+        return
     models = arg("--models", ",".join(MODELS)).split(",")
     for model in models:                               # one model over all days first (the quota may run out)
       for day in days(d0, d1):
@@ -96,16 +117,24 @@ def main():
                 path = os.path.join(out, "runs", f"{model}_{day}T{hh}.json")
                 if os.path.exists(path):
                     continue
-                q = {"latitude": lat, "longitude": lon, "hourly": "temperature_2m", "run": f"{day}T{hh}:00",
-                     "models": model, "forecast_days": 3}
-                try:
-                    d = get("https://single-runs-api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(q))
-                except Exception as e:
-                    print(f"{model} {day}T{hh} failed: {e!r:.100}", flush=True)
+                res, ok = {}, True
+                for g in range(0, len(order), 12):             # 12 stations a request: Open-Meteo counts each location
+                    grp = order[g:g + 12]
+                    q = {"latitude": ",".join(str(st[c]["lat"]) for c in grp),
+                         "longitude": ",".join(str(st[c]["lon"]) for c in grp), "hourly": "temperature_2m",
+                         "run": f"{day}T{hh}:00", "models": model, "forecast_days": 3}
+                    try:
+                        d = get("https://single-runs-api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(q))
+                    except Exception as e:
+                        print(f"{model} {day}T{hh} failed: {e!r:.100}", flush=True)
+                        ok = False
+                        break
+                    d = d if isinstance(d, list) else [d]
+                    res.update({st[c]["icao"]: {"time": x["hourly"]["time"], "t": x["hourly"]["temperature_2m"]}
+                                for c, x in zip(grp, d)})
+                    time.sleep(3.0)
+                if not ok:
                     continue
-                d = d if isinstance(d, list) else [d]
-                res = {st[c]["icao"]: {"time": x["hourly"]["time"], "t": x["hourly"]["temperature_2m"]}
-                       for c, x in zip(order, d)}
                 json.dump(res, open(path, "w"))
                 time.sleep(1.0)
         print(f"runs {model} {day}", flush=True)

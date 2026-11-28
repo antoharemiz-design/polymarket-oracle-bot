@@ -65,8 +65,12 @@ def model_at(fair, q, t):
     return fair.value(q, t)
 
 
+def sources(truth):
+    return W.prev_sources(truth) if "--runs" not in sys.argv else W.file_sources(truth)
+
+
 def calibrate(wx_dir, truth, d0, d1):
-    metar_fn, runs_fn = W.file_sources(truth)
+    metar_fn, runs_fn = sources(truth)
     days = {}
     for d, res, pt, pp, q, p in markets(wx_dir, d0, d1):
         days.setdefault((p["kind"], p["icao"], p["date"]), p)
@@ -112,7 +116,7 @@ def calibrate(wx_dir, truth, d0, d1):
 
 
 def evaluate(wx_dir, truth, d0, d1, calib, out=None):
-    metar_fn, runs_fn = W.file_sources(truth)
+    metar_fn, runs_fn = sources(truth)
     fair = W.WxFair(metar_fn, runs_fn, calib=calib)
     brier = collections.defaultdict(lambda: [0, 0.0, 0.0])
     edges = collections.defaultdict(lambda: [0, 0.0, 0.0, 0])

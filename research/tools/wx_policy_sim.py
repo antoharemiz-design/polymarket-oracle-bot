@@ -48,6 +48,13 @@ POLICIES = {
     "phase 4, 2 ticks behind the touch":     dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10, market_loss=6.0, behind=2),
     "phase 4, stop -12 h, 1 tick behind":    dict(stop_h=-12, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10, market_loss=6.0, behind=1),
     "phase 4, vol cap 0.05":                 dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.05, market_loss=6.0),
+    "phase 5: phase 4 + cap N + loss $4 + fair value": dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10,
+                                                             market_loss=4.0, cap=20.0, fv=(0.05, 0.20)),
+    "phase 5, fair value only (one 0.03)":   dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10,
+                                                  market_loss=4.0, cap=20.0, fv=(0.03, 0.20)),
+    "phase 4, position cap N":               dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10, market_loss=6.0, cap=20.0),
+    "phase 4, cap N, loss $4":               dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10, market_loss=4.0, cap=20.0),
+    "phase 4, cap N, loss $4, hold 4 h":     dict(stop_h=0, start_h=-72, hold_h=4.0, cooldown_s=300, vol=0.10, market_loss=4.0, cap=20.0),
 }
 
 
@@ -75,8 +82,14 @@ def sigma(pp, j, n=30):
     return math.sqrt(sum((x - mu) ** 2 for x in d) / max(1, len(d) - 1) * 60)
 
 
-def run_market(d, res, pt, pp, pol, share, reward_rate):
+def run_market(d, res, pt, pp, pol, share, reward_rate, fair=None):
+    """fair: [(ts, p)] of polybot.wxfair (research/tools/h11_eval.py evaluate --out); with pol["fv"] = (one, pull)
+    the quotes follow it as in the bot (phase 5): |edge| >= pull nothing (and a position against it is closed),
+    edge >= one no ask, edge <= -one no bid; no fair value: no quotes."""
     q = d["meta"]["question"]
+    CAP = pol.get("cap", 60.0)
+    fv = pol.get("fv")
+    ft = [x[0] for x in fair] if fair else []
     trades = A.maker_fills(d)                          # (ts, maker sign, YES price, size)
     tt = [t for t, *_ in trades]
     out = collections.Counter()
@@ -130,6 +143,12 @@ def run_market(d, res, pt, pp, pol, share, reward_rate):
         sig = sigma(pp, j) if pol["vol"] is not None else None
         calm = sig is None or sig <= pol["vol"]
         quote = {}
+        edge = None
+        if fv is not None:
+            jf = bisect.bisect_right(ft, t) - 1
+            edge = fair[jf][1] - m if jf >= 0 else None
+            if edge is not None and abs(edge) >= fv[1] and edge * pos < 0:
+                close(t, m, "fair")
         if (m - b) <= ZONE:
             grow_ok = pos < CAP - 1e-9 and calm and t >= cool["bid"]
             if pos < -1e-9 or grow_ok:                 # bid reduces a short, or opens/grows a long
@@ -138,6 +157,13 @@ def run_market(d, res, pt, pp, pol, share, reward_rate):
             grow_ok = -pos < CAP - 1e-9 and calm and t >= cool["ask"]
             if pos > 1e-9 or grow_ok:
                 quote["ask"] = a
+        if fv is not None:
+            if edge is None or abs(edge) >= fv[1]:
+                quote = {}
+            elif edge >= fv[0]:
+                quote.pop("ask", None)
+            elif edge <= -fv[0]:
+                quote.pop("bid", None)
         dt = (nxt - t) / 60
         sc = [score(abs(m - quote[sd]) * 100) / S_REF for sd in quote]
         two = (sum(sc) / 2 if len(sc) == 2 and min(sc) * 3 >= max(sc) else max(sc) / 3 if sc else 0.0)
@@ -201,6 +227,7 @@ def main():
     share, reward = arg("--share", 1.0), arg("--reward", 25.0)
     names = list(POLICIES) if arg("--policies", "all") == "all" else arg("--policies", "").split("|")
     outp = arg("--out", "")
+    fair_all = json.load(open(arg("--fair", ""))).get("series", {}) if arg("--fair", "") else {}
     d_from, d_to = arg("--from", "0000"), arg("--to", "9999")
     mk = []
     for f in sorted(glob.glob(os.path.join(data, "*.json"))):
@@ -215,7 +242,9 @@ def main():
         per_day = collections.defaultdict(float)
         n = 0
         for d, res, pt, pp in mk:
-            o = run_market(d, res, pt, pp, pol, share, reward)
+            if pol.get("fv") is not None and d["meta"]["conditionId"] not in fair_all:
+                continue                               # markets the fair value model does not value: left out
+            o = run_market(d, res, pt, pp, pol, share, reward, fair_all.get(d["meta"]["conditionId"]))
             if o is None:
                 continue
             n += 1

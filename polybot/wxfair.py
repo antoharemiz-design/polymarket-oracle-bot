@@ -316,3 +316,64 @@ def file_sources(truth_dir):
                            for k, x in d.items()}
         return run_ts, cache[path]
     return metar_fn, runs_fn
+
+
+def prev_sources(truth_dir):
+    """Research: METARs as file_sources, forecasts from the previous-runs files (research/tools/wx_truth_collect.py:
+    every hour's forecast as issued 1..4 days before it). For a decision at t, the forecast of hour h is the one
+    issued at least the model's publication delay before t: previous_day d = ceil((h - t + delay) / 24 h), 1..4.
+    That is older than the latest run a live bot would have, so the replay is conservative for the model."""
+    import os
+    metar_fn, _ = file_sources_metar(truth_dir)
+    cache = {}
+
+    def load(icao):
+        if icao not in cache:
+            path = os.path.join(truth_dir, "prev", f"{icao}.json")
+            if not os.path.exists(path):
+                cache[icao] = None
+            else:
+                h = json.load(open(path))
+                cache[icao] = ([_ts(t + ":00Z") for t in h["time"]], h)
+        return cache[icao]
+
+    def runs_fn(model, pts, now):
+        out = {}
+        for icao, lat, lon in pts:
+            x = load(icao)
+            if x is None:
+                continue
+            times, h = x
+            ser = []
+            for i, t in enumerate(times):
+                if t < now - 6 * 3600 or t > now + 4 * 86400:
+                    continue
+                d = min(4, max(1, math.ceil((t - now + MODELS[model] * 3600) / 86400)))
+                v = (h.get(f"temperature_2m_previous_day{d}_{model}") or [None] * len(times))[i]
+                if v is not None:
+                    ser.append((t, v))
+            out[icao] = ser
+        if not any(out.values()):
+            raise LookupError("no forecast")
+        return now, out
+    return metar_fn, runs_fn
+
+
+def file_sources_metar(truth_dir):
+    import os
+    reps = {}
+    for line in open(os.path.join(truth_dir, "metar.jsonl")):
+        x = json.loads(line)
+        reps.setdefault(x["icao"], []).append((_ts(x["time"]), x.get("raw") or ""))
+    for v in reps.values():
+        v.sort()
+    keys = {k: [r[0] for r in v] for k, v in reps.items()}
+
+    def metar_fn(icaos, now):
+        out = {}
+        for i in icaos:
+            ts = keys.get(i, [])
+            a, b = bisect.bisect_left(ts, now - 30 * 3600), bisect.bisect_right(ts, now)
+            out[i] = reps.get(i, [])[a:b]
+        return out
+    return metar_fn, None
