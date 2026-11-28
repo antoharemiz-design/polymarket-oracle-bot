@@ -77,6 +77,22 @@ class SimExchangeTest(unittest.TestCase):
         self.assertEqual(bal, (0.0, 0.0))
         self.assertTrue(any(x.startswith("taker close success") for x in log))
 
+    def test_taker_close_respects_the_floor(self):
+        async def body(sim, ex, m):
+            await ex.place(m, "bid", 0.48, 20.0)
+            sim.trade(sim.yes, "SELL", 0.48, 20.0)
+            await ex.fills([m])
+            held = await ex.balances(m)
+            above = await ex.take(m, "ask", 20.0, [(0.48, 500.0)], [(0.52, 500.0)], wait_s=1.5, sell=True, limit=0.50)
+            kept = await ex.balances(m)
+            within = await ex.take(m, "ask", 20.0, [(0.48, 500.0)], [(0.52, 500.0)], wait_s=1.5, sell=True, limit=0.40)
+            return held, above, kept, within, await ex.balances(m)
+        sim, (held, above, kept, within, bal), log = self.run_with(body)
+        self.assertEqual(above["unfilled"], "no orders within the limit")   # best bid 0.48 under the floor 0.50
+        self.assertEqual(kept, held)                         # nothing was sent
+        self.assertEqual((within["size"], bal), (20.0, (0.0, 0.0)))
+        self.assertTrue(any(x.startswith("taker close success") and "floor 0.46" in x for x in log))
+
     def test_taker_close_of_a_long_no(self):
         async def body(sim, ex, m):
             await ex.place(m, "ask", 0.52, 20.0)            # BUY NO at 0.48

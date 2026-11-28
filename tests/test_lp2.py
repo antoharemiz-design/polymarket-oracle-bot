@@ -522,7 +522,7 @@ class Phase2LoopTest(unittest.TestCase):
         self.assertEqual(calls, [("ask", 20.0)])
         self.assertEqual(t.errors, 1)
         err = [e for e in journal_events(self.j) if e["event"] == "error"]
-        self.assertIn("taker close did not fill (position held 1 h)", err[0]["error"])
+        self.assertIn("taker close failed (position held 1 h)", err[0]["error"])
         self.step(t, 5)
         self.assertEqual(len(calls), 1)                    # paused
         self.assertIsNotNone(s.orders["ask"])              # the reducing quote rests meanwhile
@@ -629,7 +629,11 @@ class Phase2LoopTest(unittest.TestCase):
         self.assertAlmostEqual(r["fee"], 30.0 * 0.05 * p * (1 - p))
         r = asyncio.run(ex.take(m, "bid", 30.0, [(0.48, 20.0)], [(0.52, 10.0)]))
         self.assertAlmostEqual(r["size"], 10.0)            # book thinner than the order: partial
-        self.assertIsNone(asyncio.run(ex.take(m, "bid", 5.0, [(0.48, 20.0)], [])))
+        self.assertEqual(asyncio.run(ex.take(m, "bid", 5.0, [(0.48, 20.0)], []))["unfilled"], "empty book")
+        r = asyncio.run(ex.take(m, "ask", 30.0, [(0.48, 3.0), (0.30, 5.0), (0.05, 100.0)], [], limit=0.38))
+        self.assertAlmostEqual(r["size"], 3.0)             # phase 6: never below the limit
+        self.assertEqual(asyncio.run(ex.take(m, "ask", 30.0, [(0.30, 5.0)], [], limit=0.38))["unfilled"],
+                         "no orders within the limit")
 
     def test_paused_does_not_flatten(self):
         t = self.make([mk("C1")])
@@ -1158,15 +1162,31 @@ class LiveTakeTest(unittest.TestCase):
         self.assertIn("place rejected", log[-1])
 
     def test_rejected_and_failed(self):
+        # a FAK that matched nothing is the book, not an error (phase 6): {size 0, unfilled}
         rej = types.SimpleNamespace(ok=False, code="fak_not_filled", message="no orders found to match")
         r, log = self.take(self.client(rej), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
-        self.assertIsNone(r)
-        self.assertIn("closing order rejected: fak_not_filled", log[-1])
+        self.assertEqual((r["size"], r["unfilled"]), (0.0, "FAK matched nothing"))
+        self.assertIn("taker close did not fill", log[-1])
+        rej = types.SimpleNamespace(ok=False, code="balance", message="not enough balance / allowance")
+        r, log = self.take(self.client(rej), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
+        self.assertIsNone(r)                               # a real rejection: an error
+        self.assertIn("closing order rejected: balance", log[-1])
         r, log = self.take(self.client(exc=RuntimeError("down")), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)])
         self.assertIsNone(r)
         self.assertIn("closing order failed", log[-1])
         r, _ = self.take(self.client(), "ask", 20.0, [], [(0.49, 50.0)])
-        self.assertIsNone(r)                               # no bids to sell into
+        self.assertEqual(r["unfilled"], "empty book")      # no bids to sell into
+
+    def test_buy_close_within_the_limit(self):
+        c = self.client(types.SimpleNamespace(ok=True, taking_amount="20", making_amount="10.6"), fill=20.0)
+        ex = lp.LiveExec.__new__(lp.LiveExec)
+        ex.c, ex.log, ex.MIN_TAKE_USD = c, (lambda *_: None), 1.0
+        ex.balances = lambda m: asyncio.sleep(0, (c.bal["YC1"], c.bal["NC1"]))
+        r = asyncio.run(ex.take(mk("C1"), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)], wait_s=1.5, limit=0.40))
+        self.assertEqual(c.sent[-1]["max_price"], "0.55")   # NO at most 1 - 0.47 + 0.02, under the cap 1 - 0.40
+        r = asyncio.run(ex.take(mk("C1"), "ask", 20.0, [(0.47, 50.0)], [(0.49, 50.0)], wait_s=1.5, limit=0.50))
+        self.assertEqual(r["unfilled"], "no orders within the limit")   # best bid 0.47 below the floor 0.50
+        self.assertEqual(len(c.sent), 1)                   # nothing sent
 
 
 class LiveCheckTest(unittest.TestCase):
@@ -1689,7 +1709,15 @@ class Phase6Test(unittest.TestCase):
         self.step(t, 1)
         self.assertEqual(t.blocked, {"C1": "event loss", "C2": "event loss"})
         self.assertEqual(t.blocked_events, {"E17"})
-        self.assertTrue(any(e["event"] == "flatten" for e in journal_events(self.j)))
+        # the price fell 0.50 -> 0.25 within the half hour: the bids (0.24) are under the reference floor, so the
+        # closes wait with their sell quotes resting; when the reference has caught up, they close
+        ev = journal_events(self.j)
+        self.assertFalse(any(e["event"] == "flatten" for e in ev))
+        self.assertTrue(any(e["event"] == "close_wait" and e["kind"] == "beyond the floor" for e in ev))
+        self.assertEqual(t.errors, 0)
+        for _ in range(4):
+            self.step(t, 600)
+        self.assertEqual(sum(1 for e in journal_events(self.j) if e["event"] == "flatten"), 2)
         # a restart keeps the event blocked
         t2 = lp.LPTest(cfg, self.ex, lp.Journal(os.path.join(self.tmp, "paper2.jsonl")), [], log=lambda *a: None,
                        clock=self.clock, books_fn=lambda toks: {x: books[x] for x in toks})
@@ -1715,6 +1743,104 @@ class Phase6Test(unittest.TestCase):
         md = "\n".join(service._phase2_lines(ev, NOW, phase=6))
         self.assertIn("правила фазы 6", md)
         self.assertIn("(критерий: не меньше $10)", md)
+
+    def safety(self, books, start_h=-46.0, **kw):
+        """A phase 6 test with a long 20 YES bought at 0.48 at start_h before the Denver day of 17 Jan."""
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock(NOW + (47 + start_h) * 3600)
+        cfg = lp.phase6_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0, fill_cooldown_s=0.0, **kw)
+        self.j = lp.Journal(os.path.join(self.tmp, "paper.jsonl"), clock=self.clock)
+        self.ex = FakeEx()
+        self.books = books
+        t = lp.LPTest(cfg, self.ex, self.j, [mk("C1", q=self.IN, event="E17")], log=lambda *a: None, clock=self.clock,
+                      books_fn=lambda toks: {x: self.books[x] for x in toks})
+        self.step(t)
+        self.ex.inject = [{"order": t.st["C1"].orders["bid"][0], "mkt": "C1", "side": "bid", "price": 0.48, "size": 20.0,
+                           "ts": self.clock.t, "done": True}]
+        self.step(t, 1)
+        return t
+
+    def ev(self, kind):
+        return [e for e in journal_events(self.j) if e["event"] == kind]
+
+    def test_one_sided_book_trips_no_limit(self):
+        # the bids under 0.48 are pulled: the mid of the book is 0.275 (-$4.10), but the book is not narrow
+        books = {"YC1": ([(0.48, 100.0)], [(0.52, 100.0)], 0.01)}
+        t = self.safety(books, stop_loss_usd=4.0)
+        books["YC1"] = ([(0.04, 100.0)], [(0.51, 100.0)], 0.01)
+        self.step(t, 5)
+        self.assertEqual((t.blocked, t.stopped, self.ev("flatten")), ({}, None, []))
+        self.assertAlmostEqual(t.pnl_mark(), 20 * (0.50 - 0.48), places=6)    # marked at the last narrow mid
+        books["YC1"] = ([(0.26, 100.0)], [(0.28, 100.0)], 0.01)   # a narrow book at 0.27: a real fall, -$4.20
+        self.step(t, 5)
+        self.assertEqual(t.blocked, {"C1": "market loss"})
+
+    def test_thin_book_close_stops_at_the_floor(self):
+        books = {"YC1": ([(0.48, 100.0)], [(0.52, 100.0)], 0.01)}
+        t = self.safety(books, start_h=-36.5)
+        books["YC1"] = ([(0.47, 3.0), (0.30, 5.0), (0.05, 100.0)], [(0.51, 100.0)], 0.01)   # narrow at 0.49
+        for dt in (1800, 3600):                             # -36 h: exit; -35 h: the exit window's taker close
+            self.step(t, dt)
+        fl = self.ev("flatten")
+        self.assertEqual([(round(e["price"], 2), e["size"]) for e in fl], [(0.47, 3.0)])  # floor 0.49 - 0.10
+        self.assertAlmostEqual(fl[0]["limit"], 0.39)
+        self.assertAlmostEqual(t.st["C1"].pos(), 17.0)
+        books["YC1"] = ([(0.30, 5.0), (0.05, 100.0)], [(0.51, 100.0)], 0.01)   # the 3 at 0.47 are gone
+        self.step(t, 1)
+        self.step(t, 61)
+        self.assertEqual(len(self.ev("flatten")), 1)        # nothing sold at 0.30 or 0.05
+        self.assertEqual(t.errors, 0)
+        self.assertEqual(self.ev("close_wait")[-1]["kind"], "beyond the floor")
+        self.assertEqual(t.st["C1"].orders["ask"][1:4:2], (0.51, 17.0))   # the sell quote keeps resting
+
+    def test_empty_bids_hold_to_resolution(self):
+        books = {"YC1": ([(0.48, 100.0)], [(0.52, 100.0)], 0.01)}
+        t = self.safety(books, start_h=-36.5)
+        books["YC1"] = ([], [(0.51, 100.0)], 0.01)
+        calls = []
+        real = self.ex.take
+
+        async def spy(*a, **kw):
+            calls.append(kw.get("limit"))
+            return await real(*a, **kw)
+        self.ex.take = spy
+        for _ in range(6):                                  # -36 h .. -33.5 h
+            self.step(t, 1800)
+        self.assertEqual((calls, t.errors), ([], 0))       # nothing sent into an empty book, no error
+        self.assertTrue(t.close_waits > 0)
+        self.assertEqual(t.st["C1"].orders["ask"][1], 0.51)  # the sell quote rests
+        self.step(t, 34 * 3600)                             # the measured day has started (hold_until_h = 0)
+        self.step(t, 1)
+        self.assertEqual(t.st["C1"].orders, {"bid": None, "ask": None})   # no quotes any more
+        self.assertAlmostEqual(t.st["C1"].pos(), 20.0)     # held to resolution
+        reb = {"event": "rebalance", "ts": 0, "markets": {"C1": {"q": self.IN, "N": 20.0}}, "exiting": {}}
+        r = lp.phase6_check([reb] + journal_events(self.j))
+        self.assertEqual((r["held_to_resolution"], r["bad"]), (1, 0), r["bad_first"])
+        self.assertGreater(r["close_waits"], 0)
+        books["YC1"] = ([(0.45, 100.0)], [(0.47, 100.0)], 0.01)   # bids come back above the floor: sold
+        self.step(t, 120)
+        self.step(t, 120)
+        self.assertNotIn("C1", t.st)
+
+    def test_exit_quote_on_an_empty_side(self):
+        books = {"YC1": ([(0.48, 100.0)], [(0.52, 100.0)], 0.01)}
+        t = self.safety(books, start_h=-36.5)
+        books["YC1"] = ([(0.30, 100.0)], [], 0.01)          # no asks at all (and bids below the floor)
+        self.step(t, 1800)
+        self.assertEqual(t.st["C1"].orders["ask"][1], 0.5)    # the sell quote at the reference price
+        self.assertEqual(t.errors, 0)
+
+    def test_quote_capital_counts_quoting_markets_only(self):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        cfg = lp.phase6_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0)
+        self.j = lp.Journal(os.path.join(self.tmp, "paper.jsonl"))
+        t = lp.LPTest(cfg, FakeEx(), self.j, [mk("C1", q=self.IN, quote_cap=20.0), mk("C2", q=self.BEFORE, quote_cap=30.0)],
+                      log=lambda *a: None, clock=self.clock,
+                      books_fn=lambda toks: {x: ([(0.48, 100.0)], [(0.52, 100.0)], 0.01) for x in toks})
+        t.target = {"C1", "C2"}
+        self.step(t)
+        self.assertEqual(t.win_cap[-1], 20.0)              # C2 waits for its window: not counted
 
     def test_window_ends_while_quoting(self):
         t = self.make(self.IN)

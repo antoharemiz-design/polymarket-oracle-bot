@@ -125,6 +125,16 @@ class LPConfig:
                                        #   0 = no limit (the backtest of phase 6 quotes every bucket)
     event_loss_usd: float = 0.0        # > 0: when the markets of one event lost this much together (marked to mid,
                                        #   retired ones included), all of them are closed and blocked
+    # phase 6 safety (audit of 28 Nov, research/PREREG_PHASE6.md): no taker close into a thin book, no limit on a
+    # one-sided book's mid; the defaults leave phases 1-5 as they were
+    narrow_spread: float = 1.0         # a book (of the other orders) is narrow when its spread is at most this; the
+                                       #   market, event and stop limits and the markout kill count only narrow books
+    taker_floor: float = 1.0           # a taker close never sells below the reference price minus this (never buys
+                                       #   above it plus this); reference = mean narrow-book mid of the last ref_window_s
+    ref_window_s: float = 1800.0       #   (else the last narrow-book mid; never narrow: no taker close)
+    hold_until_h: float = 1e9          # weather: a position the taker cannot close keeps its sell quote up to this
+                                       #   local hour of its measured day; from then on no quotes (taker tries above the
+                                       #   floor go on) and what is left is held to resolution
     inv_reduce_h: float = 0.0          # a position held this long: only the reducing side is quoted (0 = off)
     inv_flatten_h: float = 0.0         # a position held this long is closed by a taker order (0 = off)
     flatten_retry_s: float = 60.0      # after a taker close that did not fill, the next try waits this long (the quotes
@@ -177,7 +187,8 @@ PHASE5 = {"weather_only": 1, "pos_limit_mult": 1.0, "market_loss_usd": 4.0}
 # of sample (research/STATUS_2026-11-28.md; the backtest covers "highest" markets only)
 PHASE6 = {"wx_window_on": 1, "wx_window_start_h": -72.0, "wx_window_end_h": -36.0,
           "wx_cities_allow": "denver,istanbul,moscow,taipei", "wx_cities_block": "seoul,tokyo,helsinki,paris,wellington",
-          "wx_kinds": "highest", "event_markets_max": 0, "event_loss_usd": 8.0}
+          "wx_kinds": "highest", "event_markets_max": 0, "event_loss_usd": 8.0,
+          "narrow_spread": 0.10, "taker_floor": 0.10, "ref_window_s": 1800.0, "hold_until_h": 0.0}
 PHASE4 = {"sell_to_reduce": 1, "liquidate_on_stop": 1, "equity_stop": 1, "equity_every_s": 60.0,
           "market_loss_usd": 6.0, "markout_kill_usd": 3.0, "vol_risk_usd": 4.0, "vol_k": 2.0,
           "fill_cooldown_s": 300.0,
@@ -1253,19 +1264,22 @@ class PaperExec:
     async def merge(self, m, pairs):
         return pairs
 
-    async def take(self, m, side, size, bids, asks, sell=False):
+    async def take(self, m, side, size, bids, asks, sell=False, limit=None):
         """Paper taker order of `size` against the other orders' YES book: side "ask" = BUY NO (closes a long YES)
-        walking the YES bids, side "bid" = BUY YES walking the YES asks. Taker fee fee_rate x p x (1 - p) per share
-        of the token bought. Returns {side, price (YES terms, size-weighted), size, fee} or None (empty book)."""
+        walking the YES bids, side "bid" = BUY YES walking the YES asks, never past `limit` (YES price: the lowest bid
+        for "ask", the highest ask for "bid"; None = the whole book). Taker fee fee_rate x p x (1 - p) per share of the
+        token bought. Returns {side, price (YES terms, size-weighted), size, fee}, or {size: 0, unfilled: why}."""
         levels = bids if side == "ask" else asks
         left, got, val = size, 0.0, 0.0
         for p, z in levels:
+            if limit is not None and (p < limit - 1e-9 if side == "ask" else p > limit + 1e-9):
+                break
             q = min(left, z)
             got += q; val += q * p; left -= q
             if left <= 1e-9:
                 break
         if got <= 1e-9:
-            return None
+            return {"side": side, "size": 0.0, "unfilled": "no orders within the limit" if levels else "empty book"}
         px = val / got
         tp = 1 - px if side == "ask" else px
         r = {"side": side, "price": px, "size": got, "fee": got * float(m.get("fee_rate") or 0.0) * tp * (1 - tp)}
@@ -1388,29 +1402,41 @@ class LiveExec:
 
     MIN_TAKE_USD = 1.0                    # the exchange's minimum spend of a marketable BUY order
 
-    async def take(self, m, side, size, bids, asks, slippage=0.02, wait_s=10.0, sell=False):
+    async def take(self, m, side, size, bids, asks, slippage=0.02, wait_s=10.0, sell=False, limit=None):
         """Taker order closing a position. sell=True (phase 4): a market SELL of the token held, exact shares
-        (_take_sell). Otherwise (phases 2-3): a fill-and-kill BUY of the other token, merged afterwards (below)."""
+        (_take_sell). Otherwise (phases 2-3): a fill-and-kill BUY of the other token, merged afterwards (below).
+        limit (phase 6, YES terms): the lowest YES price a close of a long YES may get, the highest a close of a long
+        NO may pay. Returns the fill, {size: 0, unfilled: why} when nothing could fill (no orders, none within the
+        limits, a FAK that matched nothing), or None on an error (exception, rejection, wallet short)."""
         if sell:
-            return await self._take_sell(m, side, size, bids, asks, slippage, wait_s)
-        return await self._take_buy(m, side, size, bids, asks, slippage, wait_s)
+            return await self._take_sell(m, side, size, bids, asks, slippage, wait_s, limit)
+        return await self._take_buy(m, side, size, bids, asks, slippage, wait_s, limit)
+
+    @staticmethod
+    def _unfilled(side, why):
+        return {"side": side, "size": 0.0, "unfilled": why}
 
     @staticmethod
     def _tick_floor(x, tick):
         return max(tick, math.floor(x / tick + 1e-9) * tick)
 
-    async def _take_sell(self, m, side, size, bids, asks, slippage, wait_s):
+    async def _take_sell(self, m, side, size, bids, asks, slippage, wait_s, limit=None):
         """Close a long YES (side "ask") by a FAK market SELL of YES into the YES bids, or a long NO (side "bid") by
         a FAK SELL of NO into the NO bids (1 - YES asks); never below the best price minus `slippage` (min_price).
         The shares are exact (at most what the wallet holds); the sold shares and the USDC received are the order's
         making and taking amounts, the wallet change is the fallback."""
         levels = bids if side == "ask" else asks
         if not levels:
-            return None
+            return self._unfilled(side, "empty book")
         tick = float(m.get("tick") or 0.01)
         ref = levels[0][0] if side == "ask" else 1 - levels[0][0]      # best bid of the token sold
         token, k = (m["yes"], 0) if side == "ask" else (m["no"], 1)
         floor = self._tick_floor(ref - slippage, tick)
+        if limit is not None:                                           # phase 6: never below the reference floor
+            low = limit if side == "ask" else 1 - limit                 # lowest price of the token sold
+            if ref < low - 1e-9:
+                return self._unfilled(side, "no orders within the limit")
+            floor = max(floor, math.ceil(low / tick - 1e-9) * tick)
         dec = max(2, len(f"{tick:.6f}".rstrip("0").split(".")[1]))
         try:
             before = await self.balances(m)
@@ -1424,7 +1450,11 @@ class LiveExec:
             self.log(f"closing order failed: {e!r}")
             return None
         if not getattr(r, "ok", False):
-            self.log(f"closing order rejected: {getattr(r, 'code', r)} {getattr(r, 'message', '')}".rstrip())
+            msg = f"{getattr(r, 'code', r)} {getattr(r, 'message', '')}".rstrip()
+            if "no orders found to match" in msg:               # a FAK that matched nothing: the book, not an error
+                self.log(f"taker close did not fill: {msg}")
+                return self._unfilled(side, "FAK matched nothing")
+            self.log(f"closing order rejected: {msg}")
             return None
         try:
             sold, usd = float(r.making_amount), float(r.taking_amount)
@@ -1444,7 +1474,7 @@ class LiveExec:
                 break
         got = sold or got
         if got <= 1e-9:
-            return None
+            return self._unfilled(side, "nothing sold")
         paid = usd / sold if sold and 0 < usd < sold else ref           # price of the token sold
         px = paid if side == "ask" else 1 - paid                        # in YES terms
         tp = px if side == "ask" else 1 - px
@@ -1453,7 +1483,7 @@ class LiveExec:
         return {"side": side, "price": px, "size": got, "fee": got * float(m.get("fee_rate") or 0.0) * tp * (1 - tp),
                 "sell": True}
 
-    async def _take_buy(self, m, side, size, bids, asks, slippage, wait_s):
+    async def _take_buy(self, m, side, size, bids, asks, slippage, wait_s, limit=None):
         """Taker order closing a position (phase 2 exit): a fill-and-kill BUY of the NO token (side "ask", long YES)
         or of the YES token (side "bid", long NO); the pairs are merged afterwards.
         A market BUY is sized in USDC (polymarket-client: `amount`; `shares` is refused for BUY, 25 Nov live):
@@ -1464,20 +1494,29 @@ class LiveExec:
         the fallback, and reconcile() adopts any difference later."""
         levels = bids if side == "ask" else asks
         if not levels:
-            return None
+            return self._unfilled(side, "empty book")
         best = levels[0][0]
         token, pay = (m["no"], 1 - best) if side == "ask" else (m["yes"], best)
-        limit = min(0.99, round(pay + slippage, 2))
+        top = min(0.99, round(pay + slippage, 2))
+        if limit is not None:                                           # phase 6: never above the reference cap
+            high = 1 - limit if side == "ask" else limit                # highest price of the token bought
+            if pay > high + 1e-9:
+                return self._unfilled(side, "no orders within the limit")
+            top = min(top, math.floor(high * 100 + 1e-9) / 100)
         amount = max(self.MIN_TAKE_USD, int(size * pay * 100 + 1e-6) / 100)
         try:
             before = await self.balances(m)
             r = await self.c.place_market_order(token_id=token, side="BUY", amount=f"{amount:.2f}",
-                                                max_price=f"{limit:.2f}", order_type="FAK")
+                                                max_price=f"{top:.2f}", order_type="FAK")
         except Exception as e:
             self.log(f"closing order failed: {e!r}")
             return None
         if not getattr(r, "ok", False):
-            self.log(f"closing order rejected: {getattr(r, 'code', r)} {getattr(r, 'message', '')}".rstrip())
+            msg = f"{getattr(r, 'code', r)} {getattr(r, 'message', '')}".rstrip()
+            if "no orders found to match" in msg:
+                self.log(f"taker close did not fill: {msg}")
+                return self._unfilled(side, "FAK matched nothing")
+            self.log(f"closing order rejected: {msg}")
             return None
         try:
             shares, spent = float(r.taking_amount), float(r.making_amount)
@@ -1497,7 +1536,7 @@ class LiveExec:
                 break
         got = shares or got
         if got <= 1e-9:
-            return None
+            return self._unfilled(side, "nothing bought")
         paid = spent / shares if shares and 0 < spent < shares else pay   # average price of the bought token
         px = 1 - paid if side == "ask" else paid      # in YES terms
         tp = 1 - px if side == "ask" else px
@@ -1604,6 +1643,9 @@ class MarketState:
         self.flatten_retry_at = 0.0                     # no taker close before this time (the last one did not fill)
         self.cool = {"bid": 0.0, "ask": 0.0}            # phase 4: a side is not re-quoted to grow before this time
         self.mk_usd = 0.0                               # phase 4: dollars of the 600 s markouts of this market's fills
+        self.mark = None                                # phase 6: the last mid of a narrow book (spread <= narrow_spread)
+        self.marks = []                                 # phase 6: (ts, mid) of the narrow books, the last hour
+        self.wait = None                                # phase 6: why the last taker close could not fill (kind, ts)
         self.fair = None                                # H11: (ts, fair value, fair - mid) at the last step
         self.book = None                                # (bids, asks) of the other orders at the last step
         try:
@@ -1671,6 +1713,18 @@ class MarketState:
     def mtm(self):
         return self.cash + (self.yes * self.mid + self.no * (1 - self.mid) if self.mid is not None else 0.0)
 
+    def mtm_mark(self):
+        """Phase 6: the mark-to-market at the last narrow-book mid (the mid when the book was never narrow): what the
+        loss limits use, so a one-sided book cannot trip them."""
+        m = self.mark if self.mark is not None else self.mid
+        return self.cash + (self.yes * m + self.no * (1 - m) if m is not None else 0.0)
+
+    def ref_price(self, now, window_s):
+        """Phase 6: reference price of the taker closes: the mean narrow-book mid of the last window_s, else the last
+        narrow-book mid, else None."""
+        xs = [m for t, m in self.marks if now - t <= window_s]
+        return sum(xs) / len(xs) if xs else self.mark
+
     def exposure(self):
         if self.mid is None:
             return 0.0
@@ -1708,6 +1762,8 @@ class LPTest:
         self.acc = self._new_acc()
         self.win_cap = []                               # quote capital of the target portfolio at each sample
         self.errors = 0
+        self.close_waits = 0                            # phase 6: taker closes that could not fill (market state, not
+                                                        #   an error of the bot: no orders, none above the floor)
         self.closed_pnl = 0.0                           # mark-to-market of the markets that left the test
         self.last_rebalance = None
         self.pending_target = None                      # (markets, summary, ts) from the snapshot task, for step()
@@ -1757,6 +1813,10 @@ class LPTest:
 
     def pnl(self):
         return self.closed_pnl + sum(s.mtm() for s in self.st.values())
+
+    def pnl_mark(self):
+        """Phase 6: the PnL the loss stop uses (narrow-book marks)."""
+        return self.closed_pnl + sum(s.mtm_mark() for s in self.st.values())
 
     def restore(self, events):
         """Rebuild positions and cash of a resumed run from its own journal (fills, merges, closing orders), so a
@@ -1856,7 +1916,7 @@ class LPTest:
             s = self.st.get(cond)
             if s is None:
                 continue
-            later = next((m for t, m in s.mids if t >= due), None)
+            t_l, later = next(((t, m) for t, m in s.mids if t >= due), (None, None))
             if later is None:
                 if now - due <= 600:
                     keep.append((due, h, cond, side, price, size))
@@ -1865,7 +1925,7 @@ class LPTest:
             self.j.write("markout", mkt=cond, horizon=h, side=side, price=price, size=size, mid=later, markout=mk)
             if h == 60:
                 self._a(cond)["markout60"].append([round(100 * mk, 3), size])
-            elif h == 600:
+            elif h == 600 and any(t == t_l for t, _ in s.marks):   # the kill counts narrow books only
                 s.mk_usd += mk * size
         self.pending = keep
 
@@ -1910,20 +1970,45 @@ class LPTest:
             return False
         if ev in self.blocked_events:
             return True
-        tot = self.event_closed.get(ev, 0.0) + sum(x.mtm() for x in self.st.values() if x.m.get("event") == ev)
+        tot = self.event_closed.get(ev, 0.0) + sum(x.mtm_mark() for x in self.st.values() if x.m.get("event") == ev)
         return tot < -self.cfg.event_loss_usd
 
-    def _exit_quotes(self, s, ob, oa):
+    def _exit_quotes(self, s, ob, oa, now=None):
         """Reduce-only quotes of an exiting market: join the best price on the side that shrinks |YES - NO|, for at
-        most the position (no flip); nothing below dust_shares."""
+        most the position (no flip); nothing below dust_shares. Phase 6: with no order on that side, the quote rests
+        at the reference price (at least a tick from the other side); from hold_until_h of the measured day no quote
+        (the rest is held to resolution)."""
         pos = s.pos()
         none = ({"bid": None, "ask": None}, {"bid": 0.0, "ask": 0.0})
         if abs(pos) < self.cfg.dust_shares:
             return none
+        if now is not None and self._past_hold(s, now):
+            return none
         q = round(min(s.m["N"], abs(pos)), 2)
+        tick = s.m.get("tick") or 0.01
+        ref = s.ref_price(now, self.cfg.ref_window_s) if now is not None and self.cfg.taker_floor < 1.0 else None
         if pos > 0:
-            return ({"bid": None, "ask": self._reduce_price("ask", ob, oa, s.m.get("tick") or 0.01)}, {"bid": 0.0, "ask": q}) if oa else none
-        return ({"bid": self._reduce_price("bid", ob, oa, s.m.get("tick") or 0.01), "ask": None}, {"bid": q, "ask": 0.0}) if ob else none
+            if oa:
+                px = self._reduce_price("ask", ob, oa, tick)
+            elif ref is not None:
+                px = max(math.ceil(ref / tick - 1e-9) * tick, (ob[0][0] + tick) if ob else tick)
+            else:
+                return none
+            return {"bid": None, "ask": round(min(px, 1 - tick), 6)}, {"bid": 0.0, "ask": q}
+        if ob:
+            px = self._reduce_price("bid", ob, oa, tick)
+        elif ref is not None:
+            px = min(math.floor(ref / tick + 1e-9) * tick, (oa[0][0] - tick) if oa else 1 - tick)
+        else:
+            return none
+        return {"bid": round(max(px, tick), 6), "ask": None}, {"bid": q, "ask": 0.0}
+
+    def _past_hold(self, s, now):
+        """Phase 6: the weather market is at or past hold_until_h of its measured day (no more quotes)."""
+        if self.cfg.hold_until_h >= 1e8:
+            return False
+        h = wx_local_hours(s.m.get("q"), now)
+        return h is not None and h >= self.cfg.hold_until_h
 
     def _reduce_price(self, side, ob, oa, tick):
         """Price of a quote that reduces the position: exit_improve_ticks inside the spread, never at or through the
@@ -1941,23 +2026,46 @@ class LPTest:
 
     async def _flatten(self, s, now, ob, oa, reason="", qty=None):
         """Close the position of an exiting market with a taker order: BUY NO against the YES bids when long YES,
-        BUY YES against the YES asks when long NO; the pairs are merged afterwards."""
-        for side in ("bid", "ask"):
-            cur = s.orders[side]
-            if cur:
-                res = await self.ex.cancel(s.m, cur[0])
-                s.orders = {"bid": None, "ask": None} if res == "market" else dict(s.orders, **{side: None})
-                self.j.write("cancel", mkt=s.m["cond"], side=side, price=cur[1], scope=res)
+        BUY YES against the YES asks when long NO; the pairs are merged afterwards (phase 4: SELL of the token held).
+        Phase 6: never past the reference price -/+ taker_floor; when no order is within it (or there is no
+        reference), nothing is sent, the reduce-only quote keeps resting and the next try is in flatten_retry_s.
+        A close that could not fill is market state (close_waits, a "close_wait" event), not an error of the bot."""
         pos = s.pos()
         side = "ask" if pos > 0 else "bid"
         want = round(min(abs(pos), qty) if qty else abs(pos), 2)
-        r = await self.ex.take(s.m, side, want, ob, oa, **({"sell": True} if self.cfg.sell_to_reduce else {}))
-        if not r or r.get("size", 0.0) <= 1e-9:
+        limit = None
+        if self.cfg.taker_floor < 1.0:
+            ref = s.ref_price(now, self.cfg.ref_window_s)
+            levels = ob if side == "ask" else oa
+            if ref is None:
+                return self._close_wait(s, now, reason, side, want, "no reference", "the book was never narrow")
+            limit = ref - self.cfg.taker_floor if side == "ask" else ref + self.cfg.taker_floor
+            if not levels:
+                return self._close_wait(s, now, reason, side, want, "empty book",
+                                        f"no {'bids' if side == 'ask' else 'asks'}; reference {ref:.3f}")
+            best = levels[0][0]
+            if (best < limit - 1e-9) if side == "ask" else (best > limit + 1e-9):
+                return self._close_wait(s, now, reason, side, want, "beyond the floor",
+                                        f"best {best:.3f}, limit {limit:.3f} (reference {ref:.3f})")
+        for side_ in ("bid", "ask"):
+            cur = s.orders[side_]
+            if cur:
+                res = await self.ex.cancel(s.m, cur[0])
+                s.orders = {"bid": None, "ask": None} if res == "market" else dict(s.orders, **{side_: None})
+                self.j.write("cancel", mkt=s.m["cond"], side=side_, price=cur[1], scope=res)
+        kw = {"sell": True} if self.cfg.sell_to_reduce else {}
+        if limit is not None:
+            kw["limit"] = round(limit, 6)
+        r = await self.ex.take(s.m, side, want, ob, oa, **kw)
+        if r is not None and r.get("size", 0.0) <= 1e-9:
+            return self._close_wait(s, now, reason, side, want, "not filled", r.get("unfilled") or "nothing filled")
+        if not r:
             s.flatten_retry_at = now + self.cfg.flatten_retry_s
             self.errors += 1
-            self.j.write("error", error=f"taker close did not fill ({reason}): {s.m.get('q', s.m['cond'])[:60]} "
+            self.j.write("error", error=f"taker close failed ({reason}): {s.m.get('q', s.m['cond'])[:60]} "
                                         f"{side} {want:.2f}; next try in {self.cfg.flatten_retry_s:.0f} s")
             return
+        s.wait = None
         s.book_fill(side, r["price"], r["size"], sell=bool(r.get("sell")), fee=r.get("fee", 0.0))
         s.lot_update(now, r["size"] if side == "bid" else -r["size"])
         mid = s.mid if s.mid is not None else r["price"]
@@ -1966,9 +2074,22 @@ class LPTest:
         self.j.write("flatten", mkt=s.m["cond"], side=side, price=r["price"], size=r["size"], fee=r.get("fee", 0.0),
                      sell=bool(r.get("sell")), mid=s.mid, cost=round(-loss, 6), hours_left=round(s.hours_left(now), 3),
                      since_exit_h=round((now - s.exit_since) / 3600, 3) if s.exit_since else None, reason=reason,
-                     held_h=round((now - s.pos_since) / 3600, 3) if s.pos_since else None)
+                     held_h=round((now - s.pos_since) / 3600, 3) if s.pos_since else None, limit=limit)
         if abs(s.pos()) < self.cfg.dust_shares:
             s.pos_since = None
+
+    def _close_wait(self, s, now, reason, side, want, kind, detail):
+        """A taker close that cannot fill now: retried in flatten_retry_s; journaled when its kind changes or every
+        15 minutes (the attempts in between are counted)."""
+        s.flatten_retry_at = now + self.cfg.flatten_retry_s
+        self.close_waits += 1
+        kind0, t0, n0 = s.wait or (None, -1e18, 0)
+        if kind != kind0 or now - t0 >= 900:
+            self.j.write("close_wait", mkt=s.m["cond"], reason=reason, kind=kind, detail=detail, side=side, size=want,
+                         attempts=n0 + 1)
+            s.wait = (kind, now, 0)
+        else:
+            s.wait = (kind0, t0, n0 + 1)
 
     def _drop_finished(self):
         """Exiting markets with no position (below dust), no orders, no unmerged pairs and no pending markout
@@ -2049,10 +2170,15 @@ class LPTest:
                 return {round(o[1], 4): o[3]}
             ob, oa = without_mine(bids, mine("bid")), without_mine(asks, mine("ask"))
             s.book = (ob, oa)
+            narrow = False
             if ob and oa:
                 s.mid = (ob[0][0] + oa[0][0]) / 2
                 s.mids = (s.mids + [(now, s.mid)])[-400:]
-            if p2 and cond not in self.blocked and s.mid is not None:
+                narrow = oa[0][0] - ob[0][0] <= self.cfg.narrow_spread + 1e-9
+                if narrow:                              # phase 6: the prices the limits and taker closes trust
+                    s.mark = s.mid
+                    s.marks = [x for x in s.marks if now - x[0] <= 3600] + [(now, s.mid)]
+            if p2 and cond not in self.blocked and s.mid is not None and narrow:   # limits on narrow books only
                 why_b = ("market loss" if self.cfg.market_loss_usd > 0 and s.mtm() < -self.cfg.market_loss_usd else
                          "toxic flow" if self.cfg.markout_kill_usd > 0 and s.mk_usd < -self.cfg.markout_kill_usd else
                          "event loss" if self._event_lost(s.m.get("event")) else None)
@@ -2109,7 +2235,7 @@ class LPTest:
                 aged = (self.cfg.inv_reduce_h > 0 and s.pos_since is not None
                         and now - s.pos_since >= self.cfg.inv_reduce_h * 3600)
             if exiting or aged:
-                want, size = self._exit_quotes(s, ob, oa)
+                want, size = self._exit_quotes(s, ob, oa, now)
             else:
                 want = dict(zip(("bid", "ask"), targets(ob, oa, tick, c["v"], s.pos(), cap)))
                 size = {"bid": s.m["N"], "ask": s.m["N"]}
@@ -2214,8 +2340,11 @@ class LPTest:
                 a = self._a(cond)
                 a["m1"].append(c["rate"] * frac); a["frac"].append(frac)
                 a["comp_levels"].append(len(lv)); a["comp_size"].append(sum(z for _, z in lv))
-        if sample and p2:
-            self.win_cap.append(sum(float(self.st[c].m.get("quote_cap") or 0.0) for c in self.target if c in self.st))
+        if sample and p2:                               # quote capital of the target portfolio; phase 6: only the
+            def quoting(c):                             # markets quoting now (not waiting for their window, exiting
+                x = self.st.get(c)                      # or without orders)
+                return x is not None and (self.cfg.phase < 6 or (x.exit_since is None and any(x.orders.values())))
+            self.win_cap.append(sum(float(self.st[c].m.get("quote_cap") or 0.0) for c in self.target if quoting(c)))
         for f in await self.ex.fills([s.m for s in self.st.values()]):
             if f["mkt"] in self.st:
                 self.apply_fill(f)
@@ -2265,8 +2394,9 @@ class LPTest:
                 os.replace(self.status_path + ".tmp", self.status_path)
             except OSError:
                 pass
-            if pnl <= -self.cfg.stop_loss_usd and not self.stopped:
-                await self._stop(f"stop_loss {pnl:.2f}", pnl, f"mark-to-market {pnl:.2f}", now)
+            pm = self.pnl_mark()                       # phase 6: at narrow-book marks (= pnl in phases 1-5)
+            if pm <= -self.cfg.stop_loss_usd and not self.stopped:
+                await self._stop(f"stop_loss {pm:.2f}", pm, f"mark-to-market {pm:.2f}", now)
         every = self.cfg.equity_every_s if self.cfg.equity_stop else 600.0
         if hasattr(self.ex, "collateral") and now - self.last_equity >= every:
             self.last_equity = now                      # the real result of a live run: rewards paid, fees and all
@@ -2274,10 +2404,11 @@ class LPTest:
                 cash = await self.ex.collateral()
                 pos = 0.0
                 for x in self.st.values():
-                    if x.mid is None:
+                    mk = x.mark if x.mark is not None else x.mid    # phase 6: the narrow-book mark
+                    if mk is None:
                         continue
                     y, n = (await self.ex.balances(x.m)) if self.cfg.equity_stop and hasattr(self.ex, "balances") else (x.yes, x.no)
-                    pos += y * x.mid + n * (1 - x.mid)
+                    pos += y * mk + n * (1 - mk)
                 eq = cash + pos
                 if self.equity0 is None:
                     self.equity0 = eq
@@ -2487,12 +2618,13 @@ def phase1(events, cv_max=0.5, share_max=0.4, exclude=(), m1_per_100_min=None, q
 def phase6_check(events, cfg=None):
     """Phase 6 rule check of a run journal (research/PREREG_PHASE6.md): every quote placed before its market's exit
     is in an allowed city and kind and inside the early window; the largest |YES - NO| of each market against its N;
-    the blocks by reason; the markets quoted per city."""
+    the blocks by reason; the markets quoted per city; the taker closes that waited (market state, not errors: no
+    orders, none within the floor) and the positions held past hold_until_h (to resolution)."""
     from . import wxfair
     cfg = cfg or phase6_config(lp_dir="")
     q, n_of, exited = {}, {}, set()
     places, bad, worst, blocks, cities = 0, [], 0.0, collections.Counter(), collections.Counter()
-    quoted = set()
+    quoted, waits, wait_mk, last_pos, last_ts = set(), 0, collections.Counter(), {}, None
     for e in events:
         ev = e.get("event")
         if ev == "rebalance":
@@ -2517,13 +2649,20 @@ def phase6_check(events, cfg=None):
                 p = wxfair.parse_market(q.get(c) or "", e["ts"])
                 cities[p["city"] if p else "not weather"] += 1
         elif ev == "pnl":
-            for c, yn in (e.get("positions") or {}).items():
+            last_pos, last_ts = e.get("positions") or {}, e["ts"]
+            for c, yn in last_pos.items():
                 if n_of.get(c):
                     worst = max(worst, abs(yn[0] - yn[1]) / n_of[c])
         elif ev == "block":
             blocks[e.get("reason", "")] += 1
+        elif ev == "close_wait":
+            waits += int(e.get("attempts") or 1)
+            wait_mk[e.get("kind", "")] += 1
+    held = [c for c, yn in last_pos.items() if abs(yn[0] - yn[1]) >= cfg.dust_shares and last_ts is not None
+            and cfg.hold_until_h < 1e8 and (wx_local_hours(q.get(c), last_ts) or -1e9) >= cfg.hold_until_h]
     return {"places": places, "bad": len(bad), "bad_first": bad[:5], "max_pos_n": round(worst, 2),
-            "blocks": dict(blocks), "cities": dict(cities)}
+            "blocks": dict(blocks), "cities": dict(cities), "close_waits": waits, "close_wait_kinds": dict(wait_mk),
+            "held_to_resolution": len(held)}
 
 
 def phase2(events, net_per100_min=20.0, cv_max=0.5, share_max=0.4, ratio_min=0.6, hours=48.0):

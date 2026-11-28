@@ -443,7 +443,12 @@ def _phase2_lines(events, now, phase=2):
         out[-1:-1] = [f"- правила фазы 6: котировок вне окна −72…−36 ч / вне городов **{c6['bad']}** из {c6['places']} "
                       f"(критерий 0); наибольшая позиция {c6['max_pos_n']:.1f} N (критерий ≤ 2 N); блокировки "
                       + (", ".join(f"{k} {v}" for k, v in sorted(c6['blocks'].items())) or "нет") + "; рынков по городам "
-                      + (", ".join(f"{k} {v}" for k, v in sorted(c6['cities'].items())) or "пока нет")]
+                      + (", ".join(f"{k} {v}" for k, v in sorted(c6['cities'].items())) or "пока нет"),
+                      f"- закрытия тейкером, которые ждут (состояние рынка, не ошибки бота; критерий 4 их не считает): "
+                      f"попыток {c6['close_waits']}"
+                      + (" (" + ", ".join(f"{k} {v}" for k, v in sorted(c6['close_wait_kinds'].items())) + ")"
+                         if c6['close_wait_kinds'] else "")
+                      + f"; позиций держим до разрешения: {c6['held_to_resolution']}"]
     if last:
         ms = last.get("markets") or {}
         target = set(last.get("target") or [])
