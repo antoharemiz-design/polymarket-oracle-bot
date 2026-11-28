@@ -157,9 +157,11 @@ PHASE3 = {"exit_improve_ticks": 1, "reduce_improve_always": 1, "inv_fifo": 1, "p
           "reserve_counts_pairs": 1}
 # phase 4 (26 Nov, after the live loss of 25-26 Nov): the phase 3 rules plus the safety of the live path; the
 # adverse-selection settings are set from research/lp_phase3_report.md (weather study)
-# phase 5 = H11 on top of phase 4, with the risk lessons of the phase 4 paper run (27-28 Nov: the three blocked markets
-# held 40-61 contracts when they jumped; two of them were not weather): the position is at most N, weather only
-PHASE5 = {"fv_on": 1, "weather_only": 1, "pos_limit_mult": 1.0, "market_loss_usd": 4.0}
+# phase 5 = phase 4 with the risk lessons of the phase 4 paper run (27-28 Nov: the three blocked markets held 40-61
+# contracts when they jumped; two of them were not weather): weather only, the position at most N, market loss $4.
+# Backtest 12-25 Nov: +$9.06 per $100 a day against +$6.69 for phase 4. The H11 fair value (fv_on) is NOT on: its
+# held-out stage 2a failed (research/PREREG_H11.md); LP_FV_ON=1 turns it on for H11 experiments.
+PHASE5 = {"weather_only": 1, "pos_limit_mult": 1.0, "market_loss_usd": 4.0}
 PHASE4 = {"sell_to_reduce": 1, "liquidate_on_stop": 1, "equity_stop": 1, "equity_every_s": 60.0,
           "market_loss_usd": 6.0, "markout_kill_usd": 3.0, "vol_risk_usd": 4.0, "vol_k": 2.0,
           "fill_cooldown_s": 300.0,

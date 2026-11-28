@@ -34,6 +34,7 @@ import wx_adverse as A  # noqa: E402
 from polybot import wxfair as W  # noqa: E402
 
 LEADS = [6, 12, 24, 48, 999]
+ONLY = set()                                           # stations with forecasts (--stations-with-data)
 STEP = 1800
 
 
@@ -55,6 +56,8 @@ def markets(wx_dir, d0, d1):
         q = d["meta"]["question"]
         p = W.parse_market(q, pt[0])
         if p is None:
+            continue
+        if ONLY and p["icao"] not in ONLY:
             continue
         yield d, res, pt, pp, q, p
 
@@ -209,6 +212,8 @@ def evaluate(wx_dir, truth, d0, d1, calib, out=None):
 
 def main():
     mode, wx_dir, truth = sys.argv[1:4]
+    if "--stations-with-data" in sys.argv:              # stage 2a: only the stations whose forecasts were collected
+        ONLY.update(f[:-5] for f in os.listdir(os.path.join(truth, "prev")))
     arg = lambda k, dflt: sys.argv[sys.argv.index(k) + 1] if k in sys.argv else dflt
     d0, d1 = arg("--from", "0000"), arg("--to", "9999")
     if mode == "calibrate":

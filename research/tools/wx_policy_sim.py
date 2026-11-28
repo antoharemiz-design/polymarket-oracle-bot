@@ -242,7 +242,7 @@ def main():
         per_day = collections.defaultdict(float)
         n = 0
         for d, res, pt, pp in mk:
-            if pol.get("fv") is not None and d["meta"]["conditionId"] not in fair_all:
+            if (pol.get("fv") is not None or "--only-fair" in sys.argv) and d["meta"]["conditionId"] not in fair_all:
                 continue                               # markets the fair value model does not value: left out
             o = run_market(d, res, pt, pp, pol, share, reward, fair_all.get(d["meta"]["conditionId"]))
             if o is None:

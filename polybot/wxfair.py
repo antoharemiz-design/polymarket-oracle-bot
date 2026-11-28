@@ -61,6 +61,18 @@ MODELS = {"ecmwf_ifs025": 7.0, "gfs_seamless": 5.0}     # model -> hours from th
 CALIB = {"highest": [(6, 0.0, 0.8), (12, 0.0, 1.0), (24, 0.0, 1.4), (48, 0.0, 1.9), (999, 0.0, 2.4)],
          "lowest": [(6, 0.0, 0.8), (12, 0.0, 1.0), (24, 0.0, 1.4), (48, 0.0, 1.9), (999, 0.0, 2.4)]}
 
+CALIB_PATH = __import__("os").path.join(__import__("os").path.dirname(__file__), "wx_calib.json")
+
+
+def load_calib(path=CALIB_PATH):
+    """The committed calibration (research/tools/h11_eval.py calibrate --save), else the defaults above."""
+    import os
+    if not os.path.exists(path):
+        return CALIB
+    c = json.load(open(path))
+    return {k: ([tuple(r) for r in v] if k != "station" else v) for k, v in c.items()}
+
+
 _Q = re.compile(r"(highest|lowest) temperature in (.+?) be (?:between )?(-?\d+)(?:\s*-\s*(-?\d+))?\s*°\s*([CF])"
                 r"(\s+or\s+(?:below|lower|higher|above))?\s+on ([A-Z][a-z]+) (\d{1,2})")
 _MONTHS = {m: i for i, m in enumerate(("January", "February", "March", "April", "May", "June", "July", "August",
@@ -181,7 +193,7 @@ class WxFair:
                  runs_every_s=3600.0):
         self.metar_fn = metar_fn or live_metars
         self.runs_fn = runs_fn or live_runs
-        self.calib = calib or CALIB
+        self.calib = calib or load_calib()
         self.clock = clock
         self.metar_every_s, self.runs_every_s = metar_every_s, runs_every_s
         self.obs = {}                                 # icao -> sorted [(ts, temp_c)] of routine reports

@@ -1502,7 +1502,8 @@ class Phase5FairValueTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.clock = Clock()
-        self.cfg = lp.phase5_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0, fill_cooldown_s=0.0, market_loss_usd=0.0)
+        self.cfg = lp.phase5_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0, fill_cooldown_s=0.0, market_loss_usd=0.0,
+                                    fv_on=1)
         self.ex = FakeEx()
         self.j = lp.Journal(os.path.join(self.tmp, "paper.jsonl"))
         self.fair = self.Fair()
@@ -1520,7 +1521,7 @@ class Phase5FairValueTest(unittest.TestCase):
 
     def test_preset(self):
         c = lp.phase5_config(lp_dir=self.tmp)
-        self.assertEqual((c.phase, c.fv_on, c.weather_only, c.pos_limit_mult), (5, 1, 1, 1.0))
+        self.assertEqual((c.phase, c.fv_on, c.weather_only, c.pos_limit_mult, c.market_loss_usd), (5, 0, 1, 1.0, 4.0))
         self.assertEqual((c.sell_to_reduce, c.wx_local_stop_h), (1, 0.0))   # phase 4 kept
 
     def test_sides_follow_the_edge(self):
