@@ -141,11 +141,13 @@ def _phi(z):
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 
-def calib_at(kind, h_end, calib=None):
-    for top, bias, sig in (calib or CALIB)[kind]:
-        if h_end <= top:
-            return bias, sig
-    return calib[kind][-1][1:] if calib else CALIB[kind][-1][1:]
+def calib_at(kind, h_end, calib=None, icao=None):
+    """(bias, sigma) for the lead bucket of h_end; the bias of the station when calibrated (calib["station"])."""
+    calib = calib or CALIB
+    row = next((r for r in calib[kind] if h_end <= r[0]), calib[kind][-1])
+    top, bias, sig = row[0], row[1], row[2]
+    sb = ((calib.get("station") or {}).get(icao) or {}).get(kind) or {}
+    return sb.get(str(top), sb.get(top, bias)), sig
 
 
 def bucket_prob(kind, unit, lo, hi, m_obs, mu, sigma):
@@ -232,9 +234,9 @@ class WxFair:
         elif not mus:
             return None
         else:
-            bias, sigma = calib_at(p["kind"], h_end, self.calib)
+            bias, sigma = calib_at(p["kind"], h_end, self.calib, p["icao"])
             mu = sum(mus) / len(mus) + (bias if p["kind"] == "highest" else -bias)
-        bias, sigma = calib_at(p["kind"], max(h_end, 0.0), self.calib)
+        bias, sigma = calib_at(p["kind"], max(h_end, 0.0), self.calib, p["icao"])
         prob = bucket_prob(p["kind"], p["unit"], p["lo"], p["hi"], m_obs, mu, sigma)
         return {"p": prob, "mu": mu, "sigma": sigma, "m_obs": m_obs, "h_end": h_end, "models": len(mus),
                 "obs": len(obs)}

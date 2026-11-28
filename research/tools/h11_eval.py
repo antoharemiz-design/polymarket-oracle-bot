@@ -96,9 +96,12 @@ def calibrate(wx_dir, truth, d0, d1):
                     mus.append(ext(pts))
             if rem and mus:
                 r = ext(rem) - sum(mus) / len(mus)
-                res_by[(kind, lead_bucket((end - t) / 3600))].append(r if kind == "highest" else -r)
+                res_by[(kind, lead_bucket((end - t) / 3600))].append((icao, r if kind == "highest" else -r))
             t += STEP
-    calib = {}
+    # bias per station and lead bucket, shrunk toward the bucket's mean (k pseudo-observations); sigma per lead bucket
+    # from the residuals minus their station's bias
+    K = 20.0
+    calib = {"station": {}}
     for kind in ("highest", "lowest"):
         rows = []
         for top in LEADS:
@@ -106,10 +109,20 @@ def calibrate(wx_dir, truth, d0, d1):
             if len(xs) < 30:
                 rows.append((top, 0.0, W.calib_at(kind, top)[1]))
                 continue
-            mu = sum(xs) / len(xs)
-            sd = math.sqrt(sum((x - mu) ** 2 for x in xs) / (len(xs) - 1))
-            rows.append((top, round(mu, 3), round(sd, 3)))
-            print(f"{kind:8s} lead <= {top:4d} h: n {len(xs):6d}  bias {mu:+.2f} C  sigma {sd:.2f} C")
+            g = sum(r for _, r in xs) / len(xs)
+            per = collections.defaultdict(list)
+            for icao, r in xs:
+                per[icao].append(r)
+            dev = []
+            for icao, rs in per.items():
+                b = (sum(rs) + K * g) / (len(rs) + K)
+                calib["station"].setdefault(icao, {}).setdefault(kind, {})[str(top)] = round(b, 3)
+                dev += [r - b for r in rs]
+            sd = math.sqrt(sum(x * x for x in dev) / max(1, len(dev) - 1))
+            raw = math.sqrt(sum((r - g) ** 2 for _, r in xs) / (len(xs) - 1))
+            rows.append((top, round(g, 3), round(sd, 3)))
+            print(f"{kind:8s} lead <= {top:4d} h: n {len(xs):6d}  bias {g:+.2f} C  sigma {sd:.2f} C (without station "
+                  f"bias {raw:.2f})  stations {len(per)}")
         calib[kind] = rows
     print(json.dumps(calib))
     return calib
@@ -206,7 +219,7 @@ def main():
         cp = arg("--calib", "")
         calib = json.load(open(cp)) if cp else None
         if calib:
-            calib = {k: [tuple(r) for r in v] for k, v in calib.items()}
+            calib = {k: ([tuple(r) for r in v] if k != "station" else v) for k, v in calib.items()}
         evaluate(wx_dir, truth, d0, d1, calib, arg("--out", ""))
 
 
