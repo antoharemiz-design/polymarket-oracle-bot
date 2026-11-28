@@ -114,6 +114,17 @@ class LPConfig:
     fv_refresh_s: float = 300.0        #   METARs and forecasts are fetched this often
     fv_require: int = 1                #   1: a weather market without a fair value (no data) is not quoted
     weather_only: int = 0              # 1: only markets polybot.wxfair can value are selected
+    # phase 6 (28 Nov, research/PREREG_PHASE6.md): the early window and the city lists
+    wx_window_on: int = 0              # 1: weather markets are quoted only from wx_window_start_h to wx_window_end_h local
+    wx_window_start_h: float = -72.0   #   hours of their measured day (before it: negative); the backtest found the
+    wx_window_end_h: float = -36.0     #   fewest informed fills that early
+    wx_cities_allow: str = ""          # comma-separated city slugs of polybot.wxfair (e.g. "denver,istanbul"); empty = all
+    wx_cities_block: str = ""          # comma-separated city slugs never quoted
+    wx_kinds: str = ""                 # "highest", "lowest" or both (comma-separated); empty = both
+    event_markets_max: int = 1         # markets of one event (a city's day: its temperature buckets) in the portfolio;
+                                       #   0 = no limit (the backtest of phase 6 quotes every bucket)
+    event_loss_usd: float = 0.0        # > 0: when the markets of one event lost this much together (marked to mid,
+                                       #   retired ones included), all of them are closed and blocked
     inv_reduce_h: float = 0.0          # a position held this long: only the reducing side is quoted (0 = off)
     inv_flatten_h: float = 0.0         # a position held this long is closed by a taker order (0 = off)
     flatten_retry_s: float = 60.0      # after a taker close that did not fill, the next try waits this long (the quotes
@@ -162,6 +173,11 @@ PHASE3 = {"exit_improve_ticks": 1, "reduce_improve_always": 1, "inv_fifo": 1, "p
 # Backtest 12-25 Nov: +$9.06 per $100 a day against +$6.69 for phase 4. The H11 fair value (fv_on) is NOT on: its
 # held-out stage 2a failed (research/PREREG_H11.md); LP_FV_ON=1 turns it on for H11 experiments.
 PHASE5 = {"weather_only": 1, "pos_limit_mult": 1.0, "market_loss_usd": 4.0}
+# phase 6 = phase 5 quoted only early (72-36 h before the local measured day) in the cities that kept their result out
+# of sample (research/STATUS_2026-11-28.md; the backtest covers "highest" markets only)
+PHASE6 = {"wx_window_on": 1, "wx_window_start_h": -72.0, "wx_window_end_h": -36.0,
+          "wx_cities_allow": "denver,istanbul,moscow,taipei", "wx_cities_block": "seoul,tokyo,helsinki,paris,wellington",
+          "wx_kinds": "highest", "event_markets_max": 0, "event_loss_usd": 8.0}
 PHASE4 = {"sell_to_reduce": 1, "liquidate_on_stop": 1, "equity_stop": 1, "equity_every_s": 60.0,
           "market_loss_usd": 6.0, "markout_kill_usd": 3.0, "vol_risk_usd": 4.0, "vol_k": 2.0,
           "fill_cooldown_s": 300.0,
@@ -172,11 +188,11 @@ PHASE4 = {"sell_to_reduce": 1, "liquidate_on_stop": 1, "equity_stop": 1, "equity
 
 
 def from_env(phase=None) -> LPConfig:
-    """Settings from LP_* environment variables. The phase (argument, else LP_PHASE, else 5) picks the defaults:
-    phase 5 starts from PHASE2..PHASE5, phase 4 from PHASE2..PHASE4, phase 3 from PHASE2 + PHASE3, phase 2 from PHASE2,
-    phase 1 from the LPConfig defaults. A resumed run keeps the phase it started with (polybot/service.py)."""
+    """Settings from LP_* environment variables. The phase (argument, else LP_PHASE, else 6) picks the defaults:
+    phase N starts from PHASE2..PHASEN (phase 1 from the LPConfig defaults). A resumed run keeps the phase it started
+    with (polybot/service.py)."""
     c = LPConfig()
-    c.phase = int(phase or os.environ.get("LP_PHASE") or 5)
+    c.phase = int(phase or os.environ.get("LP_PHASE") or 6)
     if c.phase >= 2:
         for k, v in PHASE2.items():
             setattr(c, k, v)
@@ -188,6 +204,9 @@ def from_env(phase=None) -> LPConfig:
             setattr(c, k, v)
     if c.phase >= 5:
         for k, v in PHASE5.items():
+            setattr(c, k, v)
+    if c.phase >= 6:
+        for k, v in PHASE6.items():
             setattr(c, k, v)
     for f in dataclasses.fields(c):
         raw = os.environ.get("LP_" + f.name.upper())
@@ -224,6 +243,39 @@ def phase5_config(**kw) -> LPConfig:
     for k, v in kw.items():
         setattr(c, k, v)
     return c
+
+
+def phase6_config(**kw) -> LPConfig:
+    """LPConfig with the phase 6 settings (phase 5 + early window + city lists), for tests and research tools."""
+    c = phase5_config(phase=6)
+    for k, v in PHASE6.items():
+        setattr(c, k, v)
+    for k, v in kw.items():
+        setattr(c, k, v)
+    return c
+
+
+def wx_allowed(cfg, question, now):
+    """Phase 6 market filter: (allowed, reason). A weather market must be of an allowed city and kind; with the early
+    window, `window` tells where `now` is: "before", "in" or "after" (None when the window is off)."""
+    from . import wxfair
+    p = wxfair.parse_market(question or "", now)
+    if p is None:
+        return (not (cfg.wx_cities_allow or cfg.wx_kinds or cfg.wx_window_on)), "not weather", None
+    allow = {x.strip() for x in cfg.wx_cities_allow.split(",") if x.strip()}
+    block = {x.strip() for x in cfg.wx_cities_block.split(",") if x.strip()}
+    kinds = {x.strip() for x in cfg.wx_kinds.split(",") if x.strip()}
+    if (allow and p["city"] not in allow) or p["city"] in block:
+        return False, f"city {p['city']} not allowed", None
+    if kinds and p["kind"] not in kinds:
+        return False, f"{p['kind']} markets not allowed", None
+    if not cfg.wx_window_on:
+        return True, "", None
+    h = wx_local_hours(question, now)
+    if h is None:
+        return False, "no local time", None
+    where = "before" if h < cfg.wx_window_start_h else "after" if h >= cfg.wx_window_end_h else "in"
+    return True, "", where
 
 
 def phase2_config(**kw) -> LPConfig:
@@ -358,6 +410,10 @@ def wx_local_hours(question, now):
     year = local.year + (1 if month < local.month - 6 else -1 if month > local.month + 6 else 0)
     start = datetime.datetime(year, month, day, tzinfo=z)
     return (local - start).total_seconds() / 3600
+
+
+def p6_before(cfg, q, now):
+    return bool(cfg.wx_window_on) and wx_allowed(cfg, q, now)[2] == "before"
 
 
 def _wx_market(q):
@@ -701,15 +757,16 @@ def snap_rows(rw, books_by_cond, conds, kmax, mid_lo=0.15, mid_hi=0.85):
     return out
 
 
-def allocate(rows, budget, kmax, markets_max, max_share):
+def allocate(rows, budget, kmax, markets_max, max_share, per_event=1):
     """Quote budget in steps of one rewards_min_size: each step goes to the option with the best marginal M1 per
-    dollar (a new market at k = 1, one market per event, or one more unit on a chosen market, up to kmax). No
+    dollar (a new market at k = 1, at most per_event markets per event (0 = no limit), or one more unit on a chosen
+    market, up to kmax). No
     market takes more than max_share of the budget; if one carries more than max_share of the predicted M1, its
     size is cut by one unit (dropped at k = 1) and the budget is spread again.
     rows: [{cond, event, m1_k, cap_k, ...}] -> the chosen rows with k, m1_usd_day and quote_cap at that k."""
     banned, kcap = set(), {}
     while True:
-        k, events, cap = {}, set(), 0.0
+        k, events, cap = {}, collections.Counter(), 0.0
         while True:
             best = None
             for x in rows:
@@ -717,7 +774,8 @@ def allocate(rows, budget, kmax, markets_max, max_share):
                 if c in banned:
                     continue
                 cur = k.get(c, 0)
-                if cur >= min(kmax, kcap.get(c, kmax)) or (cur == 0 and (x["event"] in events or len(k) >= markets_max)):
+                full = per_event > 0 and events[x["event"]] >= per_event
+                if cur >= min(kmax, kcap.get(c, kmax)) or (cur == 0 and (full or len(k) >= markets_max)):
                     continue
                 if x["cap_k"][cur] > max(budget * max_share, x["cap_k"][0]):
                     continue
@@ -730,7 +788,9 @@ def allocate(rows, budget, kmax, markets_max, max_share):
             if best is None:
                 break
             _, c, cost, e = best
-            k[c] = k.get(c, 0) + 1; cap += cost; events.add(e)
+            if c not in k:
+                events[e] += 1
+            k[c] = k.get(c, 0) + 1; cap += cost
         out = []
         for x in rows:
             if x["cond"] in k:
@@ -746,7 +806,7 @@ def allocate(rows, budget, kmax, markets_max, max_share):
             banned.add(top["cond"])
 
 
-def rank(snaps, events, kmax, comp_min, budget, markets_max, max_share, cands=None, adjust=None):
+def rank(snaps, events, kmax, comp_min, budget, markets_max, max_share, cands=None, adjust=None, per_event=1):
     """Portfolio from the snapshot rows of the selection window (snap_rows of each snapshot, oldest first).
     Per market: M1 at each k = median over all snapshots (0 where we could not quote), capital at each k = median
     over the snapshots where we could quote, competitor levels = median (0 where we could not quote).
@@ -770,7 +830,7 @@ def rank(snaps, events, kmax, comp_min, budget, markets_max, max_share, cands=No
                      "m1_k": m1_k, "cap_k": cap_k, "k": 1, "quotable_share": len(seen) / len(vals)})
     if adjust is not None:
         rows = adjust(rows)
-    return rows, allocate(rows, budget, kmax, markets_max, max_share)
+    return rows, allocate(rows, budget, kmax, markets_max, max_share, per_event)
 
 
 WORD = re.compile(r"[a-z]{4,}")
@@ -1021,6 +1081,16 @@ class SnapStore:
         if cfg.weather_only:                            # phase 5: only markets the fair value model can value
             from . import wxfair
             cands = [c for c in cands if wxfair.parse_market((self.meta.get(c) or {}).get("question", ""), now)]
+        if cfg.wx_window_on or cfg.wx_cities_allow or cfg.wx_cities_block or cfg.wx_kinds:
+            def p6_ok(c):                               # phase 6: allowed city and kind, and the early window is open
+                q = (self.meta.get(c) or {}).get("question", "")     # at some time before the next rebalance (the
+                ok, _, where = wx_allowed(cfg, q, now)               # step does not quote it before the window and
+                if not ok:                                           # exits it after)
+                    return False
+                if where is None:
+                    return True
+                return where != "after" and wx_allowed(cfg, q, now + cfg.rebalance_h * 3600)[2] != "before"
+            cands = [c for c in cands if p6_ok(c)]
         if cfg.wx_local_stop_h >= 0:                    # phase 4: weather markets whose measured day starts before the
             def wx_ok(c):                               # next rebalance are not selected (they would exit at once)
                 h = wx_local_hours((self.meta.get(c) or {}).get("question", ""), now + cfg.rebalance_h * 3600)
@@ -1068,7 +1138,7 @@ class SnapStore:
                     out.append(x)
                 return out
         rows, chosen = rank(snaps, events, cfg.kmax, cfg.min_comp_levels, cfg.quote_budget_usd, cfg.markets_max,
-                            cfg.max_share, cands=cands, adjust=adjust)
+                            cfg.max_share, cands=cands, adjust=adjust, per_event=cfg.event_markets_max)
         out = []
         for x in chosen:
             c, m = x["cond"], self.meta[x["cond"]]
@@ -1644,6 +1714,8 @@ class LPTest:
         self.last_equity = -1e18                        # live: wallet equity (USDC + positions at mid) every 10 min
         self.equity0 = None                             # phase 4: the first equity of the run (equity_stop)
         self.blocked = {}                               # phase 4: market -> reason; closed and never quoted again
+        self.blocked_events = set()                     # phase 6: events whose markets lost event_loss_usd together
+        self.event_closed = collections.defaultdict(float)   # phase 6: event -> PnL of its retired markets
         self.liquidating = None                         # phase 4: since when the stop closes every position
         self.status_path = os.path.join(os.path.dirname(getattr(journal.f, "name", "") or "."), "status.json")
 
@@ -1713,9 +1785,13 @@ class LPTest:
             if ev == "retired":
                 if self.st.pop(e["mkt"], None) is not None:
                     self.closed_pnl += e.get("pnl", 0.0)
+                    if e.get("ev"):
+                        self.event_closed[e["ev"]] += e.get("pnl", 0.0)
                 continue
             if ev == "block":
                 self.blocked[e["mkt"]] = e.get("reason", "")
+                if e.get("reason") == "event loss" and e.get("ev"):
+                    self.blocked_events.add(e["ev"])
                 continue
             if ev == "equity":
                 if self.equity0 is None:
@@ -1799,7 +1875,7 @@ class LPTest:
         """New target portfolio: new markets start quoting at their size, markets whose size changed re-quote at
         the new size, markets no longer in the target start their exit. Written to the journal with every market
         dict, so a restart rebuilds the same state."""
-        want = {m["cond"]: m for m in target if m["cond"] not in self.blocked}
+        want = {m["cond"]: m for m in target if m["cond"] not in self.blocked and m.get("event") not in self.blocked_events}
         added, resized, retired, back = [], [], [], []
         for c, m in want.items():
             s = self.st.get(c)
@@ -1827,6 +1903,15 @@ class LPTest:
         self.log(f"rebalance: {len(want)} markets, quote capital ${cap:.0f}, predicted M1 "
                  f"${sum(float(m.get('m1_usd_day') or 0.0) for m in target):.2f}/day; +{len(added)} new, "
                  f"{len(resized)} resized, {len(retired)} exiting")
+
+    def _event_lost(self, ev):
+        """Phase 6: the markets of event ev (live and retired) lost event_loss_usd together, or it is blocked."""
+        if not ev or self.cfg.event_loss_usd <= 0:
+            return False
+        if ev in self.blocked_events:
+            return True
+        tot = self.event_closed.get(ev, 0.0) + sum(x.mtm() for x in self.st.values() if x.m.get("event") == ev)
+        return tot < -self.cfg.event_loss_usd
 
     def _exit_quotes(self, s, ob, oa):
         """Reduce-only quotes of an exiting market: join the best price on the side that shrinks |YES - NO|, for at
@@ -1895,8 +1980,10 @@ class LPTest:
                 continue
             pnl = s.mtm()
             self.closed_pnl += pnl
+            if s.m.get("event"):
+                self.event_closed[s.m["event"]] += pnl
             del self.st[cond]
-            self.j.write("retired", mkt=cond, pnl=pnl, yes=s.yes, no=s.no)
+            self.j.write("retired", mkt=cond, pnl=pnl, yes=s.yes, no=s.no, ev=s.m.get("event"))
 
     async def snapshot_tick(self, now):
         """Phase 2, one pass of the snapshot task: a snapshot when one is due; then, if rebalance_h has passed since
@@ -1967,11 +2054,22 @@ class LPTest:
                 s.mids = (s.mids + [(now, s.mid)])[-400:]
             if p2 and cond not in self.blocked and s.mid is not None:
                 why_b = ("market loss" if self.cfg.market_loss_usd > 0 and s.mtm() < -self.cfg.market_loss_usd else
-                         "toxic flow" if self.cfg.markout_kill_usd > 0 and s.mk_usd < -self.cfg.markout_kill_usd else None)
+                         "toxic flow" if self.cfg.markout_kill_usd > 0 and s.mk_usd < -self.cfg.markout_kill_usd else
+                         "event loss" if self._event_lost(s.m.get("event")) else None)
                 if why_b:                               # phase 4: closed now by taker, never quoted again in this run
                     self.blocked[cond] = why_b
                     self.target.discard(cond)
-                    self.j.write("block", mkt=cond, reason=why_b, pnl=round(s.mtm(), 4), markout_usd=round(s.mk_usd, 4))
+                    self.j.write("block", mkt=cond, reason=why_b, pnl=round(s.mtm(), 4), markout_usd=round(s.mk_usd, 4),
+                                 ev=s.m.get("event"))
+                    if why_b == "event loss":           # phase 6: every market of the event at once
+                        ev = s.m.get("event")
+                        self.blocked_events.add(ev)
+                        for c2, x in self.st.items():
+                            if c2 not in self.blocked and x.m.get("event") == ev:
+                                self.blocked[c2] = why_b
+                                self.target.discard(c2)
+                                self.j.write("block", mkt=c2, reason=why_b, pnl=round(x.mtm(), 4),
+                                             markout_usd=round(x.mk_usd, 4), ev=ev)
                     self.log(f"market blocked ({why_b}): {s.m.get('q', cond)[:60]}; its PnL {s.mtm():.2f}, "
                              f"600 s markouts {s.mk_usd:.2f}")
             if cond in cfgs:
@@ -1986,7 +2084,12 @@ class LPTest:
             exiting = aged = False
             if p2:
                 wxh = wx_local_hours(s.m.get("q"), now) if self.cfg.wx_local_stop_h >= 0 else None
+                p6 = (wx_allowed(self.cfg, s.m.get("q"), now)
+                      if self.cfg.wx_window_on or self.cfg.wx_cities_allow or self.cfg.wx_cities_block or self.cfg.wx_kinds
+                      else (True, "", None))
                 why = (f"blocked: {self.blocked[cond]}" if cond in self.blocked else
+                       p6[1] if not p6[0] else
+                       "early window over" if p6[2] == "after" else
                        "weather measured day" if wxh is not None and wxh >= self.cfg.wx_local_stop_h else
                        "reward removed" if c["rate"] <= 0 else
                        "end near" if self.cfg.exit_at_end and s.hours_left(now) < self.cfg.exit_reduce_h else
@@ -2047,6 +2150,8 @@ class LPTest:
                     want = {"bid": None, "ask": None}       # a weather market without data: not quoted
             if self.stopped or self.paused or (c["rate"] <= 0 and not exiting):
                 want = {"bid": None, "ask": None}
+            if p2 and not exiting and p6_before(self.cfg, s.m.get("q"), now):
+                want = {"bid": None, "ask": None}       # phase 6: the early window has not started yet
             sell = {"bid": False, "ask": False}
             if self.cfg.sell_to_reduce:                 # phase 4: the reducing side sells the token held
                 for side, held in (("ask", s.yes), ("bid", s.no)):
@@ -2377,6 +2482,48 @@ def phase1(events, cv_max=0.5, share_max=0.4, exclude=(), m1_per_100_min=None, q
     if out["h10_closed"]:
         out["verdict"] += " -> H10 closes (PREREG_LP_PHASE1B)"
     return out
+
+
+def phase6_check(events, cfg=None):
+    """Phase 6 rule check of a run journal (research/PREREG_PHASE6.md): every quote placed before its market's exit
+    is in an allowed city and kind and inside the early window; the largest |YES - NO| of each market against its N;
+    the blocks by reason; the markets quoted per city."""
+    from . import wxfair
+    cfg = cfg or phase6_config(lp_dir="")
+    q, n_of, exited = {}, {}, set()
+    places, bad, worst, blocks, cities = 0, [], 0.0, collections.Counter(), collections.Counter()
+    quoted = set()
+    for e in events:
+        ev = e.get("event")
+        if ev == "rebalance":
+            for c, m in (e.get("markets") or {}).items():
+                q[c] = m.get("q") or q.get(c)
+                n_of[c] = float(m.get("N") or n_of.get(c) or 0.0)
+            exited = set(e.get("exiting") or {})        # a market back in the portfolio quotes normally again
+        elif ev == "exit":
+            exited.add(e.get("mkt"))
+        elif ev == "retired":
+            exited.discard(e.get("mkt"))
+        elif ev == "place":
+            c = e.get("mkt")
+            places += 1
+            if c in exited:                            # reduce-only quotes of an exiting market
+                continue
+            ok, why, where = wx_allowed(cfg, q.get(c), e["ts"])
+            if not ok or (cfg.wx_window_on and where != "in"):
+                bad.append({"ts": e["ts"], "mkt": c, "q": (q.get(c) or "")[:80], "why": why or f"window: {where}"})
+            if c not in quoted:
+                quoted.add(c)
+                p = wxfair.parse_market(q.get(c) or "", e["ts"])
+                cities[p["city"] if p else "not weather"] += 1
+        elif ev == "pnl":
+            for c, yn in (e.get("positions") or {}).items():
+                if n_of.get(c):
+                    worst = max(worst, abs(yn[0] - yn[1]) / n_of[c])
+        elif ev == "block":
+            blocks[e.get("reason", "")] += 1
+    return {"places": places, "bad": len(bad), "bad_first": bad[:5], "max_pos_n": round(worst, 2),
+            "blocks": dict(blocks), "cities": dict(cities)}
 
 
 def phase2(events, net_per100_min=20.0, cv_max=0.5, share_max=0.4, ratio_min=0.6, hours=48.0):

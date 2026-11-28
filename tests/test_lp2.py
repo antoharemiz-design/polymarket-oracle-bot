@@ -114,6 +114,12 @@ class AllocateTest(unittest.TestCase):
         out = lp.allocate(rows, 1000.0, 1, 40, 1.0)
         self.assertEqual(sorted(x["cond"] for x in out), ["A", "C"])
 
+    def test_markets_per_event(self):
+        rows = [self.row(c, m1, 10.0, event="E") for c, m1 in (("A", 5.0), ("B", 4.0), ("C", 3.0))]
+        self.assertEqual(sorted(x["cond"] for x in lp.allocate(rows, 1000.0, 1, 40, 1.0, per_event=2)), ["A", "B"])
+        self.assertEqual(len(lp.allocate(rows, 1000.0, 1, 40, 1.0, per_event=0)), 3)    # phase 6: no limit
+        self.assertEqual(len(lp.allocate(rows, 1000.0, 3, 40, 1.0, per_event=1)), 1)    # more units, still one market
+
     def test_capital_share_per_market(self):
         out = lp.allocate([self.row("A", 5.0, 30.0, conc=1.0)], 300.0, 5, 40, 0.4)
         self.assertEqual(out[0]["k"], 4)                   # a fifth unit would put $150 > 40% of $300 in one market
@@ -216,11 +222,15 @@ class ConfigTest(unittest.TestCase):
         c = lp.phase2_config(kmax=3)
         self.assertEqual((c.phase, c.kmax, c.max_min_size), (2, 3, 200.0))
 
-    def test_phase5_is_the_default(self):
+    def test_phase6_is_the_default(self):
         old = {k: os.environ.pop(k, None) for k in ("LP_PHASE", "LP_CAPITAL_USD")}
         try:
             c = lp.from_env()
-            self.assertEqual(c.phase, 5)
+            self.assertEqual(c.phase, 6)
+            self.assertEqual((c.wx_window_on, c.wx_window_start_h, c.wx_window_end_h, c.wx_kinds), (1, -72.0, -36.0, "highest"))
+            self.assertEqual(c.wx_cities_allow, "denver,istanbul,moscow,taipei")
+            p5 = lp.from_env(phase=5)                     # a resumed phase 5 run keeps its rules
+            self.assertEqual((p5.wx_window_on, p5.wx_cities_allow), (0, ""))
             # phase 5: weather only, the position at most N, market loss $4; the H11 fair value stays off
             self.assertEqual((c.weather_only, c.pos_limit_mult, c.market_loss_usd, c.fv_on), (1, 1.0, 4.0, 0))
             p4 = lp.from_env(phase=4)                     # a resumed phase 4 run keeps its rules
@@ -1568,3 +1578,152 @@ class Phase5FairValueTest(unittest.TestCase):
         self.step(1)
         self.step(1)
         self.assertEqual(self.quotes(), (False, True))               # long N: the bid may not grow it further
+
+
+class Phase6Test(unittest.TestCase):
+    """Phase 6: weather quoted only 72-36 h before the local measured day, only in the allowed cities, never in the
+    blocked ones, "highest" markets only; position at most N and market loss $4 from phase 5."""
+    # NOW = 2027-01-15 08:00 UTC = 01:00 in Denver (UTC-7)
+    IN = "Will the highest temperature in Denver be between 40-41°F on January 17?"        # 47 h before: in the window
+    BEFORE = "Will the highest temperature in Denver be between 40-41°F on January 19?"    # 95 h before
+    AFTER = "Will the highest temperature in Denver be between 40-41°F on January 16?"     # 23 h before
+    SEOUL = "Will the highest temperature in Seoul (Incheon) be 5°C on January 17?"
+    CHICAGO = "Will the highest temperature in Chicago be between 40-41°F on January 17?"
+    LOWEST = "Will the lowest temperature in Denver be between 20-21°F on January 17?"
+
+    def test_preset(self):
+        c = lp.phase6_config(lp_dir=tempfile.mkdtemp())
+        self.assertEqual((c.phase, c.weather_only, c.pos_limit_mult, c.market_loss_usd, c.fv_on), (6, 1, 1.0, 4.0, 0))
+        self.assertEqual(c.wx_cities_block, "seoul,tokyo,helsinki,paris,wellington")
+        self.assertEqual((c.event_markets_max, c.event_loss_usd, c.wx_kinds), (0, 8.0, "highest"))
+
+    def test_filter(self):
+        c = lp.phase6_config(lp_dir=tempfile.mkdtemp())
+        self.assertEqual(lp.wx_allowed(c, self.IN, NOW), (True, "", "in"))
+        self.assertEqual(lp.wx_allowed(c, self.BEFORE, NOW)[2], "before")
+        self.assertEqual(lp.wx_allowed(c, self.AFTER, NOW)[2], "after")
+        self.assertFalse(lp.wx_allowed(c, self.SEOUL, NOW)[0])             # blocked
+        self.assertFalse(lp.wx_allowed(c, self.CHICAGO, NOW)[0])           # not in the allow list
+        self.assertFalse(lp.wx_allowed(c, self.LOWEST, NOW)[0])            # "highest" only
+        self.assertFalse(lp.wx_allowed(c, "Will BTC be above 100k on January 17?", NOW)[0])
+        c.wx_cities_allow = ""                                              # without an allow list: all but the blocked
+        self.assertTrue(lp.wx_allowed(c, self.CHICAGO, NOW)[0])
+        self.assertFalse(lp.wx_allowed(c, self.SEOUL, NOW)[0])
+
+    def make(self, q):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        cfg = lp.phase6_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0, fill_cooldown_s=0.0)
+        self.j = lp.Journal(os.path.join(self.tmp, "paper.jsonl"))
+        self.ex = FakeEx()
+        return lp.LPTest(cfg, self.ex, self.j, [mk("C1", q=q)], log=lambda *a: None, clock=self.clock,
+                         books_fn=lambda toks: {t: ([(0.48, 100.0)], [(0.52, 100.0)], 0.01) for t in toks})
+
+    def step(self, t, dt=0.0):
+        self.clock.t += dt
+        asyncio.run(t.step(self.clock.t, {c: {"v": 4.5, "min": 20.0, "rate": 10.0} for c in t.st}))
+
+    def test_quotes_only_in_the_window(self):
+        t = self.make(self.IN)
+        self.step(t)
+        self.assertIsNotNone(t.st["C1"].orders["bid"])
+        self.assertIsNotNone(t.st["C1"].orders["ask"])
+        t = self.make(self.BEFORE)
+        self.step(t)
+        self.assertEqual(t.st["C1"].orders, {"bid": None, "ask": None})
+        self.assertIsNone(t.st["C1"].exit_since)                           # waits for its window
+        self.step(t, (95 - 71) * 3600)                                      # 71 h before: inside now
+        self.assertIsNotNone(t.st["C1"].orders["bid"])
+
+    def test_window_over_and_blocked_city_exit(self):
+        for q, reason in ((self.AFTER, "early window over"), (self.SEOUL, "city seoul not allowed"),
+                          (self.LOWEST, "lowest markets not allowed")):
+            t = self.make(q)
+            self.step(t)
+            ev = [e for e in journal_events(self.j) if e["event"] == "exit"]
+            self.assertEqual(ev[0]["reason"], reason)
+            self.assertNotIn("place", [e["event"] for e in journal_events(self.j)])
+
+    def test_selection(self):
+        st = StoreTest()
+        st.setUp()
+        qs = {"IN": self.IN, "IN2": "Will the highest temperature in Denver be between 42-43°F on January 17?",
+              "SOON": "Will the highest temperature in Denver be between 40-41°F on January 18?",   # 73 h before
+              "BEFORE": self.BEFORE, "AFTER": self.AFTER, "SEOUL": self.SEOUL, "CHICAGO": self.CHICAGO,
+              "LOWEST": self.LOWEST}
+        st.metas = {c: meta(c, q=q, event="E17" if c in ("IN", "IN2") else f"E{c}") for c, q in qs.items()}
+        st.rw = {c: {"rate": 10.0, "v": 4.5, "min": 20.0} for c in qs}
+        st.books = {f"Y{c}": ([(0.48, 100.0), (0.47, 100.0)], [(0.52, 100.0), (0.53, 100.0)], 0.01) for c in qs}
+        cfg = lp.phase6_config(lp_dir=st.tmp, lookback_h=2.0, min_comp_levels=0)
+        store = lp.SnapStore(cfg, log=lambda *a: None, clock=st.clock, rewards_fn=lambda: st.rw,
+                             books_fn=lambda toks: {t: st.books[t] for t in toks if t in st.books}, gamma_fn=st.gamma)
+        now = NOW - 2 * 3600                                                 # 23:00 in Denver on 14 January
+        for i in range(5):
+            store.take(now - (4 - i) * 1800)
+        target, _ = store.rank(now)
+        # in the window, or entering it before the next rebalance (3 h); two buckets of one event (no event limit)
+        self.assertEqual(sorted(m["cond"] for m in target), ["IN", "IN2", "SOON"])
+
+    def test_event_loss(self):
+        self.tmp = tempfile.mkdtemp()
+        self.clock = Clock()
+        cfg = lp.phase6_config(lp_dir=self.tmp, poll_s=0.0, sample_s=0.0, fill_cooldown_s=0.0, market_loss_usd=0.0,
+                               markout_kill_usd=0.0, inv_reduce_h=0.0, inv_flatten_h=0.0, vol_risk_usd=0.0)
+        self.j = lp.Journal(os.path.join(self.tmp, "paper.jsonl"))
+        self.ex = FakeEx()
+        q2 = "Will the highest temperature in Denver be between 42-43°F on January 17?"
+        books = {"YC1": ([(0.48, 100.0)], [(0.52, 100.0)], 0.01), "YC2": ([(0.48, 100.0)], [(0.52, 100.0)], 0.01)}
+        t = lp.LPTest(cfg, self.ex, self.j, [mk("C1", q=self.IN, event="E17"), mk("C2", q=q2, event="E17")],
+                      log=lambda *a: None, clock=self.clock, books_fn=lambda toks: {x: books[x] for x in toks})
+        self.step(t)
+        fill = lambda c: {"order": t.st[c].orders["bid"][0], "mkt": c, "side": "bid", "price": 0.48, "size": 20.0,
+                          "ts": self.clock.t, "done": True}
+        self.ex.inject = [fill("C1")]
+        self.step(t, 1)
+        books["YC1"] = ([(0.24, 100.0)], [(0.26, 100.0)], 0.01)            # C1 -$4.60: below the $8 event limit
+        self.step(t, 1)
+        self.assertEqual(t.blocked, {})
+        self.ex.inject = [fill("C2")]
+        self.step(t, 1)
+        books["YC2"] = ([(0.24, 100.0)], [(0.26, 100.0)], 0.01)            # together -$9.20
+        self.step(t, 1)
+        self.assertEqual(t.blocked, {"C1": "event loss", "C2": "event loss"})
+        self.assertEqual(t.blocked_events, {"E17"})
+        self.assertTrue(any(e["event"] == "flatten" for e in journal_events(self.j)))
+        # a restart keeps the event blocked
+        t2 = lp.LPTest(cfg, self.ex, lp.Journal(os.path.join(self.tmp, "paper2.jsonl")), [], log=lambda *a: None,
+                       clock=self.clock, books_fn=lambda toks: {x: books[x] for x in toks})
+        t2.restore(journal_events(self.j))
+        self.assertEqual(t2.blocked_events, {"E17"})
+
+    def test_rule_check(self):
+        m = lambda q: {"q": q, "N": 20.0}
+        ev = [{"event": "rebalance", "ts": NOW, "markets": {"IN": m(self.IN), "AFTER": m(self.AFTER), "SEOUL": m(self.SEOUL)},
+               "exiting": {}},
+              {"event": "place", "ts": NOW, "mkt": "IN", "side": "bid"},
+              {"event": "place", "ts": NOW, "mkt": "SEOUL", "side": "bid"},            # a blocked city: a violation
+              {"event": "exit", "ts": NOW, "mkt": "AFTER", "reason": "early window over"},
+              {"event": "place", "ts": NOW, "mkt": "AFTER", "side": "ask"},            # reduce-only after the exit
+              {"event": "pnl", "ts": NOW, "positions": {"IN": [30.0, 0.0], "AFTER": [0.0, 10.0]}},
+              {"event": "block", "ts": NOW, "mkt": "IN", "reason": "event loss"}]
+        r = lp.phase6_check(ev)
+        self.assertEqual((r["places"], r["bad"], r["max_pos_n"]), (3, 1, 1.5))
+        self.assertEqual(r["bad_first"][0]["mkt"], "SEOUL")
+        self.assertEqual(r["blocks"], {"event loss": 1})
+        self.assertEqual(r["cities"], {"denver": 1, "seoul": 1})
+        from polybot import service
+        md = "\n".join(service._phase2_lines(ev, NOW, phase=6))
+        self.assertIn("правила фазы 6", md)
+        self.assertIn("(критерий: не меньше $10)", md)
+
+    def test_window_ends_while_quoting(self):
+        t = self.make(self.IN)
+        self.step(t)
+        oid = t.st["C1"].orders["bid"][0]
+        self.ex.inject = [{"order": oid, "mkt": "C1", "side": "bid", "price": 0.48, "size": 20.0, "ts": self.clock.t, "done": True}]
+        self.step(t, 1)
+        self.step(t, 12 * 3600)                                             # 35 h before: the window is over
+        ev = journal_events(self.j)
+        self.assertEqual([e["reason"] for e in ev if e["event"] == "exit"], ["early window over"])
+        self.assertTrue(any(e["event"] == "flatten" for e in ev))           # the position is closed
+        self.assertNotIn("C1", t.st)                                         # flat and exited: the market left
