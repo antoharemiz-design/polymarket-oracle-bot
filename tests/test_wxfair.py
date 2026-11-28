@@ -114,3 +114,15 @@ class WxFairTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ObsTimeTest(unittest.TestCase):
+    def test_observation_time_from_the_report(self):
+        # aviationweather's reportTime of 232050Z is 2100Z: the report is at 23:50 local in Ankara (UTC+3), on 23 Nov
+        raw = "METAR LTAC 232050Z 22022KT 9999 SCT040 BKN080 13/04 Q1009 TEMPO -TSRA"
+        self.assertEqual(W.obs_time(raw, ts("2026-11-23 21:00")), ts("2026-11-23 20:50"))
+        a, b = W.day_bounds("2026-11-24", "Europe/Istanbul")
+        self.assertLess(W.obs_time(raw, ts("2026-11-23 21:00")), a)       # not in the 24 Nov local day
+        # across a month end
+        self.assertEqual(W.obs_time("KDAL 302353Z 34005KT 08/M05", ts("2026-12-01 00:00")), ts("2026-11-30 23:53"))
+        self.assertEqual(W.obs_time("no time group", 123.0), 123.0)

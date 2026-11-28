@@ -52,6 +52,12 @@ POLICIES = {
                                                              market_loss=4.0, cap=20.0, fv=(0.05, 0.20)),
     "phase 5, fair value only (one 0.03)":   dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10,
                                                   market_loss=4.0, cap=20.0, fv=(0.03, 0.20)),
+    "phase 5, early only (-72..-36 h)":      dict(stop_h=-36, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10,
+                                                  market_loss=4.0, cap=20.0),
+    "phase 5, -36..-12 h":                   dict(stop_h=-12, start_h=-36, hold_h=2.0, cooldown_s=300, vol=0.10,
+                                                  market_loss=4.0, cap=20.0),
+    "phase 5, -12..0 h":                     dict(stop_h=0, start_h=-12, hold_h=2.0, cooldown_s=300, vol=0.10,
+                                                  market_loss=4.0, cap=20.0),
     "phase 4, position cap N":               dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10, market_loss=6.0, cap=20.0),
     "phase 4, cap N, loss $4":               dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10, market_loss=4.0, cap=20.0),
     "phase 4, cap N, loss $4, hold 4 h":     dict(stop_h=0, start_h=-72, hold_h=4.0, cooldown_s=300, vol=0.10, market_loss=4.0, cap=20.0),
@@ -240,8 +246,13 @@ def main():
         pol = POLICIES[name]
         tot = collections.Counter()
         per_day = collections.defaultdict(float)
+        day_quote = collections.defaultdict(float)
+        per_city = collections.defaultdict(lambda: [0.0, 0.0])
+        cities = set(arg("--cities", "").split(",")) - {""}
         n = 0
         for d, res, pt, pp in mk:
+            if cities and (d["meta"].get("event") or "").split("-on-")[0].replace("highest-temperature-in-", "") not in cities:
+                continue
             if (pol.get("fv") is not None or "--only-fair" in sys.argv) and d["meta"]["conditionId"] not in fair_all:
                 continue                               # markets the fair value model does not value: left out
             o = run_market(d, res, pt, pp, pol, share, reward, fair_all.get(d["meta"]["conditionId"]))
@@ -251,6 +262,10 @@ def main():
             tot.update(o)
             day = d["meta"].get("event_end", "")[:10]
             per_day[day] += o["trading"] + o["reward"]
+            city = (d["meta"].get("event") or "").split("-on-")[0].replace("highest-temperature-in-", "")
+            per_city[city][0] += o["trading"] + o["reward"]
+            per_city[city][1] += o["quote_min"] / 1440 * N
+            day_quote[day] += o["quote_min"] / 1440 * N
         quote_usd_days = tot["quote_min"] / 1440 * N          # ~$20 of quotes per market while quoting
         net = tot["trading"] + tot["reward"]
         per100 = net / (quote_usd_days / 100) if quote_usd_days else float("nan")
@@ -261,7 +276,9 @@ def main():
              "taker_cost_usd": round(tot["taker_cost"], 2), "held_to_outcome": round(tot["held_to_outcome"]),
              "quote_usd_days": round(quote_usd_days, 1), "net_per_100_day": round(per100, 2),
              "trading_per_100_day": round(tot["trading"] / (quote_usd_days / 100), 2) if quote_usd_days else None,
-             "losing_event_days": f"{sum(1 for v in days if v < 0)}/{len(days)}"}
+             "losing_event_days": f"{sum(1 for v in days if v < 0)}/{len(days)}",
+             "per_day": {k: [round(v, 2), round(day_quote[k], 2)] for k, v in sorted(per_day.items())},
+             "per_city": {k: [round(v[0], 2), round(v[1], 2)] for k, v in sorted(per_city.items())}}
         res_all[name] = r
         print(f"{name:42s} fills {r['fills']:6d} c/ct m1 {r['m1_c']:5.2f}  trading ${r['trading_usd']:8.2f}  "
               f"reward ${r['reward_usd']:8.2f}  net/$100/day {r['net_per_100_day']:6.2f} (trading {r['trading_per_100_day']:6.2f})  "

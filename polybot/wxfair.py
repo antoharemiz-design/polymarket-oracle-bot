@@ -135,6 +135,32 @@ def metar_temp(raw):
     return None
 
 
+_OBS = re.compile(r"\b(\d{2})(\d{2})(\d{2})Z\b")
+
+
+def obs_time(raw, ref_ts):
+    """Observation time of a METAR from its DDHHMMZ group (what the resolution counts), the latest such time not after
+    ref_ts + 1 h; ref_ts (the source's report time, rounded up to the half hour) when the group is missing.
+    aviationweather's reportTime of 232050Z is 2100Z: it would move the last report of a day into the next one."""
+    m = _OBS.search(raw or "")
+    if not m:
+        return ref_ts
+    day, hh, mm = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    ref = datetime.datetime.fromtimestamp(ref_ts + 3600, datetime.timezone.utc)
+    for back in range(0, 3):
+        y, mo = ref.year, ref.month - back
+        while mo < 1:
+            mo += 12
+            y -= 1
+        try:
+            t = datetime.datetime(y, mo, day, hh, mm, tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+        if t <= ref:
+            return t.timestamp()
+    return ref_ts
+
+
 def round_half_up(x):
     return math.floor(x + 0.5)
 
@@ -272,7 +298,9 @@ def live_metars(icaos, now):
     for k in range(0, len(icaos), 4):
         q = {"ids": ",".join(icaos[k:k + 4]), "format": "json", "hours": 30}
         for x in _get("https://aviationweather.gov/api/data/metar?" + urllib.parse.urlencode(q)):
-            out.setdefault(x["icaoId"], []).append((_ts(x["reportTime"]), x.get("rawOb") or ""))
+            raw = x.get("rawOb") or ""
+            t = float(x["obsTime"]) if x.get("obsTime") else obs_time(raw, _ts(x["reportTime"]))
+            out.setdefault(x["icaoId"], []).append((t, raw))
     return out
 
 
@@ -297,7 +325,7 @@ def file_sources(truth_dir):
     reps = {}
     for line in open(os.path.join(truth_dir, "metar.jsonl")):
         x = json.loads(line)
-        reps.setdefault(x["icao"], []).append((_ts(x["time"]), x.get("raw") or ""))
+        reps.setdefault(x["icao"], []).append((obs_time(x.get("raw") or "", _ts(x["time"])), x.get("raw") or ""))
     for v in reps.values():
         v.sort()
     keys = {k: [r[0] for r in v] for k, v in reps.items()}
@@ -359,9 +387,9 @@ def prev_sources(truth_dir):
                 continue
             times, h = x
             ser = []
-            for i, t in enumerate(times):
-                if t < now - 6 * 3600 or t > now + 4 * 86400:
-                    continue
+            a, b = bisect.bisect_left(times, now - 6 * 3600), bisect.bisect_right(times, now + 4 * 86400)
+            for i in range(a, b):
+                t = times[i]
                 d = min(4, max(1, math.ceil((t - now + MODELS[model] * 3600) / 86400)))
                 v = (h.get(f"temperature_2m_previous_day{d}_{model}") or [None] * len(times))[i]
                 if v is not None:
@@ -378,7 +406,7 @@ def file_sources_metar(truth_dir):
     reps = {}
     for line in open(os.path.join(truth_dir, "metar.jsonl")):
         x = json.loads(line)
-        reps.setdefault(x["icao"], []).append((_ts(x["time"]), x.get("raw") or ""))
+        reps.setdefault(x["icao"], []).append((obs_time(x.get("raw") or "", _ts(x["time"])), x.get("raw") or ""))
     for v in reps.values():
         v.sort()
     keys = {k: [r[0] for r in v] for k, v in reps.items()}
