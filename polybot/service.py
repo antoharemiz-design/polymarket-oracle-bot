@@ -362,6 +362,9 @@ class Service:
         if self.rewards_fn:
             kw["rewards_fn"] = self.rewards_fn
         prior = lp.load_events(self.run_dir, self.mode) if resumed else []
+        if cfg.fv_on:                                   # H11: fair value of weather markets
+            from . import wxfair
+            kw["fair"] = self.fair_fn() if getattr(self, "fair_fn", None) else wxfair.WxFair(clock=self.clock)
         self.test = lp.LPTest(cfg, ex, journal, markets, log=self.log.info, clock=self.clock,
                               control_fn=self.control_for_test, store=store, **kw)
         if prior:
@@ -414,6 +417,7 @@ def _phase2_lines(events, now, phase=2):
         if e["event"] == "pnl":
             pos = e.get("positions") or pos
     out = [f"## Ход прогона (фаза {phase})", ""]
+    crit = {5: 6, 6: 10}.get(phase, 20)                 # net per $100 a day of the phase's preregistration
     if last:
         nxt = last["ts"] + lp.from_env(phase=2).rebalance_h * 3600
         out.append(f"- переотбор: последний {time.strftime('%m-%d %H:%M UTC', time.gmtime(last['ts']))}, следующий ~"
@@ -426,13 +430,20 @@ def _phase2_lines(events, now, phase=2):
             f"${fmt(r.get('m1_per100'))}/день; CV {fmt(r.get('cv'), '{:.0%}')}; крупнейшая доля за 24 ч "
             f"{fmt(r.get('max_share_last24'), '{:.0%}')} (порог 40%); факт / прогноз {fmt(r.get('fact_over_pred'))}",
             f"- на $100 котировок в день: M1 ${fmt(r.get('m1_per100'))} + рибейты ${fmt(r.get('rebates_per100'))} + "
-            f"переоценка позиций ${fmt(r.get('mtm_per100'))} = **${fmt(r.get('net_per100'))}** (критерий: не меньше $20)",
+            f"переоценка позиций ${fmt(r.get('mtm_per100'))} = **${fmt(r.get('net_per100'))}** (критерий: не меньше "
+            f"${crit}); котировки в среднем ${fmt(r.get('quote_cap_usd'), '{:.0f}')}",
             f"- исполнений {r.get('fills', 0)}, контрактов {r.get('contracts', 0):.0f} "
             f"({fmt(r.get('contracts_per_market_day'), '{:.0f}')} на рынок в сутки); markout 60 с {fmt(r.get('markout60_c'))} ц, "
             f"p5 {fmt(r.get('markout60_p5_c'))} ц; 600 с {fmt(r.get('markout600_c'))} ц",
             f"- выходы из рынков {r.get('exits', 0)}, закрытий тейкером {r.get('flattens', 0)} "
             f"({r.get('flatten_contracts', 0):.0f} контрактов, ${r.get('flatten_cost_usd', 0.0):.2f}), рынков завершено {r.get('retired', 0)}",
             f"- простой {fmt(r.get('downtime_h'))} ч; запусков процесса {r.get('process_starts', 0)}; ошибок {r.get('errors', 0)}", ""]
+    if phase >= 6:                                      # research/PREREG_PHASE6.md: the rules of the early window
+        c6 = lp.phase6_check(events, lp.from_env(phase=phase))
+        out[-1:-1] = [f"- правила фазы 6: котировок вне окна −72…−36 ч / вне городов **{c6['bad']}** из {c6['places']} "
+                      f"(критерий 0); наибольшая позиция {c6['max_pos_n']:.1f} N (критерий ≤ 2 N); блокировки "
+                      + (", ".join(f"{k} {v}" for k, v in sorted(c6['blocks'].items())) or "нет") + "; рынков по городам "
+                      + (", ".join(f"{k} {v}" for k, v in sorted(c6['cities'].items())) or "пока нет")]
     if last:
         ms = last.get("markets") or {}
         target = set(last.get("target") or [])

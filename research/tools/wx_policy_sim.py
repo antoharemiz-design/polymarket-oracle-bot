@@ -11,6 +11,9 @@ order refilled after a fill waits `cooldown` before it may grow the position aga
 at the touch. A position is closed by a taker order at the far touch minus 1 c of slippage when its oldest lot is
 older than `hold_h`, when the policy's stop time comes (`stop_h` local hours of the measured day; None = never) and
 when the mid leaves [0.10, 0.90]. A market whose own loss passes `market_loss` is closed and left.
+--one-per-event keeps one market per event (the one with the most reward over its life); --per-slot K instead takes,
+per event and 3 h slot, the K markets with the most reward in that slot (the bot re-selects its markets every 3 h,
+at most event_markets_max per event, polybot.lp.allocate), with trading at the all-market rate per $100 of quotes.
 Rewards: --reward dollars per $100 of quotes per day while both sides quote (one side: a third), the rate paid on
 25 Nov ($14.87 for 5.9 h of $195 quotes = $31) rounded down. Every number is per market lifetime, summed.
 """
@@ -28,6 +31,7 @@ import wx_adverse as A  # noqa: E402
 from polybot.lp import wx_local_hours  # noqa: E402
 
 N, CAP, TICK, ZONE = 20.0, 60.0, 0.01, 0.045
+SLOT_S = 3 * 3600
 
 POLICIES = {
     # name: stop_h (local hours of the measured day; None = never), start_h (first quote), hold_h, cooldown_s,
@@ -48,6 +52,19 @@ POLICIES = {
     "phase 4, 2 ticks behind the touch":     dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10, market_loss=6.0, behind=2),
     "phase 4, stop -12 h, 1 tick behind":    dict(stop_h=-12, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10, market_loss=6.0, behind=1),
     "phase 4, vol cap 0.05":                 dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.05, market_loss=6.0),
+    "phase 5: phase 4 + cap N + loss $4 + fair value": dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10,
+                                                             market_loss=4.0, cap=20.0, fv=(0.05, 0.20)),
+    "phase 5, fair value only (one 0.03)":   dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10,
+                                                  market_loss=4.0, cap=20.0, fv=(0.03, 0.20)),
+    "phase 5, early only (-72..-36 h)":      dict(stop_h=-36, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10,
+                                                  market_loss=4.0, cap=20.0),
+    "phase 5, -36..-12 h":                   dict(stop_h=-12, start_h=-36, hold_h=2.0, cooldown_s=300, vol=0.10,
+                                                  market_loss=4.0, cap=20.0),
+    "phase 5, -12..0 h":                     dict(stop_h=0, start_h=-12, hold_h=2.0, cooldown_s=300, vol=0.10,
+                                                  market_loss=4.0, cap=20.0),
+    "phase 4, position cap N":               dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10, market_loss=6.0, cap=20.0),
+    "phase 4, cap N, loss $4":               dict(stop_h=0, start_h=-72, hold_h=2.0, cooldown_s=300, vol=0.10, market_loss=4.0, cap=20.0),
+    "phase 4, cap N, loss $4, hold 4 h":     dict(stop_h=0, start_h=-72, hold_h=4.0, cooldown_s=300, vol=0.10, market_loss=4.0, cap=20.0),
 }
 
 
@@ -75,8 +92,14 @@ def sigma(pp, j, n=30):
     return math.sqrt(sum((x - mu) ** 2 for x in d) / max(1, len(d) - 1) * 60)
 
 
-def run_market(d, res, pt, pp, pol, share, reward_rate):
+def run_market(d, res, pt, pp, pol, share, reward_rate, fair=None):
+    """fair: [(ts, p)] of polybot.wxfair (research/tools/h11_eval.py evaluate --out); with pol["fv"] = (one, pull)
+    the quotes follow it as in the bot (phase 5): |edge| >= pull nothing (and a position against it is closed),
+    edge >= one no ask, edge <= -one no bid; no fair value: no quotes."""
     q = d["meta"]["question"]
+    CAP = pol.get("cap", 60.0)
+    fv = pol.get("fv")
+    ft = [x[0] for x in fair] if fair else []
     trades = A.maker_fills(d)                          # (ts, maker sign, YES price, size)
     tt = [t for t, *_ in trades]
     out = collections.Counter()
@@ -130,6 +153,12 @@ def run_market(d, res, pt, pp, pol, share, reward_rate):
         sig = sigma(pp, j) if pol["vol"] is not None else None
         calm = sig is None or sig <= pol["vol"]
         quote = {}
+        edge = None
+        if fv is not None:
+            jf = bisect.bisect_right(ft, t) - 1
+            edge = fair[jf][1] - m if jf >= 0 else None
+            if edge is not None and abs(edge) >= fv[1] and edge * pos < 0:
+                close(t, m, "fair")
         if (m - b) <= ZONE:
             grow_ok = pos < CAP - 1e-9 and calm and t >= cool["bid"]
             if pos < -1e-9 or grow_ok:                 # bid reduces a short, or opens/grows a long
@@ -138,11 +167,21 @@ def run_market(d, res, pt, pp, pol, share, reward_rate):
             grow_ok = -pos < CAP - 1e-9 and calm and t >= cool["ask"]
             if pos > 1e-9 or grow_ok:
                 quote["ask"] = a
+        if fv is not None:
+            if edge is None or abs(edge) >= fv[1]:
+                quote = {}
+            elif edge >= fv[0]:
+                quote.pop("ask", None)
+            elif edge <= -fv[0]:
+                quote.pop("bid", None)
         dt = (nxt - t) / 60
         sc = [score(abs(m - quote[sd]) * 100) / S_REF for sd in quote]
         two = (sum(sc) / 2 if len(sc) == 2 and min(sc) * 3 >= max(sc) else max(sc) / 3 if sc else 0.0)
         out["reward"] += reward_rate / 100 * (N * 1.0) / 1440 * dt * two
         out["quote_min"] += dt if quote else 0
+        slot = int(t // SLOT_S)                        # per 3 h slot (the bot's rebalance): for --per-slot
+        out[("r", slot)] += reward_rate / 100 * (N * 1.0) / 1440 * dt * two
+        out[("q", slot)] += dt if quote else 0
         days.add(int(t // 86400))
         rem = {"bid": N if "bid" in quote else 0.0, "ask": N if "ask" in quote else 0.0}
         k = bisect.bisect_left(tt, t, lo=k)
@@ -201,6 +240,7 @@ def main():
     share, reward = arg("--share", 1.0), arg("--reward", 25.0)
     names = list(POLICIES) if arg("--policies", "all") == "all" else arg("--policies", "").split("|")
     outp = arg("--out", "")
+    fair_all = json.load(open(arg("--fair", ""))).get("series", {}) if arg("--fair", "") else {}
     d_from, d_to = arg("--from", "0000"), arg("--to", "9999")
     mk = []
     for f in sorted(glob.glob(os.path.join(data, "*.json"))):
@@ -213,15 +253,49 @@ def main():
         pol = POLICIES[name]
         tot = collections.Counter()
         per_day = collections.defaultdict(float)
+        day_quote = collections.defaultdict(float)
+        per_city = collections.defaultdict(lambda: [0.0, 0.0])
+        cities = set(arg("--cities", "").split(",")) - {""}
         n = 0
+        rows = []
         for d, res, pt, pp in mk:
-            o = run_market(d, res, pt, pp, pol, share, reward)
+            if cities and (d["meta"].get("event") or "").split("-on-")[0].replace("highest-temperature-in-", "") not in cities:
+                continue
+            if (pol.get("fv") is not None or "--only-fair" in sys.argv) and d["meta"]["conditionId"] not in fair_all:
+                continue                               # markets the fair value model does not value: left out
+            o = run_market(d, res, pt, pp, pol, share, reward, fair_all.get(d["meta"]["conditionId"]))
             if o is None:
                 continue
+            rows.append((d, o))
+        if "--one-per-event" in sys.argv:             # the bot quotes one market per event (polybot.lp.allocate):
+            best = {}                                  # keep the market of each event with the most reward
+            for d, o in rows:
+                e = d["meta"].get("event") or d["meta"]["conditionId"]
+                if e not in best or o["reward"] > best[e][1]["reward"]:
+                    best[e] = (d, o)
+            rows = list(best.values())
+        slot_q, slot_r = 0.0, 0.0
+        kslot = arg("--per-slot", 0)
+        if kslot:                                      # the bot re-selects its markets every 3 h, at most kslot per
+            best = collections.defaultdict(list)       # event: per event and slot, the kslot markets with the most
+            for d, o in rows:                          # reward in that slot
+                e = d["meta"].get("event") or d["meta"]["conditionId"]
+                for key, v in o.items():
+                    if isinstance(key, tuple) and key[0] == "r":
+                        best[(e, key[1])].append((v, o[("q", key[1])]))
+            top = [x for v in best.values() for x in sorted(v, reverse=True)[:kslot]]
+            slot_r = sum(x[0] for x in top)
+            slot_q = sum(x[1] for x in top) / 1440 * N
+        for d, o in rows:
             n += 1
+            o = collections.Counter({k: v for k, v in o.items() if not isinstance(k, tuple)})
             tot.update(o)
             day = d["meta"].get("event_end", "")[:10]
             per_day[day] += o["trading"] + o["reward"]
+            city = (d["meta"].get("event") or "").split("-on-")[0].replace("highest-temperature-in-", "")
+            per_city[city][0] += o["trading"] + o["reward"]
+            per_city[city][1] += o["quote_min"] / 1440 * N
+            day_quote[day] += o["quote_min"] / 1440 * N
         quote_usd_days = tot["quote_min"] / 1440 * N          # ~$20 of quotes per market while quoting
         net = tot["trading"] + tot["reward"]
         per100 = net / (quote_usd_days / 100) if quote_usd_days else float("nan")
@@ -232,7 +306,13 @@ def main():
              "taker_cost_usd": round(tot["taker_cost"], 2), "held_to_outcome": round(tot["held_to_outcome"]),
              "quote_usd_days": round(quote_usd_days, 1), "net_per_100_day": round(per100, 2),
              "trading_per_100_day": round(tot["trading"] / (quote_usd_days / 100), 2) if quote_usd_days else None,
-             "losing_event_days": f"{sum(1 for v in days if v < 0)}/{len(days)}"}
+             "losing_event_days": f"{sum(1 for v in days if v < 0)}/{len(days)}",
+             "per_day": {k: [round(v, 2), round(day_quote[k], 2)] for k, v in sorted(per_day.items())},
+             "per_city": {k: [round(v[0], 2), round(v[1], 2)] for k, v in sorted(per_city.items())}}
+        if kslot:                                      # trading at the all-market rate per $100 (an approximation)
+            tr = r["trading_per_100_day"] or 0.0
+            r["per_slot"] = {"k": kslot, "quote_usd_days": round(slot_q, 1), "reward_usd": round(slot_r, 2),
+                                 "net_usd_est": round(slot_r + tr * slot_q / 100, 2)}
         res_all[name] = r
         print(f"{name:42s} fills {r['fills']:6d} c/ct m1 {r['m1_c']:5.2f}  trading ${r['trading_usd']:8.2f}  "
               f"reward ${r['reward_usd']:8.2f}  net/$100/day {r['net_per_100_day']:6.2f} (trading {r['trading_per_100_day']:6.2f})  "
